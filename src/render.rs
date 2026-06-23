@@ -268,7 +268,6 @@ fn run_teardown<T: OuterTerminal>(term: &mut T) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::Clock;
     use crate::terminal::mock::{Call, MockTerminal};
     use portable_pty::ExitStatus;
 
