@@ -718,7 +718,6 @@ line two\r\n\
 mod cjk {
     use super::*;
     use crate::terminal::mock::RecordingGrid;
-    use portable_pty::ExitStatus;
 
     /// U+4E00 (一), the canonical double-width CJK ideograph. Two grid cells: a
     /// lead cell holding "一" and a continuation cell (byte-length zero).
@@ -1028,6 +1027,5 @@ mod cjk {
             .parser
             .process(format!("\x1b[1;{w}H{HAN}").as_bytes());
         assert_eq!(renderer.parser.screen().size(), (rows, w));
-        let _ = ExitStatus::with_exit_code(0); // keep import honest across cases
     }
 }
