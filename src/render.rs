@@ -18,10 +18,10 @@
 //!    the deadline drain already swallows everything queued before the cap).
 //! 4. Exactly one `render_once`.
 //!
-//! Dispatch (slice 02): `Pty(b)` → `parser.process(b)`; `Input(Key)` →
-//! placeholder legacy encode → PTY writer (real re-encode is slice 04);
-//! `ChildExited(s)` → set shutdown with status, break. Resize/focus/mouse are
-//! swallowed (resize is slice 05, mouse slice 07).
+//! Dispatch: `Pty(b)` → `parser.process(b)`; `Input(Key)` → re-encode at the
+//! child's current kitty level (ADR-002/003) → PTY writer; `ChildExited(s)` →
+//! set shutdown with status, break. Resize/focus/mouse are swallowed (resize is
+//! slice 05, mouse slice 07).
 
 use std::io::Write;
 use std::time::Duration;

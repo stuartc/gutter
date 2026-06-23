@@ -56,41 +56,26 @@ impl KittyState {
         }
     }
 
-    /// Push a kitty level (`CSI > N u`). **Clamped:** when the outer terminal
-    /// cannot source kitty this is a no-op, so the child stays legacy — the
-    /// case-B degradation contract.
-    pub fn push(&mut self, flags: u16) {
-        if self.outer_supports {
-            self.stack.push(flags);
-        }
-    }
-
-    /// Pop a kitty level (`CSI < u`). Returns to the previous level rather than
-    /// zeroing. A pop on an empty stack is harmless (the child stays legacy).
-    pub fn pop(&mut self) {
-        self.stack.pop();
-    }
-
-    /// Feed one recognised CSI to the state: dispatch `CSI > N u` to [`push`]
-    /// (taking `N` from the first param, default `0`) and `CSI < u` to [`pop`].
-    /// `CSI = u` / `CSI ? u` (set/query forms) are observed-but-inert here — this
-    /// slice tracks only the enable/disable the target program drives. Called by
-    /// the `unhandled_csi` watcher after [`is_kitty_csi`] has matched.
-    ///
-    /// [`push`]: KittyState::push
-    /// [`pop`]: KittyState::pop
+    /// Feed one recognised CSI to the stack. `CSI > N u` pushes level `N` (from
+    /// the first param, default `0`) — **clamped:** when the outer terminal
+    /// cannot source kitty the push is a no-op, so the child stays legacy (the
+    /// case-B degradation contract). `CSI < u` pops, returning to the previous
+    /// level rather than zeroing (a pop on an empty stack is harmless). `CSI = u`
+    /// / `CSI ? u` (set/query forms) are observed-but-inert here — this slice
+    /// tracks only the enable/disable the target program drives. Called by the
+    /// `unhandled_csi` watcher after [`is_kitty_csi`] has matched.
     pub fn apply_csi(&mut self, i1: Option<u8>, params: &[&[u16]], c: char) {
         if c != 'u' {
             return;
         }
         match i1 {
-            Some(b'>') => {
+            Some(b'>') if self.outer_supports => {
                 let flags = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
-                self.push(flags);
+                self.stack.push(flags);
             }
-            Some(b'<') => self.pop(),
-            // `=` (set) and `?` (query) are part of the family but don't change
-            // the push/pop stack in this slice.
+            Some(b'<') => {
+                self.stack.pop();
+            }
             _ => {}
         }
     }

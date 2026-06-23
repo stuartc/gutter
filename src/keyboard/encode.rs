@@ -117,12 +117,12 @@ pub fn encode_key(event: &KeyEvent, level: KittyLevel) -> Vec<u8> {
 /// `DISAMBIGUATE_ESCAPE_CODES`.
 fn encode_kitty(event: &KeyEvent) -> Vec<u8> {
     let mods = event.modifiers;
+    // Special keys take the functional `CSI codepoint [; mod] u` form — this is
+    // what lets Shift+Enter (`CSI 13;2u`) differ from Enter (`CSI 13u`).
+    if let Some(codepoint) = special_codepoint(event.code) {
+        return kitty_seq(codepoint, mods);
+    }
     match event.code {
-        // Special keys take the functional `CSI codepoint [; mod] u` form — this
-        // is what lets Shift+Enter (`CSI 13;2u`) differ from Enter (`CSI 13u`).
-        code if special_codepoint(code).is_some() => {
-            kitty_seq(special_codepoint(code).unwrap(), mods)
-        }
         // Arrows keep their legacy CSI form (no `u` disambiguation needed for the
         // target program; this slice does not expand arrow kitty coverage).
         KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left => arrow_bytes(event.code),
