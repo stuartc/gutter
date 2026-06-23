@@ -67,6 +67,19 @@ pub struct Renderer {
     /// The cursor visibility last mirrored to the outer terminal, so we only
     /// emit a show/hide when it actually changes.
     cursor_visible: bool,
+    /// Whether the OUTER terminal is currently in the alternate screen, mirroring
+    /// the child's `alternate_screen()` (ADR-012). The edge-triggered de-dupe
+    /// twin of `cursor_visible`: we only emit an enter/leave when the child's alt
+    /// state actually changes. Never forced — gutter enters the outer alt screen
+    /// only when the child does.
+    outer_alt_active: bool,
+    /// Whether the child EVER entered the alt screen this run (ADR-012's latch).
+    /// Set true the first time `alternate_screen()` reads true and never cleared.
+    /// Guards the Option C teardown replay: a TUI that toggled the alt screen and
+    /// then left it before exit still reads `alternate_screen() == false` at exit,
+    /// but the latch remembers — so its final frame is never replayed onto the
+    /// primary screen.
+    ever_entered_alt: bool,
     /// The mouse forwarding gate (ADR-005): the button-held flag the
     /// `ButtonMotion` down-filter needs. The child's `(mode, encoding)` is read
     /// live from the screen each `Event::Mouse` dispatch, not cached here.
@@ -121,6 +134,10 @@ impl Renderer {
             left_margin: geometry::margin(layout, real_cols, width),
             // vt100 starts with the cursor visible; mirror that initial state.
             cursor_visible: true,
+            // gutter starts on the primary screen and never forces the alt screen
+            // (ADR-012) — both flags start false, mirroring `cursor_visible`.
+            outer_alt_active: false,
+            ever_entered_alt: false,
             mouse_gate: MouseGate::default(),
         }
     }
@@ -249,11 +266,16 @@ where
 ///    reset, cursor/scroll/saved-pos clamp, `col_clamp`).
 /// 3. **Recompute `left_margin`** from the new `real_cols` and `W` via the shared
 ///    [`geometry::margin`].
-/// 4. **Gutter clear + full repaint**: blank the physical columns outside the
-///    band (a shrink can strand cells there), then force a full `rows_diff`
-///    repaint by resetting the `prev` baseline to a blank grid. The next
-///    `render_once` repaints every row; the child's own post-SIGWINCH repaint
-///    then overwrites the transient degraded grid wholesale.
+/// 4. **Gutter clear + full repaint — alt screen only (ADR-012/013).** In the
+///    alt screen, blank the physical columns outside the band (a shrink can
+///    strand cells there), then force a full `rows_diff` repaint by resetting the
+///    `prev` baseline to a blank grid. The next `render_once` repaints every row;
+///    the child's own post-SIGWINCH repaint then overwrites the transient
+///    degraded grid wholesale. On the **primary** screen this absolute `[0, rows)`
+///    clear/repaint is **suppressed**: gutter doesn't own the whole primary
+///    screen, so blanking `[0, rows)` would erase the real shell's scrollback
+///    history above the band. This is the narrow "don't erase history" floor —
+///    the full primary-aware resize repaint is slice 04.
 fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     renderer: &mut Renderer,
     resizer: &R,
@@ -276,28 +298,68 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     // Step 3 — recompute the left margin from the new real_cols and W.
     renderer.left_margin = geometry::margin(renderer.layout, cols, w);
 
-    // Step 4a — clear the physical gutter columns (cells stranded by a shrink).
-    let _ = term.clear_gutter(renderer.left_margin, w, cols, rows);
+    // Step 4 — the absolute `[0, rows)` gutter clear + full repaint, gated on the
+    // alt screen (ADR-012/013). The alt screen is gutter's whole viewport, so the
+    // absolute clear/repaint is safe and correct there. On the primary screen it
+    // would reach rows the real shell drew above the band — the user's scrollback
+    // history — and erase it, so it is suppressed. The full primary-aware resize
+    // repaint (recompute, scroll-aware) is slice 04.
+    if renderer.outer_alt_active {
+        // Step 4a — clear the physical gutter columns (cells stranded by a shrink).
+        let _ = term.clear_gutter(renderer.left_margin, w, cols, rows);
 
-    // Step 4b — force a full repaint next frame: reset the diff baseline to a
-    // blank grid of the new size so `rows_diff` repaints every row into the
-    // freshly-resized band. (The render_once that follows this turn does the
-    // actual paint.)
-    renderer.reset_prev_baseline();
+        // Step 4b — force a full repaint next frame: reset the diff baseline to a
+        // blank grid of the new size so `rows_diff` repaints every row into the
+        // freshly-resized band. (The render_once that follows this turn does the
+        // actual paint.)
+        renderer.reset_prev_baseline();
+    }
 }
 
 /// Paint the current virtual grid to the outer terminal at the band's offset
-/// (ADR-006). The ONLY place `rows_diff` and `move_to`/`place_cursor` are
+/// (ADR-006), mirroring the child's screen mode onto the outer terminal first
+/// (ADR-012). The ONLY place `rows_diff` and `move_to`/`place_cursor` are
 /// called — cursor repositioning does NOT live in the channel code.
 ///
-/// For each visible row, emit our own `move_to(left_margin, row)` then that
-/// row's `rows_diff` byte run (which carries its own intra-row SGR and relative
-/// cursor moves, scoped to `[0, W)`, so it paints into physical columns
+/// **Mode mirror (ADR-012).** Before painting, read the child's
+/// `alternate_screen()` and edge-trigger the outer alt screen against it (the
+/// `cursor_visible` de-dupe pattern): enter/leave the outer alt screen only on a
+/// real edge, and on an alt→primary edge drop the diff baseline so the primary
+/// screen is repainted whole rather than diffed against the stale alt frame. The
+/// `ever_entered_alt` latch is set whenever the child is in the alt screen.
+///
+/// **Paint.** For each visible row, emit our own `move_to(left_margin, row)`
+/// then that row's `rows_diff` byte run (which carries its own intra-row SGR and
+/// relative cursor moves, scoped to `[0, W)`, so it paints into physical columns
 /// `[margin, margin + W)` and never past `margin + W` — vt100's margin rule
-/// guarantees the grid is exactly `W` columns). Empty diffs (unchanged rows)
-/// are skipped. After the repaint, mirror the child's cursor visibility and
-/// reposition the real cursor to `(left_margin + col, row)`.
+/// guarantees the grid is exactly `W` columns). Empty diffs (unchanged rows) are
+/// skipped. The row paint is shared by both modes; the alt screen owns a fixed
+/// `[0, rows)` viewport and the constrained primary paint targets that same
+/// region (one screenful — the scroll-aware primary paint is slice 04).
+///
+/// After the repaint, mirror the child's cursor visibility and reposition the
+/// real cursor. The cursor row targets the **live physical row**: on the primary
+/// screen the band is painted at physical rows `[0, rows)` with no scroll yet, so
+/// the live physical row equals the grid cursor row — slice 04's scroll emit is
+/// what makes the two diverge.
 fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
+    // Mode mirror (ADR-012): edge-trigger the outer alt screen against the
+    // child's, latching whether it was ever entered. Read the flag before the
+    // long immutable borrow of `screen` below.
+    let child_alt = renderer.parser.screen().alternate_screen();
+    renderer.ever_entered_alt |= child_alt;
+    if child_alt != renderer.outer_alt_active {
+        if child_alt {
+            term.enter_alt_screen()?;
+        } else {
+            term.leave_alt_screen()?;
+            // An alt→primary edge lands us on a fresh primary screen; the cached
+            // alt frame is not a valid diff baseline, so force a full repaint.
+            renderer.reset_prev_baseline();
+        }
+        renderer.outer_alt_active = child_alt;
+    }
+
     let screen = renderer.parser.screen();
     let prev_screen = renderer.prev.screen();
 
@@ -512,29 +574,80 @@ where
     // runs no destructors, so this cannot be a Drop guard. The exit code is
     // threaded in so the dim status line draws from the same value `run` returns
     // to `main` — `None` (channel disconnected without a `ChildExited`) maps to a
-    // clean exit, so it suppresses the status line just like a zero exit.
-    let _ = run_teardown(term, exit_code.unwrap_or(0));
+    // clean exit, so it suppresses the status line just like a zero exit. The
+    // renderer is passed so teardown can read the outer alt state (conditional
+    // leave) and the final band (the Option C replay) — ADR-012.
+    let _ = run_teardown(renderer, term, exit_code.unwrap_or(0));
     exit_code
 }
 
-/// The explicit, ordered terminal restore (ADR-010): leave alt screen → emit the
-/// dim exit-status line → pop kitty flags → disable mouse → show cursor → disable
-/// raw mode. Each disables only what was actually enabled at startup (kitty pop,
-/// mouse disable).
+/// The explicit, ordered terminal restore (ADR-010), now mode-aware (ADR-012):
+/// **conditional** alt-leave → Option C latched replay + dim status → pop kitty
+/// flags → disable mouse → show cursor → disable raw mode. Each step undoes only
+/// what was actually set up (conditional alt-leave, kitty pop, mouse disable).
 ///
-/// The status line is emitted **after** the alt-leave (so it lands on the primary
-/// screen the user returns to) and **before** the remaining restore steps. The
-/// load-bearing ADR-010 invariant — alt-leave before raw-disable — is preserved:
-/// the status emission slots between alt-leave and the rest without reordering
-/// them.
-fn run_teardown<T: OuterTerminal>(term: &mut T, exit_code: i32) -> std::io::Result<()> {
-    term.leave_alt_screen()?;
-    write_exit_status(term, exit_code)?;
+/// **Conditional alt-leave (ADR-012).** The alt screen is left **only if**
+/// `outer_alt_active` — a plain command never entered it, so there is nothing to
+/// leave, and forcing a leave would itself be wrong. The load-bearing ADR-010
+/// invariant — alt-leave (when it happens) before raw-disable — is preserved.
+///
+/// **Option C latched replay (ADR-012/013).** When the child **never** entered
+/// the alt screen (`!ever_entered_alt` — the latch, not the bare exit-time read),
+/// the final band is replayed onto the primary screen plus the dim `Exited with:
+/// N` status line (slice 02). This is the safety net: a plain command's last
+/// screenful and its status survive teardown even before slice 04's scroll-aware
+/// paint. The latch suppresses the replay for anything that ever touched the alt
+/// screen (a TUI that toggled alt then left it before exit), so a TUI's final
+/// frame is never littered onto the primary screen. The status line therefore
+/// rides the replay only — a TUI emits none.
+fn run_teardown<T: OuterTerminal>(
+    renderer: &Renderer,
+    term: &mut T,
+    exit_code: i32,
+) -> std::io::Result<()> {
+    if renderer.outer_alt_active {
+        term.leave_alt_screen()?;
+    }
+    if !renderer.ever_entered_alt {
+        replay_band_to_primary(renderer, term, exit_code)?;
+    }
     term.pop_keyboard_flags()?;
     term.disable_mouse()?;
     term.show_cursor()?;
     term.disable_raw_mode()?;
     Ok(())
+}
+
+/// Option C's replay (ADR-012/013): paint the final band onto the primary screen
+/// at the band offset, then the dim `Exited with: N` status line below it. Called
+/// from teardown only when the child never entered the alt screen, so the user is
+/// already on the primary screen and the output should persist there.
+///
+/// Each non-empty row is positioned with `move_to(left_margin, row)` and painted
+/// from its full formatted bytes (`rows_formatted`, a from-scratch paint, not a
+/// diff — the live diff baseline is irrelevant at teardown). The cursor is left at
+/// the end of the bottom-most painted row, so the status line's leading `\r\n`
+/// lands one fresh line below the child's output. This is the constrained
+/// one-screenful replay — the scroll-off-the-top case is slice 04.
+fn replay_band_to_primary<T: OuterTerminal>(
+    renderer: &Renderer,
+    term: &mut T,
+    exit_code: i32,
+) -> std::io::Result<()> {
+    let screen = renderer.parser.screen();
+    for (row, line) in screen.rows_formatted(0, renderer.width).enumerate() {
+        // Skip blank rows: a fully-empty formatted row carries no visible cells,
+        // so positioning and painting it would only churn the primary screen.
+        if line.iter().all(|b| *b == b' ') {
+            continue;
+        }
+        term.move_to(renderer.left_margin, row as u16)?;
+        term.write_row(&line)?;
+    }
+    write_exit_status(term, exit_code)
+    // No explicit flush: the queued replay bytes are drained by the `show_cursor`
+    // flush later in `run_teardown` (the same way `write_exit_status`'s bytes are),
+    // so teardown emits exactly one terminal flush, not a per-helper one.
 }
 
 /// Emit the dim `Exited with: N` status line below the band, on a **non-zero**
@@ -800,16 +913,20 @@ mod tests {
         assert_eq!(code, Some(0));
     }
 
-    /// Child-exit-restore (ADR-010): enqueue `Msg::ChildExited` with no input
-    /// event; the restore side effects must fire in order, the loop must exit
-    /// rather than park, and the exit code must match `status.exit_code()`.
+    /// Child-exit-restore (ADR-010), now mode-aware (ADR-012): enqueue
+    /// `Msg::ChildExited` with no input event and no PTY content — a plain command
+    /// that never entered the alt screen. The restore side effects must fire in
+    /// order, the loop must exit rather than park, and the exit code must match
+    /// `status.exit_code()`.
+    ///
+    /// Conditional teardown (ADR-012): the child never entered the alt screen, so
+    /// `LeaveAltScreen` must **not** fire (nothing to leave). The Option C latched
+    /// replay does run — for a **non-zero** exit (42) it emits the dim
+    /// `Exited with: 42` status line via `write_row`, slotted before the remaining
+    /// restore steps.
     ///
     /// Non-kitty outer terminal (nothing pushed at startup): `PopKeyboardFlags`
     /// must NOT fire — we only pop what we pushed (ADR-003).
-    ///
-    /// A **non-zero** exit (42 here) also emits the dim `Exited with: 42` status
-    /// line via `write_row`, slotted between the alt-leave and the remaining
-    /// restore steps — the ADR-010 order is preserved (slice 02).
     #[test]
     fn child_exit_restores_in_order_no_kitty_pop_when_not_pushed() {
         use crate::terminal::OuterTerminal;
@@ -831,19 +948,19 @@ mod tests {
             1,
             "EnableMouse fires once at startup"
         );
+        // Conditional teardown: a never-alt command leaves no alt screen.
         assert_eq!(
             term.restore_calls(),
             vec![
-                Call::LeaveAltScreen,
                 Call::DisableMouse,
                 Call::ShowCursor,
                 Call::DisableRawMode,
             ],
-            "restore order with NO kitty pop (nothing was pushed)"
+            "restore order: NO LeaveAltScreen (never entered), NO kitty pop"
         );
 
         // The dim status line is recorded as a `write_row` carrying the
-        // `Exited with: 42` bytes (a blank grid emits no other `write_row`, so
+        // `Exited with: 42` bytes (a blank grid replays no other `write_row`, so
         // this is the only one).
         let status_rows: Vec<&[u8]> = term
             .calls
@@ -856,16 +973,11 @@ mod tests {
         assert_eq!(
             status_rows,
             vec![b"\r\n\x1b[2mExited with: 42\x1b[0m".as_slice()],
-            "non-zero exit emits exactly the dim status line"
+            "non-zero exit replays exactly the dim status line"
         );
 
-        // …and it slots between the alt-leave and the remaining restore steps:
-        // after LeaveAltScreen, before DisableMouse (the next restore call).
-        let leave = term
-            .calls
-            .iter()
-            .position(|c| *c == Call::LeaveAltScreen)
-            .unwrap();
+        // …and it slots before the remaining restore steps: the replay status
+        // comes before DisableMouse (the first restore call here).
         let status = term
             .calls
             .iter()
@@ -877,25 +989,28 @@ mod tests {
             .position(|c| *c == Call::DisableMouse)
             .unwrap();
         assert!(
-            leave < status && status < disable_mouse,
-            "status line slots after alt-leave and before the remaining restore steps"
+            status < disable_mouse,
+            "replay status slots before the remaining restore steps"
         );
     }
 
-    /// Child-exit-restore with a kitty-capable outer terminal: the startup push
+    /// Child-exit-restore with a kitty-capable outer terminal, for a **TUI** that
+    /// is in the alt screen at exit (`?1049h` then exit): the startup kitty push
     /// (modelled here by pushing flags on the mock before `run`) must be paired
-    /// with a `PopKeyboardFlags` in the correct restore slot — after
-    /// leave-alt-screen, before disable-raw-mode (ADR-010/003).
+    /// with a `PopKeyboardFlags` in the correct restore slot — after the (now
+    /// conditional) leave-alt-screen, before disable-raw-mode (ADR-010/003/012).
     ///
-    /// A **zero** exit is silent — no status-line `write_row` is recorded
-    /// (slice 02).
+    /// Because the child entered the alt screen, `LeaveAltScreen` fires and the
+    /// Option C replay is suppressed (the `ever_entered_alt` latch) — so a TUI's
+    /// teardown emits NO replay rows and NO status line, even on a zero exit.
     #[test]
     fn child_exit_pops_kitty_flags_when_pushed_at_startup() {
         use crate::terminal::OuterTerminal;
-        let mut clock = VirtualClock::new(vec![(
-            0u64,
-            Msg::ChildExited(ExitStatus::with_exit_code(0)),
-        )]);
+        let mut clock = VirtualClock::new(vec![
+            // The child enters the alt screen (a TUI), then exits while still in it.
+            (0u64, Msg::Pty(b"\x1b[?1049h".to_vec())),
+            (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ]);
         let mut renderer = left_renderer(80, 24, true);
         let mut term = MockTerminal::kitty_capable();
         // Simulate the startup probe + push + eager mouse capture main.rs
@@ -913,6 +1028,12 @@ mod tests {
             1,
             "EnableMouse fires once at startup"
         );
+        // The child entered the alt screen exactly once (its `?1049h` edge).
+        assert_eq!(
+            term.calls.iter().filter(|c| **c == Call::EnterAltScreen).count(),
+            1,
+            "the outer alt screen is entered once, on the child's edge"
+        );
         assert_eq!(
             term.restore_calls(),
             vec![
@@ -922,32 +1043,38 @@ mod tests {
                 Call::ShowCursor,
                 Call::DisableRawMode,
             ],
-            "kitty flags pushed at startup must be popped in the ADR-010 slot"
+            "an alt-screen TUI leaves the alt screen, then pops kitty in the ADR-010 slot"
         );
 
-        // Zero exit is silent: no status-line write_row (a blank grid emits no
-        // other write_row either, so the count is exactly zero).
+        // A TUI emits no replay and no status line — the latch suppresses Option C.
         assert_eq!(
             term.calls
                 .iter()
                 .filter(|c| matches!(c, Call::WriteRow(_)))
                 .count(),
             0,
-            "a zero exit emits no status line"
+            "an alt-screen TUI replays nothing onto the primary screen"
         );
     }
 
     /// The reusable status-line unit (slice 02), driven directly through
-    /// `run_teardown` so slice 03's contract is pinned independently of the loop.
-    /// `exit_code = 1`: a `write_row` carrying the dim `Exited with: 1` bytes,
-    /// emitted after the alt-leave and before the remaining restore steps.
-    /// `exit_code = 0`: no status-line `write_row` (success is silent).
+    /// `run_teardown` on a **primary-mode** renderer (never entered the alt
+    /// screen) so slice 03's contract is pinned independently of the loop.
+    /// `exit_code = 1`: the Option C replay records a `write_row` carrying the dim
+    /// `Exited with: 1` bytes, with NO `LeaveAltScreen` (nothing to leave), before
+    /// the remaining restore steps. `exit_code = 0`: no status-line `write_row`.
     #[test]
-    fn run_teardown_emits_dim_status_after_alt_leave_only_on_nonzero() {
-        // Non-zero: the dim line is recorded, slotted between alt-leave and the
-        // remaining restore steps.
+    fn run_teardown_replays_dim_status_on_primary_only_on_nonzero() {
+        // Non-zero on a primary (never-alt) renderer: the dim line is replayed,
+        // with no alt-leave, before the remaining restore steps.
+        let renderer = left_renderer(80, 24, false); // outer_alt_active == false
         let mut term = MockTerminal::new();
-        run_teardown(&mut term, 1).unwrap();
+        run_teardown(&renderer, &mut term, 1).unwrap();
+
+        assert!(
+            !term.calls.contains(&Call::LeaveAltScreen),
+            "a never-alt renderer must not leave an alt screen it never entered"
+        );
 
         let status_rows: Vec<&[u8]> = term
             .calls
@@ -960,14 +1087,9 @@ mod tests {
         assert_eq!(
             status_rows,
             vec![b"\r\n\x1b[2mExited with: 1\x1b[0m".as_slice()],
-            "exit_code = 1 records the dim status line via write_row"
+            "exit_code = 1 replays the dim status line via write_row"
         );
 
-        let leave = term
-            .calls
-            .iter()
-            .position(|c| *c == Call::LeaveAltScreen)
-            .unwrap();
         let status = term
             .calls
             .iter()
@@ -979,13 +1101,14 @@ mod tests {
             .position(|c| *c == Call::ShowCursor)
             .unwrap();
         assert!(
-            leave < status && status < show_cursor,
-            "status emission slots after alt-leave, before the remaining restore steps"
+            status < show_cursor,
+            "status emission slots before the remaining restore steps"
         );
 
         // Zero exit: no status-line write_row at all.
+        let renderer0 = left_renderer(80, 24, false);
         let mut term0 = MockTerminal::new();
-        run_teardown(&mut term0, 0).unwrap();
+        run_teardown(&renderer0, &mut term0, 0).unwrap();
         assert_eq!(
             term0
                 .calls
@@ -993,7 +1116,229 @@ mod tests {
                 .filter(|c| matches!(c, Call::WriteRow(_)))
                 .count(),
             0,
-            "exit_code = 0 records no status line"
+            "exit_code = 0 replays no status line"
+        );
+    }
+
+    // --- Screen-mode mirror (slice 03, ADR-012/013) ---
+
+    /// **Edge-trigger de-dupe (ADR-012).** A child that enters the alt screen
+    /// (`?1049h`) and later leaves it (`?1049l`) must toggle the OUTER alt screen
+    /// exactly once each — one `EnterAltScreen` then one `LeaveAltScreen` — the
+    /// twin of the cursor-visibility de-dupe. Repaints between the edges must not
+    /// re-toggle.
+    #[test]
+    fn alt_screen_toggles_once_per_child_edge() {
+        let script = vec![
+            // Enter alt, paint, then (a few frames later) leave alt, paint.
+            (0u64, Msg::Pty(b"\x1b[?1049h\x1b[1;1Hin-alt".to_vec())),
+            (20, Msg::Pty(b"more-alt".to_vec())),
+            (20, Msg::Pty(b"\x1b[?1049lback".to_vec())),
+            (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ];
+        let (_f, term, _p, _r, _c) = run_with(script, 20, 5);
+
+        let enters = term.calls.iter().filter(|c| **c == Call::EnterAltScreen).count();
+        let leaves = term.calls.iter().filter(|c| **c == Call::LeaveAltScreen).count();
+        assert_eq!(enters, 1, "exactly one EnterAltScreen on the child's ?1049h edge");
+        assert_eq!(leaves, 1, "exactly one LeaveAltScreen on the child's ?1049l edge");
+
+        // The enter is recorded before the leave (the edges fire in order).
+        let enter_pos = term.calls.iter().position(|c| *c == Call::EnterAltScreen).unwrap();
+        let leave_pos = term.calls.iter().position(|c| *c == Call::LeaveAltScreen).unwrap();
+        assert!(enter_pos < leave_pos, "enter precedes leave");
+    }
+
+    /// **A plain stream never enters the outer alt screen (the E2 unit floor).**
+    /// A child that only prints to the primary screen emits ZERO `EnterAltScreen`
+    /// — gutter mirrors the child's mode and never forces the alt screen.
+    #[test]
+    fn plain_stream_never_enters_alt_screen() {
+        let script = vec![
+            (0u64, Msg::Pty(b"line1\r\nline2\r\nline3".to_vec())),
+            (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ];
+        let (_f, term, _p, _r, _c) = run_with(script, 20, 5);
+
+        assert_eq!(
+            term.calls.iter().filter(|c| **c == Call::EnterAltScreen).count(),
+            0,
+            "a plain stream must never enter the outer alt screen"
+        );
+    }
+
+    /// **Conditional teardown + latch (ADR-012).** Three streams, one assertion
+    /// each, driven through the full loop + teardown:
+    /// - plain → no `LeaveAltScreen`, the band is replayed (its `write_row`s) plus
+    ///   the dim status line on the non-zero exit;
+    /// - alt (still in the alt screen at exit) → `LeaveAltScreen` present, no
+    ///   replay;
+    /// - alt-then-`?1049l` (left the alt screen before exit) → the
+    ///   `ever_entered_alt` latch still suppresses the replay, proving the latch
+    ///   beats the bare `alternate_screen()` read.
+    #[test]
+    fn conditional_teardown_and_latch() {
+        // --- Plain stream, non-zero exit: replay + status, no alt-leave. ---
+        let (_f, term, _p, _r, _c) = run_with(
+            vec![
+                (0u64, Msg::Pty(b"hello\r\nworld".to_vec())),
+                (20, Msg::ChildExited(ExitStatus::with_exit_code(5))),
+            ],
+            20,
+            5,
+        );
+        assert!(
+            !term.calls.contains(&Call::LeaveAltScreen),
+            "plain stream: nothing to leave"
+        );
+        let writes: Vec<&[u8]> = term
+            .calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::WriteRow(b) => Some(b.as_slice()),
+                _ => None,
+            })
+            .collect();
+        // The replay emits the band rows AND the status line; assert both the
+        // content and the status are present among the teardown write_rows.
+        assert!(
+            writes.iter().any(|w| w.windows(5).any(|s| s == b"hello")),
+            "plain stream replays the band content, got {writes:?}"
+        );
+        assert!(
+            writes.contains(&b"\r\n\x1b[2mExited with: 5\x1b[0m".as_slice()),
+            "plain stream replays the dim status line, got {writes:?}"
+        );
+
+        // --- Alt stream, still in the alt screen at exit: leave, no replay. ---
+        let (_f, term, _p, _r, _c) = run_with(
+            vec![
+                (0u64, Msg::Pty(b"\x1b[?1049h\x1b[1;1Htui".to_vec())),
+                (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+            ],
+            20,
+            5,
+        );
+        assert!(
+            term.calls.contains(&Call::LeaveAltScreen),
+            "alt stream: must leave the alt screen it entered"
+        );
+        // No teardown replay: the only paint is the live alt frame, not a replay.
+        // After the leave, no write_row is emitted (the replay is suppressed).
+        let leave_idx = term.calls.iter().position(|c| *c == Call::LeaveAltScreen).unwrap();
+        assert!(
+            !term.calls[leave_idx..].iter().any(|c| matches!(c, Call::WriteRow(_))),
+            "alt stream: no replay write_row after the alt-leave"
+        );
+
+        // --- Alt-then-?1049l: latched, replay STILL suppressed. ---
+        let (_f, term, _p, _r, _c) = run_with(
+            vec![
+                (0u64, Msg::Pty(b"\x1b[?1049h\x1b[1;1Htui".to_vec())),
+                (20, Msg::Pty(b"\x1b[?1049l".to_vec())),
+                (20, Msg::ChildExited(ExitStatus::with_exit_code(3))),
+            ],
+            20,
+            5,
+        );
+        // The bare alternate_screen() read at exit is false (the child left it),
+        // but the latch remembers — so no replay and no status line.
+        let teardown_writes: Vec<&[u8]> = term
+            .calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::WriteRow(b) => Some(b.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !teardown_writes.contains(&b"\r\n\x1b[2mExited with: 3\x1b[0m".as_slice()),
+            "alt-then-primary: the latch suppresses the replay status, got {teardown_writes:?}"
+        );
+    }
+
+    /// **The primary-branch cursor tail targets the live physical row (ADR-012).**
+    /// A plain stream leaves the cursor at the child's cursor row; the recorded
+    /// `PlaceCursor` row must equal the grid cursor row, not an absolute row above
+    /// the band. (For the constrained one-screenful paint the live physical row IS
+    /// the grid cursor row; slice 04's scroll emit is what makes them diverge.)
+    #[test]
+    fn primary_cursor_targets_live_physical_row() {
+        let script = vec![
+            (0u64, Msg::Pty(b"alpha\r\nbeta\r\ngamma".to_vec())),
+            (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ];
+        let mut clock = VirtualClock::new(script);
+        let mut renderer = left_renderer(20, 5, false);
+        let mut term = MockTerminal::new();
+        let mut pty: Vec<u8> = Vec::new();
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+
+        // The child's cursor after "gamma" (no trailing newline) is on row 2.
+        let (crow, _ccol) = renderer.screen().cursor_position();
+        assert_eq!(crow, 2, "child cursor on the third line (row 2)");
+
+        // The last PlaceCursor the primary paint recorded targets that live row,
+        // never an absolute row above the band (e.g. row 0).
+        let placed_row = term
+            .calls
+            .iter()
+            .rev()
+            .find_map(|c| if let Call::PlaceCursor(_, row) = c { Some(*row) } else { None })
+            .expect("a primary paint placed the cursor");
+        assert_eq!(
+            placed_row, crow,
+            "primary cursor tail targets the live physical row (= grid cursor row)"
+        );
+    }
+
+    /// **Primary-mode resize preserves history above the band (ADR-012).** A plain
+    /// (non-alt) stream resized mid-run must NOT emit the absolute `clear_gutter`
+    /// or a full-band repaint — those would erase the real shell's scrollback above
+    /// the band on the primary screen. Contrast: an alt stream resized the same way
+    /// still does the absolute `[0, rows)` clear (the v1 behaviour, correct in the
+    /// alt screen). Pins the `outer_alt_active` gate in `handle_resize`.
+    #[test]
+    fn primary_resize_preserves_history_alt_resize_clears() {
+        use crossterm::event::Event;
+
+        // --- Primary (plain) stream resized: NO clear_gutter, NO repaint. ---
+        let script = vec![
+            (0u64, Msg::Pty(b"primary content".to_vec())),
+            // A resize arrives mid-run, BEFORE the child exits.
+            (20, Msg::Input(Event::Resize(100, 30))),
+            (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ];
+        let mut clock = VirtualClock::new(script);
+        let mut renderer = left_renderer(20, 24, false);
+        let mut term = MockTerminal::new();
+        let mut pty: Vec<u8> = Vec::new();
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+
+        // The absolute gutter clear must NOT fire on the primary screen — it would
+        // blank rows the real shell drew above the band.
+        assert!(
+            !term.calls.iter().any(|c| matches!(c, Call::ClearGutter(..))),
+            "primary-mode resize must not clear_gutter (would erase history), calls = {:?}",
+            term.calls
+        );
+
+        // --- Alt stream resized: the absolute clear_gutter STILL fires. ---
+        let script = vec![
+            (0u64, Msg::Pty(b"\x1b[?1049h\x1b[1;1Htui".to_vec())),
+            (20, Msg::Input(Event::Resize(100, 30))),
+            (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ];
+        let mut clock = VirtualClock::new(script);
+        let mut renderer = left_renderer(20, 24, false);
+        let mut term = MockTerminal::new();
+        let mut pty: Vec<u8> = Vec::new();
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+
+        assert!(
+            term.calls.iter().any(|c| matches!(c, Call::ClearGutter(..))),
+            "alt-mode resize must still clear_gutter (v1 behaviour), calls = {:?}",
+            term.calls
         );
     }
 
@@ -1959,7 +2304,8 @@ mod resize {
     }
 
     /// **Mid-burst case C — physical gutter has no stale cells.** Paint a wide
-    /// left-aligned frame, then resize so the band shrinks and the margin moves;
+    /// left-aligned frame in the **alt screen** (where the absolute gutter clear
+    /// is owned, ADR-012), then resize so the band shrinks and the margin moves;
     /// after the gutter clear + repaint, every physical cell outside the band must
     /// be blank. Proves the explicit gutter clear (ADR-008 step 4) — the
     /// `rows_diff` repaint alone touches only `[margin, margin+W)`.
@@ -1968,11 +2314,13 @@ mod resize {
         let (w0, rows, phys) = (100u16, 6u16, 120u16);
         // Start left-aligned, 100-wide, so cols 0..100 carry content.
         let mut r = renderer(w0, rows, phys, Layout::Left, Width::Cols(w0));
-        // Fill row 0 across the whole band so a shrink would strand cells.
+        // Enter the alt screen (a TUI owns its viewport) and fill row 0 across the
+        // whole band so a shrink would strand cells.
         let filler: String = "X".repeat(w0 as usize);
-        r.parser.process(format!("\x1b[1;1H{filler}").as_bytes());
+        r.parser.process(format!("\x1b[?1049h\x1b[1;1H{filler}").as_bytes());
 
-        // First paint the wide frame into the physical grid.
+        // First paint the wide frame into the physical grid (this enters the outer
+        // alt screen on the child's edge, so `outer_alt_active` is now true).
         let mut grid = RecordingGrid::new(phys, rows);
         render_once(&mut r, &mut grid).unwrap();
         // Sanity: a cell near the right of the old band is painted.
@@ -2114,11 +2462,16 @@ mod resize {
         assert!(r.width > 0, "W never collapses to zero");
     }
 
-    /// The gutter clear is invoked with the live band geometry every resize —
-    /// proven on the `MockTerminal` call record.
+    /// The gutter clear is invoked with the live band geometry every resize — in
+    /// the **alt screen**, where gutter owns the whole viewport (ADR-012). Proven
+    /// on the `MockTerminal` call record.
     #[test]
     fn resize_clears_the_gutter() {
         let mut r = renderer(80, 24, 200, Layout::Center, Width::Cols(80));
+        // The child is in the alt screen at the resize (a TUI). The absolute
+        // gutter clear is gated on this (ADR-012); see the primary-mode guard test
+        // for the suppressed case.
+        r.outer_alt_active = true;
         let resizer = RecResizer::default();
         let mut term = MockTerminal::new();
         handle_resize(&mut r, &resizer, &mut term, 120, 30);

@@ -13,13 +13,15 @@
 //!   `sh -c 'stty cols C rows R; exec gutter ...'`: `stty` resizes gutter's own
 //!   controlling terminal BEFORE it reads its size at startup — deterministic,
 //!   no resize race.
-//! - **Capture the LIVE frame, not the post-exit screen.** gutter renders into
-//!   the alternate screen and, on child exit, leaves it (`?1049l`) — which
-//!   discards that screen's content. So the wrapped children here stay alive
-//!   (a long `sleep`) and the harness drains a bounded window WHILE the child
-//!   is still running, parsing the alt-screen frame gutter actually painted.
-//!   The child-exit-restore test is the one case that deliberately reads the
-//!   teardown sequence instead.
+//! - **Capture the LIVE frame, not the post-exit screen.** gutter mirrors the
+//!   child's screen mode (ADR-012): a TUI's content is painted into the outer
+//!   alternate screen, which is discarded on the alt-leave at teardown. So the
+//!   alt-screen children here stay alive (a long `sleep`) and the harness drains
+//!   a bounded window WHILE the child is still running, parsing the alt-screen
+//!   frame gutter actually painted. Plain (non-alt) children are the opposite:
+//!   their output is painted onto the PRIMARY screen and SURVIVES teardown, so
+//!   the plain-output and exit-status tests read the post-exit stream. The
+//!   child-exit-restore test deliberately reads the teardown sequence.
 //!
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
@@ -261,6 +263,78 @@ fn child_exit_restores_terminal_and_propagates_code() {
     );
 }
 
+/// **Plain output survives to the primary screen (the E2 regression, ADR-012).**
+/// A plain command that only prints to the primary screen (`printf 'line1\nline2
+/// \nline3'; exit 0`, no `?1049h`): gutter must mirror the child's mode, never
+/// force the alt screen, and leave the output visible on the primary screen after
+/// exit. Asserted on the post-exit stream — the inverse of the alt-screen tests:
+/// the three lines are present AND `?1049h`/`?1049l` are NEVER emitted.
+#[test]
+fn plain_command_output_survives_to_primary_screen() {
+    // No trailing newline, no alt-screen negotiation — a pure primary-screen
+    // command. It exits immediately; we read the post-exit stream.
+    let child = "/bin/sh -c \"printf 'line1\\nline2\\nline3'; exit 0\"";
+    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 --left {child}"));
+    let mut session = spawn(cmd);
+
+    // Drain through teardown: the output is on the primary screen, so it survives.
+    let bytes = drain_window(&mut session, Duration::from_secs(3));
+    let s = String::from_utf8_lossy(&bytes);
+
+    // gutter must NEVER force the alt screen for a plain command — the E2 fix.
+    assert!(
+        !s.contains("\u{1b}[?1049h") && !s.contains("\u{1b}[?1049l"),
+        "a plain command must never emit ?1049h/?1049l, got {s:?}"
+    );
+
+    // All three lines are visible on the primary screen after exit.
+    let parser = outer_grid(&bytes, 80, 24);
+    let screen = parser.screen();
+    for marker in ["line1", "line2", "line3"] {
+        let present = screen.rows(0, 80).any(|r| r.contains(marker));
+        assert!(present, "plain output {marker:?} must survive on the primary screen");
+    }
+
+    assert_eq!(wait_status(session), Some(0), "gutter propagates the zero exit");
+}
+
+/// **Mode-switch mid-run (ADR-012).** A child that prints to the PRIMARY screen
+/// first, THEN enters the alt screen (`?1049h`), paints, and exits while in alt.
+/// gutter must enter the outer alt screen on the child's edge — AFTER the primary
+/// lines — not at startup, and restore cleanly (leave the alt screen) on exit.
+#[test]
+fn mode_switch_mid_run_enters_alt_after_primary_lines() {
+    // Print a primary marker, then enter the alt screen and paint, then exit in
+    // alt. The `?1049h` must appear in the stream AFTER the primary marker.
+    let child = "/bin/sh -c \"printf 'primline'; sleep 0.3; printf '\\033[?1049h\\033[1;1Halt-frame'; sleep 0.3; exit 0\"";
+    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 --left {child}"));
+    let mut session = spawn(cmd);
+
+    let bytes = drain_window(&mut session, Duration::from_secs(3));
+    let s = String::from_utf8_lossy(&bytes);
+
+    // The outer alt screen is entered (the child's `?1049h` edge) and later left.
+    let enter = s
+        .find("\u{1b}[?1049h")
+        .expect("gutter must enter the outer alt screen on the child's edge");
+    assert!(
+        s.contains("\u{1b}[?1049l") || s.contains("\u{1b}[?47l"),
+        "gutter must leave the outer alt screen on exit, got {s:?}"
+    );
+
+    // The primary marker was painted BEFORE the alt screen was entered — proving
+    // the alt screen is entered lazily on the child's edge, not forced at startup.
+    let prim = s
+        .find("primline")
+        .expect("the primary marker must be painted on the primary screen");
+    assert!(
+        prim < enter,
+        "the primary lines must be painted before the ?1049h edge (not forced at startup)"
+    );
+
+    let _ = wait_status(session);
+}
+
 /// Block on the wrapped process and return its exit code, if any.
 fn wait_status(session: OsSession) -> Option<i32> {
     use expectrl::process::unix::WaitStatus;
@@ -319,12 +393,12 @@ fn multi_mb_scroll_stays_bounded() {
     drop(session);
 }
 
-/// **Non-zero exit shows the dim `Exited with: N` status line (slice 02).** A
-/// child that exits non-zero: gutter must, after leaving the alt screen (so the
-/// line lands on the primary screen the user returns to), emit the dim
-/// `\r\n\x1b[2mExited with: N\x1b[0m`. Asserted on the raw teardown bytes —
-/// reading to the teardown, like the child-exit-restore test, and confirming the
-/// status line lands *after* the alt-leave (`?1049l`).
+/// **Non-zero exit shows the dim `Exited with: N` status line (slice 02/03).** A
+/// plain child that exits non-zero: gutter mirrors the child's mode (ADR-012), so
+/// it never forces the alt screen — the band is painted onto the **primary**
+/// screen and the Option C replay emits the dim `\r\n\x1b[2mExited with: N\x1b[0m`
+/// there on exit. Asserted on the raw teardown bytes: the status line is present
+/// AND gutter never emits `?1049h`/`?1049l` for this plain command.
 #[test]
 fn non_zero_exit_shows_dim_status_line() {
     let child = "/bin/sh -c 'exit 3'";
@@ -339,17 +413,10 @@ fn non_zero_exit_shows_dim_status_line() {
         s.contains("\u{1b}[2mExited with: 3\u{1b}[0m"),
         "non-zero exit must emit the dim status line, got {s:?}"
     );
-    // The status line lands AFTER the alt-leave (on the primary screen).
-    let leave = s
-        .find("\u{1b}[?1049l")
-        .or_else(|| s.find("\u{1b}[?47l"))
-        .expect("teardown must leave the alternate screen");
-    let status = s
-        .find("Exited with: 3")
-        .expect("status line present");
+    // A plain command never touches the alt screen — neither enter nor leave.
     assert!(
-        leave < status,
-        "the status line must land after the alt-leave (on the primary screen)"
+        !s.contains("\u{1b}[?1049h") && !s.contains("\u{1b}[?1049l"),
+        "a plain command must never enter/leave the alt screen, got {s:?}"
     );
 
     assert_eq!(
@@ -359,9 +426,10 @@ fn non_zero_exit_shows_dim_status_line() {
     );
 }
 
-/// **Zero exit is silent (slice 02).** A child that exits cleanly: gutter must
-/// emit NO status line — a clean run leaves a clean screen. Asserted on the raw
-/// teardown bytes, which must still carry the alt-leave but no `Exited with:`.
+/// **Zero exit is silent (slice 02/03).** A plain child that exits cleanly:
+/// gutter must emit NO status line — a clean run leaves a clean screen — and,
+/// mirroring the child's mode (ADR-012), must never enter or leave the alt screen
+/// for a plain command. Asserted on the raw teardown bytes.
 #[test]
 fn zero_exit_shows_no_status_line() {
     let child = "/bin/sh -c 'exit 0'";
@@ -371,14 +439,15 @@ fn zero_exit_shows_no_status_line() {
     let bytes = drain_window(&mut session, Duration::from_secs(3));
     let s = String::from_utf8_lossy(&bytes);
 
-    // The teardown still ran (alt-leave present), but no status line at all.
-    assert!(
-        s.contains("\u{1b}[?1049l") || s.contains("\u{1b}[?47l"),
-        "teardown must leave the alternate screen, got {s:?}"
-    );
+    // No status line on a clean exit.
     assert!(
         !s.contains("Exited with:"),
         "a zero exit must emit no status line, got {s:?}"
+    );
+    // And a plain command never touches the alt screen.
+    assert!(
+        !s.contains("\u{1b}[?1049h") && !s.contains("\u{1b}[?1049l"),
+        "a plain command must never enter/leave the alt screen, got {s:?}"
     );
 
     assert_eq!(

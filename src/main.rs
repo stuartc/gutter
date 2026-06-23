@@ -140,7 +140,8 @@ fn run() -> i32 {
     // Spawned but never joined; reaped by process::exit on teardown (ADR-010).
     thread::spawn(move || input::run(merged_tx));
 
-    // --- Outer terminal setup: raw mode, kitty probe, then alt screen ---
+    // --- Outer terminal setup: raw mode, kitty probe, eager mouse capture ---
+    // No forced alt screen (ADR-012): the render thread mirrors the child's mode.
     let mut terminal = CrosstermTerminal::new();
     if let Err(e) = terminal.enable_raw_mode() {
         eprintln!("gutter: failed to enable raw mode: {e}");
@@ -180,11 +181,11 @@ fn run() -> i32 {
         eprintln!("gutter: failed to enable mouse capture: {e}");
     }
 
-    if let Err(e) = terminal.enter_alt_screen() {
-        let _ = terminal.disable_raw_mode();
-        eprintln!("gutter: failed to enter alt screen: {e}");
-        return 1;
-    }
+    // No forced alt screen (ADR-012). gutter mirrors the child's screen mode: the
+    // render thread enters the outer alt screen lazily, on the child's `?1049h`
+    // edge, and a plain command stays on the primary screen so its output
+    // survives on exit. Kitty push and eager mouse capture above both work on the
+    // primary screen, so they stay.
 
     // --- The OSC-52 clipboard sink: a separately-opened /dev/tty (ADR-004) ---
     // Opened read-write at this ONE call site, distinct from crossterm's stdout

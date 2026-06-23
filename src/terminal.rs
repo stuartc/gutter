@@ -2,10 +2,13 @@
 //!
 //! Two responsibilities behind one injectable trait:
 //!
-//! 1. **Lifecycle** — raw mode, alt screen, and the explicit ordered restore
-//!    (leave alt screen → pop kitty flags → disable mouse → show cursor →
-//!    disable raw mode) run BEFORE `process::exit` (ADR-010). `process::exit`
-//!    runs no destructors, so teardown cannot be a `Drop` guard.
+//! 1. **Lifecycle** — raw mode, the mirrored alt screen, and the explicit
+//!    ordered restore (conditionally leave alt screen → pop kitty flags → disable
+//!    mouse → show cursor → disable raw mode) run BEFORE `process::exit`
+//!    (ADR-010). The alt screen is no longer forced at setup; it mirrors the
+//!    child's mode from the render thread (ADR-012), so the teardown leave is
+//!    conditional. `process::exit` runs no destructors, so teardown cannot be a
+//!    `Drop` guard.
 //! 2. **Render output** — the offset repaint paints through this handle:
 //!    `move_to(col, row)` positions a row at its physical left margin,
 //!    `write_row(bytes)` emits that row's `rows_diff` byte run, `place_cursor`
@@ -52,7 +55,9 @@ pub trait OuterTerminal {
     ///
     /// [`disable_mouse`]: OuterTerminal::disable_mouse
     fn enable_mouse(&mut self) -> io::Result<()>;
-    /// Enter the alternate screen. Setup; after raw mode.
+    /// Enter the alternate screen — mirroring the child's `?1049h` edge from the
+    /// render thread (ADR-012). gutter never forces the alt screen at setup; this
+    /// is called mid-run, only when the child enters it.
     fn enter_alt_screen(&mut self) -> io::Result<()>;
 
     // --- Render output (per frame) ---
@@ -89,7 +94,10 @@ pub trait OuterTerminal {
     fn flush(&mut self) -> io::Result<()>;
 
     // --- Teardown (ADR-010 order) ---
-    /// Leave the alternate screen. Teardown step 1.
+    /// Leave the alternate screen. Teardown step 1 — but **conditional** on the
+    /// outer terminal actually being in the alt screen (ADR-012): a plain command
+    /// never entered it, so teardown skips the leave. Also called mid-run on the
+    /// child's alt→primary edge.
     fn leave_alt_screen(&mut self) -> io::Result<()>;
     /// Pop kitty keyboard enhancement flags. Teardown step 2. No-op until
     /// slice 04 pushes them.
