@@ -449,9 +449,26 @@ mod equivalence_gate {
     /// The checked-in real-target byte stream and its reviewed allowlist.
     const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/claude-code-flow.cast");
     const ALLOWLIST: &str = include_str!("../../tests/fixtures/claude-code-flow.allowlist");
-    /// The band width the fixture was recorded at, and the gate replays at.
+    /// The band width the keystone fixture was recorded at, and the gate replays
+    /// at. This pair is bound to `claude-code-flow.cast` and read by name in three
+    /// tests — a second fixture at any other width must carry its OWN dimensions
+    /// (the per-fixture width trap), so the wide-edge fixture uses `W_WIDE`/
+    /// `ROWS_WIDE` below rather than borrowing these.
     const W: u16 = 80;
     const ROWS: u16 = 24;
+
+    /// The CJK / wide-char-at-band-edge fixture (slice 06, A2) and its reviewed
+    /// allowlist. A separate raw, timing-less, settled alt-screen VT byte stream
+    /// from the keystone — laid out so a wide (2-cell) glyph's lead sits at the
+    /// last in-band column, putting real divergence pressure on vt100's margin
+    /// rule (ADR-006). It declares its OWN width/rows (`W_WIDE`/`ROWS_WIDE`) — it
+    /// happens to also be 80×24, but the consts are distinct names so the gate
+    /// never silently reuses the keystone's pair against a differently-sized
+    /// fixture (the per-fixture width trap the PRD names).
+    const FIXTURE_WIDE: &[u8] = include_bytes!("../../tests/fixtures/wide-edge.cast");
+    const ALLOWLIST_WIDE: &str = include_str!("../../tests/fixtures/wide-edge.allowlist");
+    const W_WIDE: u16 = 80;
+    const ROWS_WIDE: u16 = 24;
 
     /// **The gate (CI keystone).** Replay the fixture at width `W` through
     /// `tattoy-wezterm-term` (bare) AND gutter's vt100 (wrapped, margin 0),
@@ -605,6 +622,98 @@ mod equivalence_gate {
             allow.is_empty(),
             "the reviewed allowlist is empty for the current fixture (no benign \
              divergences); if this changes, add reviewed entries"
+        );
+    }
+
+    /// **The wide-char-at-band-edge gate (slice 06, A2).** The same pipeline as
+    /// the keystone, run against `wide-edge.cast` at its OWN `W_WIDE`/`ROWS_WIDE`
+    /// — a settled alt-screen frame where wide (2-cell) CJK glyphs and an emoji sit
+    /// at the last in-band column (cols 79/80), plus a CJK run that overflows the
+    /// band by a full glyph so vt100's margin rule must wrap it. **Pass = zero
+    /// CORRUPTING cells** (ADR-001): both emulators must agree on every CHARACTER.
+    ///
+    /// This is the test that would FAIL and demand `render_cell_walk` be wired
+    /// (A1, slice 05) if vt100's margin rule ever let a wide glyph's right half
+    /// bleed past column W where the wezterm-term oracle did not — a corrupting
+    /// cell here is the concrete, known trigger that reopens A1 (ADR-006).
+    #[test]
+    fn wide_edge_equivalence_gate_passes() {
+        let allowlist = Allowlist::parse(ALLOWLIST_WIDE);
+        let result = gate(FIXTURE_WIDE, W_WIDE, ROWS_WIDE, &allowlist);
+
+        assert!(
+            result.corrupting.is_empty(),
+            "WIDE-EDGE GATE FAILED: {} corrupting cell(s) — vt100 and the \
+             wezterm-term oracle disagree on a CHARACTER at the band edge. A wide \
+             glyph's half bled past column W on one side (ADR-006 right-edge \
+             safety). This is the concrete A1 trigger: render_cell_walk now has a \
+             reason to be wired live. First few: {:?}",
+            result.corrupting.len(),
+            result
+                .corrupting
+                .iter()
+                .take(8)
+                .map(|d| (d.row, d.col, &d.bare_cell.contents, &d.wrapped_cell.contents))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            result.unallowlisted_benign.is_empty(),
+            "WIDE-EDGE GATE: {} benign divergence(s) not in the reviewed allowlist \
+             — a reviewer must sign them off in wide-edge.allowlist. First few: {:?}",
+            result.unallowlisted_benign.len(),
+            result
+                .unallowlisted_benign
+                .iter()
+                .take(8)
+                .map(|d| (d.row, d.col))
+                .collect::<Vec<_>>()
+        );
+        assert!(result.passes(), "wide-edge gate must pass on the settled frame");
+    }
+
+    /// **Wide-edge fixture coverage (assertion on the fixture).** The checked-in
+    /// `wide-edge.cast` must carry real wide content — CJK codepoints AND an emoji
+    /// — and stay SGR-dense, so it can't silently degrade to thin ASCII and stop
+    /// exercising vt100's margin rule (the analogue of
+    /// `fixture_contains_the_five_phases` for the keystone).
+    #[test]
+    fn wide_edge_fixture_contains_wide_content() {
+        let f = FIXTURE_WIDE;
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack.windows(needle.len()).any(|w| w == needle)
+        }
+
+        // A settled alt-screen frame (the wide content is laid into a fixed band).
+        assert!(contains(f, b"\x1b[?1049h"), "wide-edge: alt-screen enter (DECSET)");
+
+        // CJK codepoints (each 2 grid cells wide) — the UTF-8 bytes of the glyphs
+        // the fixture lays at the band edge.
+        assert!(contains(f, "漢".as_bytes()), "wide-edge: CJK glyph present");
+        assert!(contains(f, "字".as_bytes()), "wide-edge: CJK glyph present");
+        // An emoji (also 2 cells wide) at the edge — the non-CJK wide codepoint.
+        assert!(contains(f, "🌟".as_bytes()), "wide-edge: emoji present");
+
+        // SGR-dense, not thin ASCII: a healthy count of CSI introducers proves the
+        // fixture carries real attribute runs (SGR backgrounds straddle the edge).
+        let sgr_count = f.windows(2).filter(|w| w == b"\x1b[").count();
+        assert!(
+            sgr_count > 15,
+            "wide-edge fixture must be SGR-dense (got {sgr_count} CSI introducers) \
+             — a thin fixture stops exercising the margin rule (ADR-001/006)"
+        );
+    }
+
+    /// The reviewed wide-edge allowlist file loads and is empty (the two emulators
+    /// agree on every cell of the settled wide-edge frame — zero corrupting AND
+    /// zero benign divergences). It exists, parses, and is the seam a reviewer adds
+    /// to only on a benign SGR-convention difference at a same-character cell.
+    #[test]
+    fn wide_edge_allowlist_file_loads() {
+        let allow = Allowlist::parse(ALLOWLIST_WIDE);
+        assert!(
+            allow.is_empty(),
+            "the reviewed wide-edge allowlist is empty (no benign divergences); if \
+             this changes, add reviewed entries with a sign-off"
         );
     }
 }

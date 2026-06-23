@@ -1,0 +1,28 @@
+# Reviewed benign-divergence allowlist for the wide-char-at-band-edge equivalence
+# gate fixture (ADR-001/006, slice 06). Each entry tolerates ONE specific benign
+# divergence between the wezterm-term oracle (bare) and gutter's vt100 (wrapped)
+# on the settled frame of tests/fixtures/wide-edge.cast at width 80.
+#
+# This fixture lays CJK runs and an emoji so a wide (2-cell) glyph's lead sits at
+# the last in-band column — the exact place vt100's margin rule decides whether
+# the lead half wraps to the next row or bleeds past the band (ADR-006). It is
+# the documented A1 trigger (slice 05): if the two emulators ever disagree on a
+# CHARACTER at a cell here, that is a CORRUPTING cell — it cannot be allowlisted
+# (only same-character SGR-convention differences are benign), and it is the
+# concrete reason render_cell_walk would be wired live.
+#
+# wezterm is a divergence CLASSIFIER, not pass/fail ground truth: a benign
+# divergence is one where BOTH emulators rendered the same CHARACTER and only an
+# SGR convention differs. Such a cell is tolerated ONLY if it appears here, with
+# a human sign-off (this file is a reviewed, version-controlled diff).
+#
+# Format (whitespace-separated, one per line):
+#   <row> <col> <bare_contents> <wrapped_contents>
+# where `~` stands for an empty (blank) cell. Lines starting with `#` and blank
+# lines are ignored.
+#
+# As of the slice-06 review the two emulators agree on EVERY cell of the
+# fixture's settled frame — zero corrupting AND zero benign divergences — so no
+# entry is required. The file exists, is consulted by the gate, and is the seam a
+# reviewer adds to (with sign-off) only if a future fixture refresh surfaces a
+# benign SGR-convention difference on a same-character cell.
