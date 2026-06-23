@@ -265,7 +265,7 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
 
     // Reposition the real cursor inside the band.
     let (crow, ccol) = screen.cursor_position();
-    term.place_cursor(crate::geometry::physical_col(renderer.left_margin, ccol), crow)?;
+    term.place_cursor(geometry::physical_col(renderer.left_margin, ccol), crow)?;
 
     term.flush()?;
 
@@ -334,7 +334,7 @@ fn render_cell_walk<T: OuterTerminal>(
             // column (`col == W - 1`) vt100 never produces — a wide glyph that
             // wouldn't fit is wrapped to the next row, so the lead cell is at
             // most `col == W - 2` and `left_margin + W` is never painted.
-            term.move_to(crate::geometry::physical_col(left_margin, col), row)?;
+            term.move_to(geometry::physical_col(left_margin, col), row)?;
             term.write_row(contents.as_bytes())?;
         }
     }
