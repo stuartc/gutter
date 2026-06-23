@@ -11,8 +11,12 @@
 //!   terminal is restored with NO keystroke), which also proves there is no
 //!   hang on teardown (the detached input thread is reaped by `process::exit`).
 //!
+//! Iteration-02 slice 01 (E1) adds two more: the child spawns in the launcher's
+//! cwd (not `$HOME`), and the child inherits the launcher's environment.
+//!
 //! Headless: a real PTY with no display. Tests pin `TERM=xterm-256color`.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -42,13 +46,33 @@ fn gutter_cmd(child_argv: &[&str]) -> Command {
 
 /// Spawn gutter under a real PTY sized `OUTER_COLS × OUTER_ROWS`.
 fn spawn_gutter(child_argv: &[&str]) -> OsSession {
-    let mut session = Session::spawn(gutter_cmd(child_argv)).expect("spawn gutter under PTY");
+    spawn_gutter_with(child_argv, |_| {})
+}
+
+/// Spawn gutter under a real PTY, letting the caller tweak the `Command` first
+/// (e.g. set the launcher's `current_dir` or export an env var) — the seam the
+/// E1 cwd / env-inheritance tests drive.
+fn spawn_gutter_with(child_argv: &[&str], configure: impl FnOnce(&mut Command)) -> OsSession {
+    let mut cmd = gutter_cmd(child_argv);
+    configure(&mut cmd);
+    let mut session = Session::spawn(cmd).expect("spawn gutter under PTY");
     session
         .get_process_mut()
         .set_window_size(OUTER_COLS, OUTER_ROWS)
         .expect("set outer PTY window size");
     session.set_expect_timeout(Some(Duration::from_secs(10)));
     session
+}
+
+/// Create a fresh, uniquely-named directory under the system temp dir and return
+/// its canonical (symlink-resolved) path. On macOS the temp dir is reached via
+/// `/tmp -> /private/tmp`, so the child's `pwd -P` reports the resolved path;
+/// canonicalising here lets both sides agree.
+fn fresh_temp_dir(tag: &str) -> PathBuf {
+    let unique = format!("gutter-e1-{tag}-{}", std::process::id());
+    let dir = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    std::fs::canonicalize(&dir).expect("canonicalize temp dir")
 }
 
 /// Passthrough of a non-full-screen child: `gutter echo hi-from-gutter` shows
@@ -108,4 +132,53 @@ fn child_exit_restores_terminal_no_keystroke() {
         WaitStatus::Exited(_, code) => assert_eq!(code, 0),
         other => panic!("expected clean exit 0, got {other:?}"),
     }
+}
+
+/// **E1 regression: the child spawns in the launcher's cwd, not `$HOME`.** Set
+/// gutter's process `current_dir` to a known temp dir, wrap a `pwd -P`-reporting
+/// child, and assert it reports that temp dir — not `$HOME`. Before the
+/// `builder.cwd(...)` fix, portable-pty `current_dir($HOME)`'d the child and
+/// this reported the home directory (the `tig` "Not a git repository" symptom).
+#[test]
+fn child_spawns_in_launcher_cwd() {
+    let launch_dir = fresh_temp_dir("cwd");
+    // `pwd -P` resolves symlinks, matching our canonicalised `launch_dir`.
+    let mut p = spawn_gutter_with(&["sh", "-c", "pwd -P"], |cmd| {
+        cmd.current_dir(&launch_dir);
+    });
+
+    let expected = launch_dir.to_string_lossy().into_owned();
+    p.expect(expected.as_str())
+        .unwrap_or_else(|e| panic!("child should report the launcher cwd {expected:?}: {e:?}"));
+
+    // And it must NOT be `$HOME` — guards against the home fallback regressing.
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = Path::new(&home);
+        // The temp dir is outside HOME on every supported platform; assert that
+        // so the positive match above can't be home masquerading as the cwd.
+        assert!(
+            !launch_dir.starts_with(home),
+            "test temp dir {launch_dir:?} must be outside HOME {home:?}"
+        );
+    }
+
+    p.expect(Eof).expect("gutter exits after child completes");
+    let _ = std::fs::remove_dir_all(&launch_dir);
+}
+
+/// **Env inheritance (already correct; locked in).** Export a probe variable
+/// before launch and wrap a child that echoes it; the child must receive the
+/// launcher's value. `CommandBuilder::new` seeds `get_base_env()` from the full
+/// launcher env, so this passes today — the test guards a future portable-pty
+/// bump from silently dropping env inheritance while we touch the spawn path.
+#[test]
+fn child_inherits_launcher_env() {
+    const PROBE_VALUE: &str = "gutter-env-probe-value-9173";
+    let mut p = spawn_gutter_with(&["sh", "-c", "printf '%s\\n' \"$GUTTER_ENV_PROBE\""], |cmd| {
+        cmd.env("GUTTER_ENV_PROBE", PROBE_VALUE);
+    });
+
+    p.expect(PROBE_VALUE)
+        .expect("child must receive the launcher-exported env var");
+    p.expect(Eof).expect("gutter exits after child completes");
 }

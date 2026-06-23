@@ -101,6 +101,14 @@ pub fn spawn(
     for arg in args {
         builder.arg(arg);
     }
+    // Without a cwd, portable-pty actively `current_dir($HOME)`s the child
+    // (`cmdbuilder.rs` `dir = self.cwd.unwrap_or(home)`), so the child runs in
+    // $HOME rather than where gutter was launched. Spawn it where the user is
+    // standing. The error is swallowed deliberately: if the cwd cannot be read,
+    // portable-pty's home fallback is a reasonable last resort over aborting.
+    if let Ok(cwd) = std::env::current_dir() {
+        builder.cwd(cwd);
+    }
 
     let child = pair
         .slave
