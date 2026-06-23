@@ -139,7 +139,7 @@ fn child_sees_band_width() {
 #[test]
 fn content_in_band_gutters_empty() {
     let child = "/bin/sh -c 'printf HELLO_FROM_THE_BAND; sleep 3'";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 {child}"));
+    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
     let mut session = spawn(cmd);
     let bytes = drain_window(&mut session, Duration::from_millis(700));
 
@@ -161,7 +161,7 @@ fn content_in_band_gutters_empty() {
 fn cursor_tracks_child_inside_band() {
     // Move to row 3, col 10 (1-based CSI), then idle alive.
     let child = "/bin/sh -c 'printf \"\\033[3;10H\"; sleep 3'";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 {child}"));
+    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
     let mut session = spawn(cmd);
     let bytes = drain_window(&mut session, Duration::from_millis(700));
 
@@ -180,7 +180,7 @@ fn cursor_tracks_child_inside_band() {
 #[test]
 fn cursor_visibility_mirrored_on_outer() {
     let child = "/bin/sh -c 'printf \"\\033[?25lX\"; sleep 3'";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 {child}"));
+    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
     let mut session = spawn(cmd);
     let bytes = drain_window(&mut session, Duration::from_millis(700));
 
@@ -198,7 +198,7 @@ fn cursor_visibility_mirrored_on_outer() {
 #[test]
 fn vim_renders_inside_band() {
     let child = "/usr/bin/vim -u NONE -N -i NONE";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 {child}"));
+    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
     let mut session = spawn(cmd);
 
     // Let vim enter the alt screen and lay out.
@@ -291,7 +291,7 @@ fn multi_mb_scroll_stays_bounded() {
     // PAST our capture window — we want the live alt-screen frame, not the
     // post-exit primary screen (leaving the alt screen discards its content).
     let child = "/bin/sh -c 'i=0; while [ $i -lt 20000 ]; do printf \"line %d of the flood test\\n\" $i; i=$((i+1)); done; sleep 6'";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 {child}"));
+    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
     let mut session = spawn(cmd);
 
     let start = Instant::now();

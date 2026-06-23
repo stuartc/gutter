@@ -1,41 +1,46 @@
 //! Command-line parsing.
 //!
-//! `gutter [--width <N>] <cmd> [args...]`. The first non-flag positional is the
-//! command, the rest are its arguments — a hand-rolled split of
-//! `std::env::args`, no clap.
+//! `gutter [--width <N|Npct>] [--center|--left] <cmd> [args...]`. The first
+//! non-flag positional is the command, the rest are its arguments — a
+//! hand-rolled split of `std::env::args`, no clap.
 //!
-//! `--width <N>` is **absolute only** in this slice: a fixed column count `W`
-//! for the whole session (`W` never changes on resize). The proportional
-//! `--width <N>pct` form and the `--center`/`--left` flag (with the centred
-//! margin recompute-on-resize) land in slice 05 (ADR-011); they are not parsed
-//! here yet. When `--width` is omitted, `W` defaults to the real terminal width
-//! at startup, so gutter behaves as a transparent passthrough.
+//! `--width` accepts two forms (ADR-011): a bare integer → [`Width::Cols`]
+//! (absolute, fixed for the session); an integer with a `pct` or `%` suffix →
+//! [`Width::Percent`] (proportional, recomputed on every resize). When `--width`
+//! is omitted, `W` defaults to the real terminal width at startup, so gutter
+//! behaves as a transparent passthrough.
+//!
+//! `--center` / `--left` select the band's alignment (a [`Layout`]); `--center`
+//! is the default. The alignment feeds the one `geometry::margin` function used
+//! by both startup and the resize handler — there is no per-flag config
+//! hierarchy (two small fields live flat on [`Config`]).
 
-/// The minimum band width. A band narrower than this is not useful, so an
-/// explicit `--width` below it is rejected rather than silently clamped.
-pub const MIN_WIDTH: u16 = 1;
+use crate::geometry::{Layout, Width};
 
-/// The parsed invocation: the band width and the child command + arguments.
+/// The parsed invocation: the band width, the alignment, and the child command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// The absolute band width `W`, or `None` to default to the real terminal
-    /// width at startup.
-    pub width: Option<u16>,
+    /// The requested band width, or `None` to default to the real terminal
+    /// width at startup. A [`Width::Percent`] tracks the terminal on resize.
+    pub width: Option<Width>,
+    /// The band alignment. Defaults to [`Layout::Center`].
+    pub layout: Layout,
     pub cmd: String,
     pub args: Vec<String>,
 }
 
-/// Parse `gutter [--width <N>] <cmd> [args...]` from an argument iterator
-/// (excluding argv[0]).
+/// Parse `gutter [--width <N|Npct>] [--center|--left] <cmd> [args...]` from an
+/// argument iterator (excluding argv[0]).
 ///
 /// Flags are only recognised before the command; once the command is seen,
 /// everything that follows is the child's own argument (so
 /// `gutter vim --width` passes `--width` to vim).
 ///
-/// Returns `Err` with a usage message on a missing/invalid width or no command.
+/// Returns `Err` with a usage message on a missing/invalid value or no command.
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> {
     let mut iter = args.into_iter().peekable();
-    let mut width: Option<u16> = None;
+    let mut width: Option<Width> = None;
+    let mut layout: Option<Layout> = None;
 
     // Leading flags, terminated by the first non-flag (the command).
     while let Some(arg) = iter.peek() {
@@ -49,6 +54,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
             let val = val.to_string();
             iter.next();
             width = Some(parse_width(&val)?);
+        } else if arg == "--center" || arg == "--centre" {
+            iter.next();
+            layout = Some(Layout::Center);
+        } else if arg == "--left" {
+            iter.next();
+            layout = Some(Layout::Left);
         } else {
             break;
         }
@@ -58,28 +69,38 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
 
     Ok(Config {
         width,
+        layout: layout.unwrap_or_default(),
         cmd,
         args: iter.collect(),
     })
 }
 
 fn usage() -> String {
-    "usage: gutter [--width <N>] <cmd> [args...]".to_string()
+    "usage: gutter [--width <N|Npct>] [--center|--left] <cmd> [args...]".to_string()
 }
 
-/// Parse an absolute width. The proportional `Npct`/`N%` form is slice 05, so a
-/// trailing `pct`/`%` is rejected here with a pointer rather than mis-parsed.
-fn parse_width(s: &str) -> Result<u16, String> {
-    if s.ends_with("pct") || s.ends_with('%') {
-        return Err("gutter: proportional --width (Npct) is not supported yet".to_string());
+/// Parse a `--width` value into a [`Width`]: a bare integer is absolute
+/// ([`Width::Cols`]); an integer with a `pct` or `%` suffix is proportional
+/// ([`Width::Percent`]). The digits are parsed first, then the suffix is
+/// stripped — `pct` is the documented spelling, `%` an accepted alias.
+fn parse_width(s: &str) -> Result<Width, String> {
+    if let Some(digits) = s.strip_suffix("pct").or_else(|| s.strip_suffix('%')) {
+        let p: u8 = digits
+            .parse()
+            .map_err(|_| format!("gutter: invalid --width percentage '{s}'"))?;
+        if p == 0 || p > 100 {
+            return Err(format!("gutter: --width percentage must be 1..=100, got '{s}'"));
+        }
+        Ok(Width::Percent(p))
+    } else {
+        let n: u16 = s
+            .parse()
+            .map_err(|_| format!("gutter: invalid --width value '{s}'"))?;
+        if n < 1 {
+            return Err("gutter: --width must be at least 1".to_string());
+        }
+        Ok(Width::Cols(n))
     }
-    let n: u16 = s
-        .parse()
-        .map_err(|_| format!("gutter: invalid --width value '{s}'"))?;
-    if n < MIN_WIDTH {
-        return Err(format!("gutter: --width must be at least {MIN_WIDTH}"));
-    }
-    Ok(n)
 }
 
 #[cfg(test)]
@@ -94,6 +115,7 @@ mod tests {
     fn parses_cmd_and_args() {
         let cfg = parse(v(&["echo", "hi", "there"])).unwrap();
         assert_eq!(cfg.width, None);
+        assert_eq!(cfg.layout, Layout::Center); // default
         assert_eq!(cfg.cmd, "echo");
         assert_eq!(cfg.args, v(&["hi", "there"]));
     }
@@ -106,9 +128,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_width_flag() {
+    fn parses_absolute_width_flag() {
         let cfg = parse(v(&["--width", "100", "vim", "file"])).unwrap();
-        assert_eq!(cfg.width, Some(100));
+        assert_eq!(cfg.width, Some(Width::Cols(100)));
         assert_eq!(cfg.cmd, "vim");
         assert_eq!(cfg.args, v(&["file"]));
     }
@@ -116,22 +138,57 @@ mod tests {
     #[test]
     fn parses_width_equals_form() {
         let cfg = parse(v(&["--width=80", "echo"])).unwrap();
-        assert_eq!(cfg.width, Some(80));
-        assert_eq!(cfg.cmd, "echo");
+        assert_eq!(cfg.width, Some(Width::Cols(80)));
     }
 
     #[test]
-    fn width_after_command_is_child_arg() {
-        let cfg = parse(v(&["vim", "--width", "100"])).unwrap();
+    fn parses_proportional_width_pct() {
+        let cfg = parse(v(&["--width", "50pct", "echo"])).unwrap();
+        assert_eq!(cfg.width, Some(Width::Percent(50)));
+    }
+
+    #[test]
+    fn parses_proportional_width_percent_alias() {
+        let cfg = parse(v(&["--width", "50%", "echo"])).unwrap();
+        assert_eq!(cfg.width, Some(Width::Percent(50)));
+        let cfg = parse(v(&["--width=33%", "echo"])).unwrap();
+        assert_eq!(cfg.width, Some(Width::Percent(33)));
+    }
+
+    #[test]
+    fn parses_center_flag() {
+        let cfg = parse(v(&["--center", "echo"])).unwrap();
+        assert_eq!(cfg.layout, Layout::Center);
+        // British spelling accepted too.
+        let cfg = parse(v(&["--centre", "echo"])).unwrap();
+        assert_eq!(cfg.layout, Layout::Center);
+    }
+
+    #[test]
+    fn parses_left_flag() {
+        let cfg = parse(v(&["--left", "echo"])).unwrap();
+        assert_eq!(cfg.layout, Layout::Left);
+    }
+
+    #[test]
+    fn parses_width_and_alignment_together() {
+        let cfg = parse(v(&["--width", "100", "--center", "claude"])).unwrap();
+        assert_eq!(cfg.width, Some(Width::Cols(100)));
+        assert_eq!(cfg.layout, Layout::Center);
+        assert_eq!(cfg.cmd, "claude");
+
+        let cfg = parse(v(&["--left", "--width=50pct", "claude"])).unwrap();
+        assert_eq!(cfg.width, Some(Width::Percent(50)));
+        assert_eq!(cfg.layout, Layout::Left);
+    }
+
+    #[test]
+    fn flags_after_command_are_child_args() {
+        let cfg = parse(v(&["vim", "--width", "100", "--center"])).unwrap();
         assert_eq!(cfg.width, None);
+        assert_eq!(cfg.layout, Layout::Center);
         assert_eq!(cfg.cmd, "vim");
-        assert_eq!(cfg.args, v(&["--width", "100"]));
-    }
-
-    #[test]
-    fn rejects_proportional_width_for_now() {
-        assert!(parse(v(&["--width", "50pct", "echo"])).is_err());
-        assert!(parse(v(&["--width", "50%", "echo"])).is_err());
+        assert_eq!(cfg.args, v(&["--width", "100", "--center"]));
     }
 
     #[test]
@@ -142,6 +199,13 @@ mod tests {
     #[test]
     fn rejects_non_numeric_width() {
         assert!(parse(v(&["--width", "wide", "echo"])).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_percentage() {
+        assert!(parse(v(&["--width", "0pct", "echo"])).is_err());
+        assert!(parse(v(&["--width", "101pct", "echo"])).is_err());
+        assert!(parse(v(&["--width", "abcpct", "echo"])).is_err());
     }
 
     #[test]

@@ -22,9 +22,15 @@
 //! each `KeyEvent` (crossterm gives no raw bytes) at the child's negotiated
 //! kitty level, tracking the child's `CSI > N u` push/pop stack via the shared
 //! callbacks struct and clamping it to the outer terminal's
-//! `supports_keyboard_enhancement()` capability (ADR-002/003). OSC 52 (slice 06),
-//! mouse (slice 07), resize and proportional width (slice 05) land later, their
-//! modules declared by the slices that implement them.
+//! `supports_keyboard_enhancement()` capability (ADR-002/003).
+//!
+//! Resize + alignment + proportional width (slice 05): `Event::Resize` arrives as
+//! `Msg::Input` and runs on Thread 2 — the only owner of the parser. The handler
+//! recomputes `W` (for a proportional `--width Npct`), resizes the PTY then the
+//! parser screen in that order (ADR-008), recomputes the centred/left margin, and
+//! clears the gutter before the full repaint (ADR-011). OSC 52 (slice 06) and
+//! mouse (slice 07) land later, their modules declared by the slices that
+//! implement them.
 
 mod callbacks;
 mod cli;
@@ -71,11 +77,11 @@ fn run() -> i32 {
     // PTY below so the child lays out as if it owned a `W`-wide terminal. The
     // real terminal's own width is only used to position the band (the margin).
     let (real_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let width = geometry::resolve_width(config.width, real_cols);
-    // Left-aligned, fixed margin 0 in this slice; the centred formula
-    // (`geometry::centred_margin`) is implemented and property-tested but the
-    // `--center` flag that selects it lands in slice 05.
-    let left_margin = 0u16;
+    // `--width` omitted → a full-width band that tracks the terminal (100%);
+    // otherwise the parsed absolute/proportional Width. One Width value, resolved
+    // by the single `geometry::resolve_width` (startup) and recomputed on resize.
+    let width_config = config.width.unwrap_or(geometry::Width::Percent(100));
+    let width = geometry::resolve_width(width_config, real_cols);
 
     // --- Spawn the child in a PTY sized `W × real_rows` ---
     let spawned = match pty::spawn(&config.cmd, &config.args, width, rows) {
@@ -98,6 +104,10 @@ fn run() -> i32 {
             return 1;
         }
     };
+    // The master moves into the resizer (the render thread's `Event::Resize`
+    // handler is the only caller of `master.resize` — ADR-008). `resize` takes
+    // `&self`, so the resizer holds the master and hands out nothing else.
+    let resizer = pty::MasterResizer::new(master);
 
     // --- The merged unbounded channel into Thread 2 (ADR-009) ---
     let (merged_tx, merged_rx) = channel::<msg::Msg>();
@@ -159,9 +169,22 @@ fn run() -> i32 {
     }
 
     // --- Thread 2: the render loop, on the main thread ---
-    let mut renderer = Renderer::new(width, rows, left_margin, outer_supports_kitty);
+    let mut renderer = Renderer::new(
+        width,
+        rows,
+        real_cols,
+        config.layout,
+        width_config,
+        outer_supports_kitty,
+    );
     let mut clock = RealClock::new(merged_rx);
-    let code = render::run(&mut clock, &mut renderer, &mut terminal, &mut pty_writer);
+    let code = render::run(
+        &mut clock,
+        &mut renderer,
+        &mut terminal,
+        &mut pty_writer,
+        &resizer,
+    );
 
     // The render loop already ran the ordered restore before returning. Any
     // None (channel disconnected without ChildExited) is treated as success.

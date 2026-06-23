@@ -105,7 +105,7 @@ fn wide_glyph_at_band_edge_does_not_bleed() {
     let child = format!(
         "/bin/sh -c 'printf \"\\033[1;{band}H\\344\\270\\200\"; sleep 3'"
     );
-    let cmd = gutter_in_terminal(outer_cols, outer_rows, &format!("--width {band} {child}"));
+    let cmd = gutter_in_terminal(outer_cols, outer_rows, &format!("--width {band} --left {child}"));
     let mut session = spawn(cmd);
     let bytes = drain_window(&mut session, Duration::from_millis(800));
 
@@ -134,7 +134,7 @@ fn wide_char_line_renders_inside_band() {
     let (band, outer_cols, outer_rows) = (40u16, 100u16, 24u16);
     // 一二三 = E4 B8 80  E4 BA 8C  E4 B8 89 at the home position.
     let child = "/bin/sh -c 'printf \"\\033[1;1H\\344\\270\\200\\344\\272\\214\\344\\270\\211\"; sleep 3'";
-    let cmd = gutter_in_terminal(outer_cols, outer_rows, &format!("--width {band} {child}"));
+    let cmd = gutter_in_terminal(outer_cols, outer_rows, &format!("--width {band} --left {child}"));
     let mut session = spawn(cmd);
     let bytes = drain_window(&mut session, Duration::from_millis(800));
 

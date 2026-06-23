@@ -53,6 +53,19 @@ pub trait OuterTerminal {
     /// Write a row's `rows_diff` byte run verbatim (it carries its own intra-row
     /// SGR and relative cursor moves, scoped to `[0, W)`).
     fn write_row(&mut self, bytes: &[u8]) -> io::Result<()>;
+    /// Clear the gutter columns — everything outside the band `[margin,
+    /// margin + width)` across every physical row `[0, rows)` of a `real_cols`-wide
+    /// terminal. Called on resize (ADR-008 step 4): a shrink that moved the margin
+    /// leftward, or a centred→narrower transition, can strand painted cells where
+    /// the gutter now is, and the `rows_diff` repaint only touches `[margin,
+    /// margin + width)` — so the cells outside it must be cleared explicitly.
+    fn clear_gutter(
+        &mut self,
+        margin: u16,
+        width: u16,
+        real_cols: u16,
+        rows: u16,
+    ) -> io::Result<()>;
     /// Reposition the real cursor inside the band at physical `(col, row)` after
     /// the repaint, from the child's `screen.cursor_position()`.
     fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()>;
@@ -138,6 +151,34 @@ impl OuterTerminal for CrosstermTerminal {
         self.out.write_all(bytes)
     }
 
+    fn clear_gutter(
+        &mut self,
+        margin: u16,
+        width: u16,
+        real_cols: u16,
+        rows: u16,
+    ) -> io::Result<()> {
+        use crossterm::{cursor::MoveTo, queue};
+        let band_end = margin.saturating_add(width).min(real_cols);
+        // Reset SGR first so the blanks are painted with the default background
+        // (a leftover colour run would tint the gutter).
+        self.out.write_all(b"\x1b[0m")?;
+        for row in 0..rows {
+            // Left gutter: physical columns [0, margin).
+            if margin > 0 {
+                queue!(self.out, MoveTo(0, row))?;
+                self.out.write_all(&b" ".repeat(margin as usize))?;
+            }
+            // Right gutter: physical columns [band_end, real_cols).
+            if real_cols > band_end {
+                queue!(self.out, MoveTo(band_end, row))?;
+                self.out
+                    .write_all(&b" ".repeat((real_cols - band_end) as usize))?;
+            }
+        }
+        Ok(())
+    }
+
     fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {
         use crossterm::{cursor::MoveTo, queue};
         queue!(self.out, MoveTo(col, row))
@@ -214,6 +255,8 @@ pub mod mock {
         EnterAltScreen,
         MoveTo(u16, u16),
         WriteRow(Vec<u8>),
+        /// `clear_gutter(margin, width, real_cols, rows)`.
+        ClearGutter(u16, u16, u16, u16),
         PlaceCursor(u16, u16),
         SetCursorVisible(bool),
         Flush,
@@ -332,6 +375,31 @@ pub mod mock {
             self.parser.process(bytes);
             Ok(())
         }
+        fn clear_gutter(
+            &mut self,
+            margin: u16,
+            width: u16,
+            real_cols: u16,
+            rows: u16,
+        ) -> io::Result<()> {
+            // Paint blanks over the physical gutter columns, exactly as the real
+            // terminal would — so the physical-cell readback sees them cleared.
+            let band_end = margin.saturating_add(width).min(real_cols);
+            self.parser.process(b"\x1b[0m");
+            for row in 0..rows {
+                if margin > 0 {
+                    let seq = format!("\x1b[{};1H", row + 1);
+                    self.parser.process(seq.as_bytes());
+                    self.parser.process(&b" ".repeat(margin as usize));
+                }
+                if real_cols > band_end {
+                    let seq = format!("\x1b[{};{}H", row + 1, band_end + 1);
+                    self.parser.process(seq.as_bytes());
+                    self.parser.process(&b" ".repeat((real_cols - band_end) as usize));
+                }
+            }
+            Ok(())
+        }
         fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {
             let seq = format!("\x1b[{};{}H", row + 1, col + 1);
             self.parser.process(seq.as_bytes());
@@ -386,6 +454,17 @@ pub mod mock {
         }
         fn write_row(&mut self, bytes: &[u8]) -> io::Result<()> {
             self.calls.push(Call::WriteRow(bytes.to_vec()));
+            Ok(())
+        }
+        fn clear_gutter(
+            &mut self,
+            margin: u16,
+            width: u16,
+            real_cols: u16,
+            rows: u16,
+        ) -> io::Result<()> {
+            self.calls
+                .push(Call::ClearGutter(margin, width, real_cols, rows));
             Ok(())
         }
         fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {

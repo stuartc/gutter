@@ -18,6 +18,44 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
 use crate::msg::Msg;
 
+/// The one PTY-master call the resize handler makes: `master.resize(PtySize)`,
+/// which issues `TIOCSWINSZ` and lets the **kernel** send SIGWINCH to the
+/// child's foreground process group (ADR-008). Abstracted behind a trait so the
+/// resize handler can be driven against a recording mock that captures the call
+/// order alongside `set_size` — the seam the ADR-008 ordering test asserts on.
+///
+/// `cols` passed here is always the band width `W` (recomputed for a proportional
+/// width — ADR-011), **never** `real_cols`.
+pub trait PtyResizer {
+    /// Resize the PTY to `cols × rows`. `cols` is the band width `W`.
+    fn resize(&self, cols: u16, rows: u16) -> Result<(), String>;
+}
+
+/// The production resizer: wraps the `portable-pty` master. `resize` takes
+/// `&self` on the master, so a shared handle is enough — no `&mut`.
+pub struct MasterResizer {
+    master: Box<dyn MasterPty + Send>,
+}
+
+impl MasterResizer {
+    pub fn new(master: Box<dyn MasterPty + Send>) -> Self {
+        Self { master }
+    }
+}
+
+impl PtyResizer for MasterResizer {
+    fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| format!("pty resize: {e}"))
+    }
+}
+
 /// Chunk size for a single PTY read. The kernel PTY buffer absorbs slack.
 const READ_CHUNK: usize = 64 * 1024;
 
