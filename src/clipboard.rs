@@ -17,7 +17,7 @@
 //! - [`reconstruct_osc52`] — build `ESC ] 52 ; ty ; data BEL` by concatenating
 //!   the raw byte slices. `data` arrives base64-encoded; it is forwarded
 //!   **verbatim** — no decode/re-encode, so no padding or charset drift.
-//! - [`forward_to_tty`] — write the reconstructed sequence to an injected
+//! - [`forward_osc52`] — write the reconstructed sequence to an injected
 //!   `Write` and flush. The injected writer is the seam: production hands in the
 //!   real `/dev/tty` handle, tests hand in a buffer they read back.
 
@@ -69,12 +69,12 @@ pub fn reconstruct_osc52(ty: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Write the reconstructed OSC 52 to `out` and flush.
 ///
-/// `out` is taken as `&mut impl Write` so the production caller injects the real
-/// `/dev/tty` handle and the tests inject a buffer. Returns `io::Result` so the
-/// caller can log a failure; the callback swallows the error rather than letting
-/// it unwind out of `parser.process()` (a failed clipboard write must never
-/// crash the render loop or desync the parser).
-pub fn forward_to_tty(out: &mut impl Write, ty: &[u8], data: &[u8]) -> io::Result<()> {
+/// `out` is taken as `&mut impl Write` (it knows nothing about ttys) so the
+/// production caller injects the real `/dev/tty` handle and the tests inject a
+/// buffer. Returns `io::Result` so the caller can log a failure; the callback
+/// swallows the error rather than letting it unwind out of `parser.process()` (a
+/// failed clipboard write must never crash the render loop or desync the parser).
+pub fn forward_osc52(out: &mut impl Write, ty: &[u8], data: &[u8]) -> io::Result<()> {
     out.write_all(&reconstruct_osc52(ty, data))?;
     out.flush()
 }
@@ -109,12 +109,12 @@ mod tests {
         assert_eq!(reconstruct_osc52(b"c", b""), b"\x1b]52;c;\x07");
     }
 
-    /// `forward_to_tty` writes exactly the reconstructed bytes to the injected
+    /// `forward_osc52` writes exactly the reconstructed bytes to the injected
     /// sink and flushes — the seam the end-to-end test reads back.
     #[test]
     fn forward_writes_reconstructed_bytes() {
         let mut buf: Vec<u8> = Vec::new();
-        forward_to_tty(&mut buf, b"c", b"aGVsbG8=").unwrap();
+        forward_osc52(&mut buf, b"c", b"aGVsbG8=").unwrap();
         assert_eq!(buf, b"\x1b]52;c;aGVsbG8=\x07");
     }
 

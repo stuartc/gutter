@@ -21,7 +21,7 @@
 use std::fmt;
 use std::io::{self, Write};
 
-use crate::clipboard::forward_to_tty;
+use crate::clipboard::forward_osc52;
 use crate::keyboard::{is_kitty_csi, KittyState};
 
 /// The single callbacks struct the parser owns.
@@ -108,7 +108,7 @@ impl vt100::Callbacks for GutterCallbacks {
     /// a failed clipboard write must not unwind out of `process()` or take down
     /// the render loop (best-effort side effect).
     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
-        if let Err(e) = forward_to_tty(&mut self.clipboard_out, ty, data) {
+        if let Err(e) = forward_osc52(&mut self.clipboard_out, ty, data) {
             eprintln!("gutter: clipboard write failed: {e}");
         }
     }
