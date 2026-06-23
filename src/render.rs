@@ -79,6 +79,11 @@ impl Renderer {
     /// probe — it clamps the child's kitty negotiation (ADR-003). The live
     /// `parser` carries it; `prev` is a diff-baseline that only replays formatted
     /// content and never tracks kitty, so its clamp is irrelevant (`false`).
+    ///
+    /// `clipboard_out` is the OSC-52 sink injected into the live parser's
+    /// callbacks (ADR-004) — production passes the real `/dev/tty` handle, tests
+    /// pass a captured buffer. Only the live `parser` carries it; `prev` (a
+    /// diff-only baseline) never runs the clipboard path, so it gets `io::sink()`.
     pub fn new(
         width: u16,
         rows: u16,
@@ -86,13 +91,14 @@ impl Renderer {
         layout: Layout,
         width_config: Width,
         outer_supports_kitty: bool,
+        clipboard_out: Box<dyn Write + Send>,
     ) -> Self {
         Self {
             parser: vt100::Parser::new_with_callbacks(
                 rows,
                 width,
                 0,
-                GutterCallbacks::new(outer_supports_kitty),
+                GutterCallbacks::with_clipboard(outer_supports_kitty, clipboard_out),
             ),
             prev: vt100::Parser::new_with_callbacks(
                 rows,
@@ -123,7 +129,15 @@ impl Renderer {
     /// the margin from `geometry::margin` in [`Renderer::new`].
     #[cfg(test)]
     fn at_margin(width: u16, rows: u16, left_margin: u16) -> Self {
-        let mut r = Self::new(width, rows, width, Layout::Left, Width::Cols(width), false);
+        let mut r = Self::new(
+            width,
+            rows,
+            width,
+            Layout::Left,
+            Width::Cols(width),
+            false,
+            Box::new(std::io::sink()),
+        );
         r.left_margin = left_margin;
         r.real_cols = left_margin.saturating_add(width);
         r
@@ -558,6 +572,7 @@ mod tests {
             Layout::Left,
             Width::Cols(width),
             outer_kitty,
+            Box::new(std::io::sink()),
         )
     }
 
@@ -1331,7 +1346,15 @@ mod resize {
         layout: Layout,
         cfg: Width,
     ) -> Renderer {
-        Renderer::new(width, rows, real_cols, layout, cfg, false)
+        Renderer::new(
+            width,
+            rows,
+            real_cols,
+            layout,
+            cfg,
+            false,
+            Box::new(std::io::sink()),
+        )
     }
 
     /// **Resize ordering (ADR-008 gate).** Drive one resize and assert the

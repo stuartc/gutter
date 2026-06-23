@@ -34,6 +34,7 @@
 
 mod callbacks;
 mod cli;
+mod clipboard;
 mod clock;
 mod geometry;
 mod input;
@@ -168,6 +169,19 @@ fn run() -> i32 {
         return 1;
     }
 
+    // --- The OSC-52 clipboard sink: a separately-opened /dev/tty (ADR-004) ---
+    // Opened read-write at this ONE call site, distinct from crossterm's stdout
+    // repaint sink, and handed into the render thread's callbacks. If there is no
+    // controlling tty (the clipboard fd can't open), degrade to a discarding sink
+    // so gutter still runs — a missing clipboard fd must not abort startup.
+    let clipboard_out: Box<dyn std::io::Write + Send> = match clipboard::open_tty_read_write() {
+        Ok(tty) => Box::new(tty),
+        Err(e) => {
+            eprintln!("gutter: /dev/tty unavailable, clipboard disabled: {e}");
+            Box::new(std::io::sink())
+        }
+    };
+
     // --- Thread 2: the render loop, on the main thread ---
     let mut renderer = Renderer::new(
         width,
@@ -176,6 +190,7 @@ fn run() -> i32 {
         config.layout,
         width_config,
         outer_supports_kitty,
+        clipboard_out,
     );
     let mut clock = RealClock::new(merged_rx);
     let code = render::run(
