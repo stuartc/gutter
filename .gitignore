@@ -19,3 +19,11 @@ target/
 # Editor / OS noise
 .DS_Store
 *.swp
+
+# Machine-local symlink to the planning docs, not part of the code
+.context/
+
+
+# Added by cargo
+
+/target
