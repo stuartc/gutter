@@ -4,22 +4,27 @@
 //! Architecture: three live threads + a waiter, one merged unbounded channel,
 //! no async runtime. See `.context/design/CONTEXT.md` for the full design brief.
 //!
-//! - Thread 1 (`pty::reader`)   — dumb PTY byte pump, self-throttled.
-//! - Thread 2 (`render::run`)    — owns the outer terminal; the only writer of
-//!   the PTY master and the only thread touching outer output/teardown.
-//! - Thread 3 (`input::run`)     — owns crossterm's event source exclusively.
-//! - Thread 4 (`waiter::run`)    — blocks on `child.wait()`, the authoritative
-//!   child-death signal.
+//! - Thread 1 (`pty::reader`)    — dumb PTY byte pump, self-throttled via a
+//!   bounded staging `sync_channel(N)` (the backpressure seam, ADR-007/009).
+//! - Thread 2 (`render::run`)     — owns the `vt100::Parser`, the outer
+//!   terminal handle and the sole PTY-master writer; runs the fixed-deadline
+//!   60fps coalescing loop and the offset repaint.
+//! - Thread 3 (`input::run`)      — owns crossterm's event source exclusively.
+//! - Thread 4 (`waiter::run`)     — blocks on `child.wait()`, the authoritative
+//!   child-death signal (ADR-010).
 //!
-//! Slice 01 (skeleton + passthrough + teardown): the render thread does a
-//! verbatim byte blit instead of a real grid repaint, the PTY is the real
-//! terminal width (the offset arrives in slice 02), and keyboard re-encoding is
-//! a throwaway placeholder. The vt100 parser, the 60fps coalescing loop, the
-//! margin maths, OSC 52, mouse, resize and proportional width all land later;
-//! their modules (`callbacks`, `clipboard`, `clock`, `mouse`, `resize`,
-//! `width`) are declared by the slices that implement them.
+//! Slice 02 (virtual grid + offset repaint): the PTY is sized `W × real_rows`
+//! so the child believes it owns a `W`-wide terminal; its output is parsed into
+//! a `W`-column vt100 grid on the render thread and repainted to the real
+//! terminal at a left-margin column offset (left-aligned, fixed `W`). Keyboard
+//! stays the slice-01 passthrough placeholder (real re-encoding is slice 04);
+//! OSC 52 (slice 06), mouse (slice 07), resize and proportional width (slice 05)
+//! land later, their modules declared by the slices that implement them.
 
+mod callbacks;
 mod cli;
+mod clock;
+mod geometry;
 mod input;
 mod keyboard;
 mod msg;
@@ -28,10 +33,15 @@ mod render;
 mod terminal;
 mod waiter;
 
+#[cfg(feature = "oracle")]
+mod oracle;
+
 use std::process;
 use std::sync::mpsc::{channel, sync_channel};
 use std::thread;
 
+use clock::RealClock;
+use render::Renderer;
 use terminal::{CrosstermTerminal, OuterTerminal};
 
 fn main() {
@@ -42,7 +52,7 @@ fn main() {
 /// The orchestration, factored out of `main` so `main` is just the
 /// `process::exit` shell. Returns the exit code to propagate.
 fn run() -> i32 {
-    // --- Arg parse: gutter <cmd> [args...] ---
+    // --- Arg parse: gutter [--width <N>] <cmd> [args...] ---
     let config = match cli::parse(std::env::args().skip(1)) {
         Ok(c) => c,
         Err(msg) => {
@@ -51,13 +61,19 @@ fn run() -> i32 {
         }
     };
 
-    // --- Size the PTY to the real terminal's current cols × rows ---
-    // This is the one slice where the PTY is the real width; from slice 02 the
-    // `cols` argument becomes `W`. The width flows from this single place.
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    // --- Resolve the band width `W` against the real terminal ---
+    // `W` is the ONE width the child is ever told about; it is sized into the
+    // PTY below so the child lays out as if it owned a `W`-wide terminal. The
+    // real terminal's own width is only used to position the band (the margin).
+    let (real_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let width = geometry::resolve_width(config.width, real_cols);
+    // Left-aligned, fixed margin 0 in this slice; the centred formula
+    // (`geometry::centred_margin`) is implemented and property-tested but the
+    // `--center` flag that selects it lands in slice 05.
+    let left_margin = 0u16;
 
-    // --- Spawn the child in the PTY ---
-    let spawned = match pty::spawn(&config.cmd, &config.args, cols, rows) {
+    // --- Spawn the child in a PTY sized `W × real_rows` ---
+    let spawned = match pty::spawn(&config.cmd, &config.args, width, rows) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("gutter: failed to spawn '{}': {e}", config.cmd);
@@ -114,8 +130,9 @@ fn run() -> i32 {
     }
 
     // --- Thread 2: the render loop, on the main thread ---
-    let mut stdout = std::io::stdout();
-    let code = render::run(merged_rx, &mut terminal, &mut stdout, &mut pty_writer);
+    let mut renderer = Renderer::new(width, rows, left_margin);
+    let mut clock = RealClock::new(merged_rx);
+    let code = render::run(&mut clock, &mut renderer, &mut terminal, &mut pty_writer);
 
     // The render loop already ran the ordered restore before returning. Any
     // None (channel disconnected without ChildExited) is treated as success.

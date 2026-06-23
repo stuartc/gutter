@@ -9,12 +9,19 @@ vt100 = "0.16.2"
 crossterm = "0.29.0"
 signal-hook = "0.4.4"
 
+# The wezterm-term comparison oracle (ADR-001) is an OPTIONAL dependency,
+# enabled only by the `oracle` feature below. With the feature off (the default)
+# it is not compiled or linked, so it stays out of the shipping binary; the
+# day-1 equivalence gate (slice 08) is then a flag flip, not a fresh integration.
+tattoy-wezterm-term = { version = "0.1.0-fork.5", optional = true }
+
 [dev-dependencies]
 expectrl = "0.9.0"
 insta = "1.48.0"
 proptest = "1.11.0"
 
 [features]
-# wezterm-term comparison oracle, wired in from milestone 2 behind a flag.
-# Stays out of the shipping binary unless the day-1 equivalence gate trips.
-oracle = []
+# Wires in the wezterm-term comparison oracle. Off by default; the oracle module
+# and its tests are `#[cfg(feature = "oracle")]`, so a normal build never pulls
+# the heavy wezterm dependency tree.
+oracle = ["dep:tattoy-wezterm-term"]

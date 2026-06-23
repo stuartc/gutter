@@ -1,14 +1,15 @@
 //! PTY setup and Thread 1 (the dumb byte pump).
 //!
-//! Opens a `portable-pty` `PtyPair` sized to the band width × `real_rows`. In
-//! slice 01 the band width *is* the real terminal width (passthrough, no
-//! offset yet); from slice 02 it becomes `W`. The width flows from a single
-//! place — [`spawn`]'s `cols` argument — so slice 02 changes one call site.
+//! Opens a `portable-pty` `PtyPair` sized `W × real_rows` — the band width `W`,
+//! NOT the real terminal width. This is the whole mechanism: the child believes
+//! it owns a `W`-wide terminal and lays out absolutely within `W` (ADR-008's
+//! `(rows, cols)` order is easy to transpose — keep it `cols: W`). The width
+//! flows from a single place — [`spawn`]'s `cols` argument.
 //!
 //! [`reader`] reads the master in bounded chunks and forwards `Msg::Pty(bytes)`
 //! through a bounded `sync_channel(N)` staging step (the backpressure seam from
-//! ADR-007; its N is slice 02's to tune). It never scans for OSC, never detects
-//! child death, never writes the PTY.
+//! ADR-007/009). It never scans for OSC, never detects child death, never
+//! writes the PTY.
 
 use std::io::Read;
 use std::sync::mpsc::{Sender, SyncSender};
@@ -22,7 +23,8 @@ const READ_CHUNK: usize = 64 * 1024;
 
 /// Depth of the bounded staging channel between the read loop and the merge
 /// point. The backpressure seam from ADR-007 — Thread 1 blocks here when it
-/// gets too far ahead of Thread 2. Real tuning of `N` is slice 02's concern.
+/// gets too far ahead of Thread 2. Ceiling ≈ `N × READ_CHUNK` (≈ 4MB at N=64),
+/// which the kernel PTY buffer absorbs.
 pub const STAGING_DEPTH: usize = 64;
 
 /// The handles a spawned PTY hands back to the rest of the program.

@@ -6,9 +6,9 @@
 //! capability) is slice 04 (ADR-002 / ADR-003).
 //!
 //! **THROWAWAY — DELETE IN SLICE 04.** What lives here now is a minimal legacy
-//! encoding: just enough to type into the child so the binary is runnable.
-//! Encoding correctness is explicitly NOT a criterion for slice 01. Do not
-//! invest in this; slice 04 replaces it wholesale.
+//! encoding: just enough to type into the child so the binary is runnable (the
+//! slice-02 input path stays this slice-01 placeholder). Encoding correctness is
+//! NOT a criterion until slice 04, which replaces this wholesale.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 

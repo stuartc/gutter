@@ -1,0 +1,13 @@
+---
+source: src/render.rs
+assertion_line: 587
+expression: grid
+---
+[
+    "GUTTER demo",
+    "line one",
+    "lineedited",
+    "",
+    "",
+    "",
+]
