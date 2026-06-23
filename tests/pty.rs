@@ -318,3 +318,72 @@ fn multi_mb_scroll_stays_bounded() {
     // Drop the session explicitly so the child (and its `sleep`) is reaped now.
     drop(session);
 }
+
+/// **Non-zero exit shows the dim `Exited with: N` status line (slice 02).** A
+/// child that exits non-zero: gutter must, after leaving the alt screen (so the
+/// line lands on the primary screen the user returns to), emit the dim
+/// `\r\n\x1b[2mExited with: N\x1b[0m`. Asserted on the raw teardown bytes —
+/// reading to the teardown, like the child-exit-restore test, and confirming the
+/// status line lands *after* the alt-leave (`?1049l`).
+#[test]
+fn non_zero_exit_shows_dim_status_line() {
+    let child = "/bin/sh -c 'exit 3'";
+    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 {child}"));
+    let mut session = spawn(cmd);
+
+    // Read to the teardown — we WANT the post-exit restore + status sequence.
+    let bytes = drain_window(&mut session, Duration::from_secs(3));
+    let s = String::from_utf8_lossy(&bytes);
+
+    assert!(
+        s.contains("\u{1b}[2mExited with: 3\u{1b}[0m"),
+        "non-zero exit must emit the dim status line, got {s:?}"
+    );
+    // The status line lands AFTER the alt-leave (on the primary screen).
+    let leave = s
+        .find("\u{1b}[?1049l")
+        .or_else(|| s.find("\u{1b}[?47l"))
+        .expect("teardown must leave the alternate screen");
+    let status = s
+        .find("Exited with: 3")
+        .expect("status line present");
+    assert!(
+        leave < status,
+        "the status line must land after the alt-leave (on the primary screen)"
+    );
+
+    assert_eq!(
+        wait_status(session),
+        Some(3),
+        "gutter must propagate the non-zero exit code"
+    );
+}
+
+/// **Zero exit is silent (slice 02).** A child that exits cleanly: gutter must
+/// emit NO status line — a clean run leaves a clean screen. Asserted on the raw
+/// teardown bytes, which must still carry the alt-leave but no `Exited with:`.
+#[test]
+fn zero_exit_shows_no_status_line() {
+    let child = "/bin/sh -c 'exit 0'";
+    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 {child}"));
+    let mut session = spawn(cmd);
+
+    let bytes = drain_window(&mut session, Duration::from_secs(3));
+    let s = String::from_utf8_lossy(&bytes);
+
+    // The teardown still ran (alt-leave present), but no status line at all.
+    assert!(
+        s.contains("\u{1b}[?1049l") || s.contains("\u{1b}[?47l"),
+        "teardown must leave the alternate screen, got {s:?}"
+    );
+    assert!(
+        !s.contains("Exited with:"),
+        "a zero exit must emit no status line, got {s:?}"
+    );
+
+    assert_eq!(
+        wait_status(session),
+        Some(0),
+        "gutter must propagate the zero exit code"
+    );
+}

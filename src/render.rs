@@ -509,21 +509,49 @@ where
     }
 
     // Explicit ordered restore BEFORE process::exit (ADR-010). `process::exit`
-    // runs no destructors, so this cannot be a Drop guard.
-    let _ = run_teardown(term);
+    // runs no destructors, so this cannot be a Drop guard. The exit code is
+    // threaded in so the dim status line draws from the same value `run` returns
+    // to `main` — `None` (channel disconnected without a `ChildExited`) maps to a
+    // clean exit, so it suppresses the status line just like a zero exit.
+    let _ = run_teardown(term, exit_code.unwrap_or(0));
     exit_code
 }
 
-/// The explicit, ordered terminal restore (ADR-010): leave alt screen → pop
-/// kitty flags → disable mouse → show cursor → disable raw mode. Each disables
-/// only what was actually enabled at startup (kitty pop, mouse disable).
-fn run_teardown<T: OuterTerminal>(term: &mut T) -> std::io::Result<()> {
+/// The explicit, ordered terminal restore (ADR-010): leave alt screen → emit the
+/// dim exit-status line → pop kitty flags → disable mouse → show cursor → disable
+/// raw mode. Each disables only what was actually enabled at startup (kitty pop,
+/// mouse disable).
+///
+/// The status line is emitted **after** the alt-leave (so it lands on the primary
+/// screen the user returns to) and **before** the remaining restore steps. The
+/// load-bearing ADR-010 invariant — alt-leave before raw-disable — is preserved:
+/// the status emission slots between alt-leave and the rest without reordering
+/// them.
+fn run_teardown<T: OuterTerminal>(term: &mut T, exit_code: i32) -> std::io::Result<()> {
     term.leave_alt_screen()?;
+    write_exit_status(term, exit_code)?;
     term.pop_keyboard_flags()?;
     term.disable_mouse()?;
     term.show_cursor()?;
     term.disable_raw_mode()?;
     Ok(())
+}
+
+/// Emit the dim `Exited with: N` status line below the band, on a **non-zero**
+/// exit only — success is silent (a zero exit emits nothing). The leading `\r\n`
+/// scrolls the primary screen one line so the status lands on a fresh line below
+/// the content, as a normal command's trailing output would, rather than
+/// overwriting the last band row. The dim SGR (`\x1b[2m`) and reset (`\x1b[0m`)
+/// ride the existing `write_row` as plain bytes — no new trait method.
+///
+/// A single reusable unit: slice 03's replay path calls this rather than
+/// re-implementing the placement and dimming.
+fn write_exit_status<T: OuterTerminal>(term: &mut T, exit_code: i32) -> std::io::Result<()> {
+    if exit_code == 0 {
+        return Ok(());
+    }
+    let line = format!("\r\n\x1b[2mExited with: {exit_code}\x1b[0m");
+    term.write_row(line.as_bytes())
 }
 
 #[cfg(test)]
@@ -778,6 +806,10 @@ mod tests {
     ///
     /// Non-kitty outer terminal (nothing pushed at startup): `PopKeyboardFlags`
     /// must NOT fire — we only pop what we pushed (ADR-003).
+    ///
+    /// A **non-zero** exit (42 here) also emits the dim `Exited with: 42` status
+    /// line via `write_row`, slotted between the alt-leave and the remaining
+    /// restore steps — the ADR-010 order is preserved (slice 02).
     #[test]
     fn child_exit_restores_in_order_no_kitty_pop_when_not_pushed() {
         use crate::terminal::OuterTerminal;
@@ -809,12 +841,54 @@ mod tests {
             ],
             "restore order with NO kitty pop (nothing was pushed)"
         );
+
+        // The dim status line is recorded as a `write_row` carrying the
+        // `Exited with: 42` bytes (a blank grid emits no other `write_row`, so
+        // this is the only one).
+        let status_rows: Vec<&[u8]> = term
+            .calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::WriteRow(b) => Some(b.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            status_rows,
+            vec![b"\r\n\x1b[2mExited with: 42\x1b[0m".as_slice()],
+            "non-zero exit emits exactly the dim status line"
+        );
+
+        // …and it slots between the alt-leave and the remaining restore steps:
+        // after LeaveAltScreen, before DisableMouse (the next restore call).
+        let leave = term
+            .calls
+            .iter()
+            .position(|c| *c == Call::LeaveAltScreen)
+            .unwrap();
+        let status = term
+            .calls
+            .iter()
+            .position(|c| matches!(c, Call::WriteRow(_)))
+            .unwrap();
+        let disable_mouse = term
+            .calls
+            .iter()
+            .position(|c| *c == Call::DisableMouse)
+            .unwrap();
+        assert!(
+            leave < status && status < disable_mouse,
+            "status line slots after alt-leave and before the remaining restore steps"
+        );
     }
 
     /// Child-exit-restore with a kitty-capable outer terminal: the startup push
     /// (modelled here by pushing flags on the mock before `run`) must be paired
     /// with a `PopKeyboardFlags` in the correct restore slot — after
     /// leave-alt-screen, before disable-raw-mode (ADR-010/003).
+    ///
+    /// A **zero** exit is silent — no status-line `write_row` is recorded
+    /// (slice 02).
     #[test]
     fn child_exit_pops_kitty_flags_when_pushed_at_startup() {
         use crate::terminal::OuterTerminal;
@@ -849,6 +923,77 @@ mod tests {
                 Call::DisableRawMode,
             ],
             "kitty flags pushed at startup must be popped in the ADR-010 slot"
+        );
+
+        // Zero exit is silent: no status-line write_row (a blank grid emits no
+        // other write_row either, so the count is exactly zero).
+        assert_eq!(
+            term.calls
+                .iter()
+                .filter(|c| matches!(c, Call::WriteRow(_)))
+                .count(),
+            0,
+            "a zero exit emits no status line"
+        );
+    }
+
+    /// The reusable status-line unit (slice 02), driven directly through
+    /// `run_teardown` so slice 03's contract is pinned independently of the loop.
+    /// `exit_code = 1`: a `write_row` carrying the dim `Exited with: 1` bytes,
+    /// emitted after the alt-leave and before the remaining restore steps.
+    /// `exit_code = 0`: no status-line `write_row` (success is silent).
+    #[test]
+    fn run_teardown_emits_dim_status_after_alt_leave_only_on_nonzero() {
+        // Non-zero: the dim line is recorded, slotted between alt-leave and the
+        // remaining restore steps.
+        let mut term = MockTerminal::new();
+        run_teardown(&mut term, 1).unwrap();
+
+        let status_rows: Vec<&[u8]> = term
+            .calls
+            .iter()
+            .filter_map(|c| match c {
+                Call::WriteRow(b) => Some(b.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            status_rows,
+            vec![b"\r\n\x1b[2mExited with: 1\x1b[0m".as_slice()],
+            "exit_code = 1 records the dim status line via write_row"
+        );
+
+        let leave = term
+            .calls
+            .iter()
+            .position(|c| *c == Call::LeaveAltScreen)
+            .unwrap();
+        let status = term
+            .calls
+            .iter()
+            .position(|c| matches!(c, Call::WriteRow(_)))
+            .unwrap();
+        let show_cursor = term
+            .calls
+            .iter()
+            .position(|c| *c == Call::ShowCursor)
+            .unwrap();
+        assert!(
+            leave < status && status < show_cursor,
+            "status emission slots after alt-leave, before the remaining restore steps"
+        );
+
+        // Zero exit: no status-line write_row at all.
+        let mut term0 = MockTerminal::new();
+        run_teardown(&mut term0, 0).unwrap();
+        assert_eq!(
+            term0
+                .calls
+                .iter()
+                .filter(|c| matches!(c, Call::WriteRow(_)))
+                .count(),
+            0,
+            "exit_code = 0 records no status line"
         );
     }
 
