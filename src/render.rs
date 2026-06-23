@@ -21,8 +21,6 @@
 use std::io::Write;
 use std::sync::mpsc::Receiver;
 
-use portable_pty::ExitStatus;
-
 use crate::keyboard;
 use crate::msg::Msg;
 use crate::terminal::OuterTerminal;
@@ -66,8 +64,8 @@ where
                 // Resize / focus / mouse events are swallowed in slice 01.
             }
             Msg::ChildExited(status) => {
-                let code = restore_and_code(terminal, &status);
-                return Some(code);
+                let _ = run_teardown(terminal);
+                return Some(status.exit_code() as i32);
             }
         }
     }
@@ -77,19 +75,13 @@ where
     None
 }
 
-/// Run the ordered restore and return the child's exit code as a process code.
-fn restore_and_code<T: OuterTerminal>(terminal: &mut T, status: &ExitStatus) -> i32 {
-    let _ = run_teardown(terminal);
-    status.exit_code() as i32
-}
-
 /// The explicit, ordered terminal restore (ADR-010). Run BEFORE `process::exit`
 /// because `process::exit` runs no destructors — this cannot be a `Drop` guard.
 ///
 /// Order is load-bearing: leave alt screen → pop kitty flags → disable mouse →
 /// show cursor → disable raw mode. Pop/disable are no-ops in slice 01 but stay
 /// in the sequence so slices 04/07 drop in without re-sequencing.
-pub fn run_teardown<T: OuterTerminal>(terminal: &mut T) -> std::io::Result<()> {
+fn run_teardown<T: OuterTerminal>(terminal: &mut T) -> std::io::Result<()> {
     terminal.leave_alt_screen()?;
     terminal.pop_keyboard_flags()?;
     terminal.disable_mouse()?;
@@ -102,6 +94,7 @@ pub fn run_teardown<T: OuterTerminal>(terminal: &mut T) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::terminal::mock::{Call, MockTerminal};
+    use portable_pty::ExitStatus;
     use std::sync::mpsc::channel;
 
     /// The ADR-010 keystone: feed `Msg::ChildExited` into the loop with the
