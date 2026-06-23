@@ -22,6 +22,7 @@ use std::fmt;
 use std::io::{self, Write};
 
 use crate::clipboard::forward_osc52;
+use crate::cursor::{is_decscusr, CursorShape};
 use crate::keyboard::{is_kitty_csi, KittyState};
 
 /// The single callbacks struct the parser owns.
@@ -34,6 +35,11 @@ pub struct GutterCallbacks {
     /// The child's negotiated kitty keyboard level — driven by the
     /// `unhandled_csi` watcher below, read by the encoder at keystroke time.
     pub kitty_state: KittyState,
+    /// The child's requested cursor shape (DECSCUSR / `CSI Ps SP q`) — driven by
+    /// the same `unhandled_csi` watcher (vt100 surfaces DECSCUSR as an unhandled
+    /// CSI, slice 08), read by the render loop to mirror the shape on the outer
+    /// terminal. Touches only its own field; independent of the kitty watcher.
+    pub cursor_shape: CursorShape,
     /// The clipboard write sink (ADR-004). Production injects the real
     /// `/dev/tty` handle ([`crate::clipboard::open_tty_read_write`]); tests
     /// inject a buffer they read back. Baseline (diff-only) parsers get an
@@ -62,6 +68,7 @@ impl GutterCallbacks {
     pub fn with_clipboard(outer_supports: bool, clipboard_out: Box<dyn Write + Send>) -> Self {
         Self {
             kitty_state: KittyState::new(outer_supports),
+            cursor_shape: CursorShape::new(),
             clipboard_out,
         }
     }
@@ -94,6 +101,12 @@ impl vt100::Callbacks for GutterCallbacks {
     ) {
         if is_kitty_csi(i1, c) {
             self.kitty_state.apply_csi(i1, params, c);
+        } else if is_decscusr(i1, c) {
+            // DECSCUSR cursor-shape request (slice 08). vt100 doesn't implement
+            // it, so it lands here with the SP intermediate in `i1`; record the
+            // requested shape for the render loop to mirror. Touches only
+            // `cursor_shape` — sibling to the kitty and clipboard concerns.
+            self.cursor_shape.apply_csi(params);
         }
     }
 
@@ -143,6 +156,34 @@ mod tests {
         // Pop to empty → legacy.
         parser.process(b"\x1b[<u");
         assert_eq!(parser.callbacks().kitty_state.current(), KittyLevel::Legacy);
+    }
+
+    /// The cursor-shape watcher (slice 08) tracks the child's DECSCUSR through
+    /// the real `vt100` callback path: drive `parser.process()` with a
+    /// `CSI Ps SP q` and assert the shared callbacks recorded a pending shape to
+    /// mirror — proving DECSCUSR is observable via `unhandled_csi` (in scope,
+    /// not a documented gap) and tracked on the shared struct.
+    #[test]
+    fn decscusr_tracked_through_parser() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(true));
+
+        // Child requests a steady bar cursor (CSI 6 SP q).
+        parser.process(b"\x1b[6 q");
+        assert_eq!(
+            parser.callbacks_mut().cursor_shape.take_pending(),
+            Some(b"\x1b[6 q".to_vec()),
+            "DECSCUSR surfaces via unhandled_csi and is mirrored verbatim"
+        );
+
+        // A non-DECSCUSR unhandled CSI must NOT touch the shape (the SP
+        // intermediate is required). A kitty enable is the obvious neighbour.
+        parser.process(b"\x1b[>1u");
+        assert_eq!(
+            parser.callbacks_mut().cursor_shape.take_pending(),
+            None,
+            "a kitty CSI must not register as a cursor-shape change"
+        );
     }
 
     /// With the outer terminal unable to source kitty, the child's enable is

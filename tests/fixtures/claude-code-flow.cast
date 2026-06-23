@@ -1,0 +1,13 @@
+[?1049h[?25l[?2004h[?1h[?1000h[?1002h[?1006h[>1u[2J[H[1;1H[1;38;5;39m Claude Code [0m[38;5;240m v1.0 [0m[2;1H[38;5;244m────────────────────────────────────────[0m[4;1H[97mEditing src/main.rs[0m[5;5H[38;5;81mfn[0m [38;5;220mmain[0m() {[6;5H    [38;5;81mlet[0m x = [38;5;208m42[0m;[7;5H    [38;5;81mlet[0m greeting = [38;5;114m"hello"[0m;[8;5H    println!([38;5;114m"{} {}"[0m, greeting, x);[9;5H}[6;13H[38;5;208m43[0m[11;20r[20;1H[38;5;245mlog line 00: doing some work here...[0m
+[38;5;245mlog line 01: doing some work here...[0m
+[38;5;245mlog line 02: doing some work here...[0m
+[38;5;245mlog line 03: doing some work here...[0m
+[38;5;245mlog line 04: doing some work here...[0m
+[38;5;245mlog line 05: doing some work here...[0m
+[38;5;245mlog line 06: doing some work here...[0m
+[38;5;245mlog line 07: doing some work here...[0m
+[38;5;245mlog line 08: doing some work here...[0m
+[38;5;245mlog line 09: doing some work here...[0m
+[38;5;245mlog line 10: doing some work here...[0m
+[38;5;245mlog line 11: doing some work here...[0m
+[r[12;1H[1;97mdiff --git a/lib.rs b/lib.rs[0m[13;1H[38;5;244m@@ -1,4 +1,5 @@[0m[14;1H[48;5;52m[38;5;203m-    old_value = compute();[0m[15;1H[48;5;22m[38;5;120m+    new_value = compute_v2();[0m[16;1H[48;5;22m[38;5;120m+    log::info!("updated");[0m[17;1H [38;5;250m     return new_value;[0m[22;3H[38;5;213m⠋[0m [38;5;245mThinking...[0m[22;3H[38;5;213m⠙[0m [38;5;245mThinking...[0m[22;3H[38;5;213m⠹[0m [38;5;245mThinking...[0m[22;3H[38;5;213m⠸[0m [38;5;245mThinking...[0m[22;3H[38;5;213m⠋[0m [38;5;245mThinking...[0m[22;3H[38;5;213m⠙[0m [38;5;245mThinking...[0m[22;3H[38;5;213m⠹[0m [38;5;245mThinking...[0m[22;3H[38;5;213m⠸[0m [38;5;245mThinking...[0m[22;3H[38;5;213m⠋[0m [38;5;245mThinking...[0m[22;3H[38;5;213m⠙[0m [38;5;245mThinking...[0m[22;3H[38;5;213m⠹[0m [38;5;245mThinking...[0m[22;3H[38;5;213m⠸[0m [38;5;245mThinking...[0m[22;3H[38;5;120m✔[0m [38;5;245mDone[0m   [24;1H[38;5;240m> [0m

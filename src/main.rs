@@ -36,6 +36,7 @@ mod callbacks;
 mod cli;
 mod clipboard;
 mod clock;
+mod cursor;
 mod geometry;
 mod input;
 mod keyboard;
@@ -46,7 +47,12 @@ mod render;
 mod terminal;
 mod waiter;
 
-#[cfg(feature = "oracle")]
+// The wezterm-term comparison oracle and the equivalence gate (ADR-001) are
+// test-only infrastructure — no shipping call site (the gate trips a flag flip,
+// it doesn't run in the binary). Gated on `test` AND the `oracle` feature so it
+// compiles for `cargo test --features oracle` but is excluded from a plain
+// `--features oracle` build, leaving no dead-code surface in the binary.
+#[cfg(all(test, feature = "oracle"))]
 mod oracle;
 
 use std::process;

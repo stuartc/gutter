@@ -310,15 +310,25 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
         term.write_row(&line)?;
     }
 
-    // Mirror DECTCEM: only emit a show/hide when the state actually changed.
+    // Capture the cursor state while the (immutable) screen borrow is live, so
+    // the mutable cursor-shape access below doesn't conflict with it.
     let visible = !screen.hide_cursor();
+    let (crow, ccol) = screen.cursor_position();
+
+    // Mirror DECTCEM: only emit a show/hide when the state actually changed.
     if visible != renderer.cursor_visible {
         term.set_cursor_visible(visible)?;
         renderer.cursor_visible = visible;
     }
 
+    // Mirror DECSCUSR cursor shape (slice 08): the watcher on the shared
+    // callbacks recorded any `CSI Ps SP q` the child emitted; emit the matching
+    // sequence to the outer terminal only on a real change (the watcher de-dupes).
+    if let Some(shape) = renderer.parser.callbacks_mut().cursor_shape.take_pending() {
+        term.set_cursor_shape(&shape)?;
+    }
+
     // Reposition the real cursor inside the band.
-    let (crow, ccol) = screen.cursor_position();
     term.place_cursor(geometry::physical_col(renderer.left_margin, ccol), crow)?;
 
     term.flush()?;
@@ -1161,6 +1171,56 @@ mod tests {
         assert_eq!(place, Some((7 + 2, 0)), "cursor at margin + col");
     }
 
+    /// **Cursor visibility golden-master against the real-target fixture (slice
+    /// 08).** Replay the checked-in Claude Code fixture through the render loop
+    /// at a non-zero margin, sample the cursor state (position + visibility)
+    /// across the replay as an insta snapshot, AND assert directly that at settle
+    /// the outer cursor position equals `(left_margin + col, row)` from
+    /// `cursor_position()` and that the fixture's `CSI ?25l` hid the outer cursor.
+    #[test]
+    fn cursor_state_golden_master_over_fixture() {
+        let fixture: &[u8] = include_bytes!("../tests/fixtures/claude-code-flow.cast");
+        let (w, rows, margin) = (80u16, 24u16, 10u16);
+
+        let mut renderer = Renderer::at_margin(w, rows, margin);
+        let mut term = MockTerminal::new();
+        // Replay the whole fixture, then render the settled frame once.
+        renderer.parser.process(fixture);
+        render_once(&mut renderer, &mut term).unwrap();
+
+        // Sample the cursor state for the golden master: visibility + the outer
+        // PlaceCursor the frame emitted.
+        let placed = term.calls.iter().rev().find_map(|c| {
+            if let Call::PlaceCursor(col, row) = c {
+                Some((*col, *row))
+            } else {
+                None
+            }
+        });
+        let visible = term
+            .calls
+            .iter()
+            .filter_map(|c| if let Call::SetCursorVisible(v) = c { Some(*v) } else { None })
+            .next_back();
+        insta::assert_debug_snapshot!((visible, placed));
+
+        // Direct assertion: outer cursor == (left_margin + col, row) at settle.
+        let (crow, ccol) = renderer.parser.screen().cursor_position();
+        assert_eq!(
+            placed,
+            Some((margin + ccol, crow)),
+            "outer cursor must sit at (left_margin + col, row)"
+        );
+
+        // The fixture hides the cursor (CSI ?25l in phase 1); the outer terminal
+        // must have been told to hide it.
+        assert_eq!(
+            visible,
+            Some(false),
+            "the fixture's CSI ?25l must hide the outer cursor"
+        );
+    }
+
     /// insta golden-master: snapshot the virtual grid for a representative
     /// fixture stream (startup banner + a multi-line edit with colour), so
     /// render regressions surface as a snapshot diff. Drives the parser
@@ -1244,6 +1304,38 @@ line two\r\n\
             .filter_map(|c| if let Call::SetCursorVisible(v) = c { Some(*v) } else { None })
             .collect();
         assert_eq!(vis, vec![false, true], "hide then show, mirrored once each");
+    }
+
+    /// **Cursor-shape mirroring (slice 08), end-to-end through the dispatch
+    /// path.** A child-emitted `DECSCUSR` (`CSI 6 SP q`, steady bar) must reach
+    /// the outer terminal as the matching `CSI 6 SP q` — proving shape is IN
+    /// scope (not a documented gap) and mirrored exactly once on the change.
+    #[test]
+    fn cursor_shape_mirrored_on_outer() {
+        let script = vec![
+            // Child sets a steady-bar cursor, then a steady-underline cursor.
+            (0u64, Msg::Pty(b"\x1b[6 q".to_vec())),
+            (20, Msg::Pty(b"\x1b[4 q".to_vec())),
+            (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ];
+        let (_f, term, _p, _r, _c) = run_with(script, 20, 5);
+
+        let shapes: Vec<Vec<u8>> = term
+            .calls
+            .iter()
+            .filter_map(|c| {
+                if let Call::SetCursorShape(b) = c {
+                    Some(b.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![b"\x1b[6 q".to_vec(), b"\x1b[4 q".to_vec()],
+            "each DECSCUSR change mirrored once, verbatim"
+        );
     }
 }
 

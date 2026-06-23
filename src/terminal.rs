@@ -80,6 +80,11 @@ pub trait OuterTerminal {
     fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()>;
     /// Mirror the child's cursor visibility (DECTCEM / `CSI ?25l`).
     fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()>;
+    /// Mirror the child's cursor SHAPE (DECSCUSR / `CSI Ps SP q`, slice 08). The
+    /// `bytes` are the ready-made `CSI Ps SP q` sequence the watcher produced;
+    /// the outer terminal forwards them verbatim. Emitted only on a real shape
+    /// change (the watcher de-dupes), alongside the per-frame cursor reposition.
+    fn set_cursor_shape(&mut self, bytes: &[u8]) -> io::Result<()>;
     /// Flush the queued frame to the real terminal. Exactly once per frame.
     fn flush(&mut self) -> io::Result<()>;
 
@@ -222,6 +227,12 @@ impl OuterTerminal for CrosstermTerminal {
         }
     }
 
+    fn set_cursor_shape(&mut self, bytes: &[u8]) -> io::Result<()> {
+        // Forward the watcher's ready-made `CSI Ps SP q` verbatim — gutter does
+        // not re-derive the sequence, it mirrors what the child requested.
+        self.out.write_all(bytes)
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         self.out.flush()
     }
@@ -293,6 +304,8 @@ pub mod mock {
         ClearGutter(u16, u16, u16, u16),
         PlaceCursor(u16, u16),
         SetCursorVisible(bool),
+        /// `set_cursor_shape(bytes)` — the mirrored `CSI Ps SP q` (slice 08).
+        SetCursorShape(Vec<u8>),
         Flush,
         LeaveAltScreen,
         PopKeyboardFlags,
@@ -451,6 +464,10 @@ pub mod mock {
                 .process(if visible { b"\x1b[?25h" } else { b"\x1b[?25l" });
             Ok(())
         }
+        fn set_cursor_shape(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.parser.process(bytes);
+            Ok(())
+        }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
@@ -519,6 +536,10 @@ pub mod mock {
         }
         fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
             self.calls.push(Call::SetCursorVisible(visible));
+            Ok(())
+        }
+        fn set_cursor_shape(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.calls.push(Call::SetCursorShape(bytes.to_vec()));
             Ok(())
         }
         fn flush(&mut self) -> io::Result<()> {
