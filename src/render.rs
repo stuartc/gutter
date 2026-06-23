@@ -67,9 +67,9 @@ pub struct Renderer {
     /// The cursor visibility last mirrored to the outer terminal, so we only
     /// emit a show/hide when it actually changes.
     cursor_visible: bool,
-    /// The mouse forwarding gate (ADR-005): the cached `(mode, encoding)` pair
-    /// refreshed once per frame from the screen poll, plus the button-held flag
-    /// the `ButtonMotion` down-filter needs. Drives the `Event::Mouse` dispatch.
+    /// The mouse forwarding gate (ADR-005): the button-held flag the
+    /// `ButtonMotion` down-filter needs. The child's `(mode, encoding)` is read
+    /// live from the screen each `Event::Mouse` dispatch, not cached here.
     mouse_gate: MouseGate,
 }
 
@@ -121,7 +121,7 @@ impl Renderer {
             left_margin: geometry::margin(layout, real_cols, width),
             // vt100 starts with the cursor visible; mirror that initial state.
             cursor_visible: true,
-            mouse_gate: MouseGate::new(),
+            mouse_gate: MouseGate::default(),
         }
     }
 
@@ -198,22 +198,19 @@ where
             None
         }
         Msg::Input(crossterm::event::Event::Mouse(ev)) => {
-            // The mouse forwarding gate (ADR-005). Refresh the cached
-            // `(mode, encoding)` pair from the live screen poll FIRST — this runs
-            // after every `Msg::Pty` dispatched earlier in the frame's drain
-            // applied its bytes, so a DECSET the child just sent is already visible
-            // (the poll IS the mirror point; there is no change event). The gate
-            // then translates the coordinate (live `left_margin`/`width`),
-            // down-filters motion and re-encodes SGR; only `Forward` reaches the
-            // PTY master.
+            // The mouse forwarding gate (ADR-005). Read the child's
+            // `(mode, encoding)` from the live screen poll FIRST — this runs after
+            // every `Msg::Pty` dispatched earlier in the frame's drain applied its
+            // bytes, so a DECSET the child just sent is already visible (the poll IS
+            // the mirror point; there is no change event). The gate then translates
+            // the coordinate (live `left_margin`/`width`), down-filters motion and
+            // re-encodes SGR; only `Forward` reaches the PTY master.
             let screen = renderer.parser.screen();
-            renderer.mouse_gate.update_modes(
-                screen.mouse_protocol_mode(),
-                screen.mouse_protocol_encoding(),
-            );
+            let mode = screen.mouse_protocol_mode();
+            let encoding = screen.mouse_protocol_encoding();
             match renderer
                 .mouse_gate
-                .forward(&ev, renderer.left_margin, renderer.width)
+                .forward(&ev, mode, encoding, renderer.left_margin, renderer.width)
             {
                 MouseDecision::Forward(bytes) => {
                     let _ = pty_writer.write_all(&bytes);
