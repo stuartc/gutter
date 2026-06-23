@@ -19,10 +19,13 @@
 //! 4. Exactly one `render_once`.
 //!
 //! Dispatch: `Pty(b)` → `parser.process(b)`; `Input(Key)` → re-encode at the
-//! child's current kitty level (ADR-002/003) → PTY writer; `Input(Resize)` →
-//! `handle_resize` (the ADR-008 ordering + ADR-011 proportional recompute, on
-//! this thread, the parser's only owner); `ChildExited(s)` → set shutdown with
-//! status, break. Other input (focus/mouse/paste) is swallowed (mouse slice 07).
+//! child's current kitty level (ADR-002/003) → PTY writer; `Input(Mouse)` → the
+//! poll-diff forwarding gate (ADR-005): refresh the cached `(mode, encoding)` from
+//! the live screen, then translate + down-filter + re-encode SGR → PTY writer (or
+//! swallow / fail loud on a non-SGR encoding); `Input(Resize)` → `handle_resize`
+//! (the ADR-008 ordering + ADR-011 proportional recompute, on this thread, the
+//! parser's only owner); `ChildExited(s)` → set shutdown with status, break.
+//! Other input (focus/paste) is swallowed.
 
 use std::io::Write;
 use std::time::Duration;
@@ -31,6 +34,7 @@ use crate::callbacks::GutterCallbacks;
 use crate::clock::{Clock, Recv};
 use crate::geometry::{self, Layout, Width};
 use crate::keyboard;
+use crate::mouse::{MouseDecision, MouseGate};
 use crate::msg::Msg;
 use crate::pty::PtyResizer;
 use crate::terminal::OuterTerminal;
@@ -63,6 +67,10 @@ pub struct Renderer {
     /// The cursor visibility last mirrored to the outer terminal, so we only
     /// emit a show/hide when it actually changes.
     cursor_visible: bool,
+    /// The mouse forwarding gate (ADR-005): the cached `(mode, encoding)` pair
+    /// refreshed once per frame from the screen poll, plus the button-held flag
+    /// the `ButtonMotion` down-filter needs. Drives the `Event::Mouse` dispatch.
+    mouse_gate: MouseGate,
 }
 
 impl Renderer {
@@ -113,6 +121,7 @@ impl Renderer {
             left_margin: geometry::margin(layout, real_cols, width),
             // vt100 starts with the cursor visible; mirror that initial state.
             cursor_visible: true,
+            mouse_gate: MouseGate::new(),
         }
     }
 
@@ -188,8 +197,42 @@ where
             handle_resize(renderer, resizer, term, cols, rows);
             None
         }
-        // Other input events (focus/mouse/paste) are swallowed here (mouse is
-        // slice 07).
+        Msg::Input(crossterm::event::Event::Mouse(ev)) => {
+            // The mouse forwarding gate (ADR-005). Refresh the cached
+            // `(mode, encoding)` pair from the live screen poll FIRST — this runs
+            // after every `Msg::Pty` dispatched earlier in the frame's drain
+            // applied its bytes, so a DECSET the child just sent is already visible
+            // (the poll IS the mirror point; there is no change event). The gate
+            // then translates the coordinate (live `left_margin`/`width`),
+            // down-filters motion and re-encodes SGR; only `Forward` reaches the
+            // PTY master.
+            let screen = renderer.parser.screen();
+            renderer.mouse_gate.update_modes(
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+            );
+            match renderer
+                .mouse_gate
+                .forward(&ev, renderer.left_margin, renderer.width)
+            {
+                MouseDecision::Forward(bytes) => {
+                    let _ = pty_writer.write_all(&bytes);
+                    let _ = pty_writer.flush();
+                }
+                MouseDecision::Swallow => {}
+                MouseDecision::BailNonSgr => {
+                    // A reporting mode with a non-Sgr encoding is out of v1 scope.
+                    // Fail loud rather than feed the child a malformed SGR event
+                    // that would desync its mouse parser (ADR-005).
+                    panic!(
+                        "gutter: child negotiated an unsupported non-SGR mouse \
+                         encoding; SGR 1006 is the only supported encoding (v1)"
+                    );
+                }
+            }
+            None
+        }
+        // Other input events (focus/paste) are swallowed here.
         Msg::Input(_) => None,
         Msg::ChildExited(status) => Some(status.exit_code() as i32),
     }
@@ -465,9 +508,8 @@ where
 }
 
 /// The explicit, ordered terminal restore (ADR-010): leave alt screen → pop
-/// kitty flags → disable mouse → show cursor → disable raw mode. Pop/disable are
-/// no-ops in slice 02 but stay in the sequence so slices 04/07 drop in without
-/// re-sequencing.
+/// kitty flags → disable mouse → show cursor → disable raw mode. Each disables
+/// only what was actually enabled at startup (kitty pop, mouse disable).
 fn run_teardown<T: OuterTerminal>(term: &mut T) -> std::io::Result<()> {
     term.leave_alt_screen()?;
     term.pop_keyboard_flags()?;
@@ -731,10 +773,25 @@ mod tests {
     /// must NOT fire — we only pop what we pushed (ADR-003).
     #[test]
     fn child_exit_restores_in_order_no_kitty_pop_when_not_pushed() {
-        let script = vec![(0u64, Msg::ChildExited(ExitStatus::with_exit_code(42)))];
-        let (_flushes, term, _pty, _r, code) = run_with(script, 80, 24);
+        use crate::terminal::OuterTerminal;
+        let mut clock =
+            VirtualClock::new(vec![(0u64, Msg::ChildExited(ExitStatus::with_exit_code(42)))]);
+        let mut renderer = left_renderer(80, 24, false);
+        let mut term = MockTerminal::new();
+        // Model the eager startup mouse capture main.rs performs (no kitty push
+        // on this non-kitty path). `DisableMouse` must then fire in teardown.
+        term.enable_mouse().unwrap();
+        let mut pty: Vec<u8> = Vec::new();
+
+        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
 
         assert_eq!(code, Some(42), "exit code must equal status.exit_code()");
+        // EnableMouse fired exactly once at startup (acceptance criterion).
+        assert_eq!(
+            term.calls.iter().filter(|c| **c == Call::EnableMouse).count(),
+            1,
+            "EnableMouse fires once at startup"
+        );
         assert_eq!(
             term.restore_calls(),
             vec![
@@ -760,14 +817,21 @@ mod tests {
         )]);
         let mut renderer = left_renderer(80, 24, true);
         let mut term = MockTerminal::kitty_capable();
-        // Simulate the startup probe + push that main.rs performs.
+        // Simulate the startup probe + push + eager mouse capture main.rs
+        // performs, in that order (kitty push, then EnableMouse).
         assert!(term.supports_keyboard_enhancement().unwrap());
         term.push_keyboard_flags().unwrap();
+        term.enable_mouse().unwrap();
         let mut pty: Vec<u8> = Vec::new();
 
         let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
 
         assert_eq!(code, Some(0));
+        assert_eq!(
+            term.calls.iter().filter(|c| **c == Call::EnableMouse).count(),
+            1,
+            "EnableMouse fires once at startup"
+        );
         assert_eq!(
             term.restore_calls(),
             vec![
@@ -848,6 +912,202 @@ mod tests {
         assert_eq!(
             pty, b"\r\r",
             "both Enters degrade to the same legacy byte under the clamp"
+        );
+    }
+
+    // --- Mouse forwarding through the render-loop dispatch arm (slice 07) ---
+    //
+    // These exercise the full Thread-2 wiring: a `Msg::Pty` carrying the child's
+    // DECSET negotiation, the per-cycle poll that refreshes the gate from the live
+    // screen, then a `Msg::Input(Event::Mouse)` that the gate translates and
+    // re-encodes onto the PTY writer. They assert on the child-received bytes (the
+    // PTY-writer sink), never the grid — the same contract the expectrl oracle
+    // would assert, proven here without a PTY.
+
+    use crossterm::event::{
+        Event as CtEvent, MouseButton, MouseEvent, MouseEventKind,
+    };
+
+    fn mouse_ev(kind: MouseEventKind, column: u16, row: u16) -> Msg {
+        Msg::Input(CtEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }))
+    }
+
+    /// Run a mouse script against a renderer pinned at `left_margin`, returning the
+    /// bytes the child received. The renderer is built at `width`/`margin` so the
+    /// coordinate translation and the `[0, W)` discard are exercised at a real
+    /// non-zero margin.
+    fn run_mouse(margin: u16, width: u16, mut script: Vec<(u64, Msg)>) -> Vec<u8> {
+        script.push((1, Msg::ChildExited(ExitStatus::with_exit_code(0))));
+        let mut clock = VirtualClock::new(script);
+        let mut renderer = Renderer::at_margin(width, 24, margin);
+        let mut term = MockTerminal::new();
+        let mut pty: Vec<u8> = Vec::new();
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        pty
+    }
+
+    /// First post-negotiation click is delivered AND the margin is subtracted:
+    /// the child enables SGR mouse (`CSI ?1000h ?1006h`), then a click at physical
+    /// col `margin + 5` row 3 arrives → the child receives `CSI < 0 ; 6 ; 4 M`
+    /// (child col 5 → SGR 6, row 3 → SGR 4). This is both the correct-cell and the
+    /// first-click-after-negotiation criterion (eager capture means click #1 is
+    /// the one asserted).
+    #[test]
+    fn mouse_first_click_delivered_margin_subtracted() {
+        let margin = 30;
+        let pty = run_mouse(
+            margin,
+            40,
+            vec![
+                // Child negotiates SGR press/release mouse.
+                (0u64, Msg::Pty(b"\x1b[?1000h\x1b[?1006h".to_vec())),
+                // The very first click after negotiation.
+                (
+                    1,
+                    mouse_ev(MouseEventKind::Down(MouseButton::Left), margin + 5, 3),
+                ),
+            ],
+        );
+        assert_eq!(
+            pty, b"\x1b[<0;6;4M",
+            "first click delivered, margin subtracted (child col 5 → SGR 6)"
+        );
+    }
+
+    /// Gutter click ignored: with SGR mouse negotiated, a click left of the band
+    /// (`col < margin`) and one beyond it (`>= margin + W`) both deliver nothing.
+    #[test]
+    fn mouse_gutter_clicks_discarded() {
+        let margin = 30;
+        let w = 40;
+        let pty = run_mouse(
+            margin,
+            w,
+            vec![
+                (0u64, Msg::Pty(b"\x1b[?1000h\x1b[?1006h".to_vec())),
+                // Left gutter (col 5 < margin 30).
+                (1, mouse_ev(MouseEventKind::Down(MouseButton::Left), 5, 0)),
+                // Right gutter (col margin+w = 70, >= band end).
+                (
+                    1,
+                    mouse_ev(MouseEventKind::Down(MouseButton::Left), margin + w, 0),
+                ),
+            ],
+        );
+        assert!(pty.is_empty(), "gutter clicks deliver nothing, got {pty:?}");
+    }
+
+    /// Down-filter, PressRelease (mode 1000): a drag (press → motion → release)
+    /// delivers the press and the release but NOT the motion event.
+    #[test]
+    fn mouse_pressrelease_drops_drag_motion() {
+        let margin = 10;
+        let pty = run_mouse(
+            margin,
+            40,
+            vec![
+                (0u64, Msg::Pty(b"\x1b[?1000h\x1b[?1006h".to_vec())),
+                (
+                    1,
+                    mouse_ev(MouseEventKind::Down(MouseButton::Left), margin + 1, 0),
+                ),
+                // Motion mid-drag — must be dropped in PressRelease.
+                (
+                    1,
+                    mouse_ev(MouseEventKind::Drag(MouseButton::Left), margin + 2, 0),
+                ),
+                (
+                    1,
+                    mouse_ev(MouseEventKind::Up(MouseButton::Left), margin + 2, 0),
+                ),
+            ],
+        );
+        // Press at child col 1 (SGR 2) M, release at child col 2 (SGR 3) m — no
+        // motion event between them.
+        assert_eq!(
+            pty, b"\x1b[<0;2;1M\x1b[<0;3;1m",
+            "PressRelease forwards press + release, drops the drag motion"
+        );
+    }
+
+    /// Down-filter, ButtonMotion (mode 1002): motion while a button is held is
+    /// delivered; motion with no button held is dropped. Driven by the gate's
+    /// tracked press/release state.
+    #[test]
+    fn mouse_buttonmotion_gates_on_button_held() {
+        let margin = 10;
+        let pty = run_mouse(
+            margin,
+            40,
+            vec![
+                (0u64, Msg::Pty(b"\x1b[?1002h\x1b[?1006h".to_vec())),
+                // Motion before any press → no button held → dropped.
+                (1, mouse_ev(MouseEventKind::Moved, margin + 1, 0)),
+                // Press → held.
+                (
+                    1,
+                    mouse_ev(MouseEventKind::Down(MouseButton::Left), margin + 1, 0),
+                ),
+                // Drag (motion with button) → delivered.
+                (
+                    1,
+                    mouse_ev(MouseEventKind::Drag(MouseButton::Left), margin + 2, 0),
+                ),
+                // Release → not held.
+                (
+                    1,
+                    mouse_ev(MouseEventKind::Up(MouseButton::Left), margin + 2, 0),
+                ),
+                // Motion after release → dropped.
+                (1, mouse_ev(MouseEventKind::Moved, margin + 3, 0)),
+            ],
+        );
+        // Delivered: press (col1→2, button 0, M), drag (col2→3, button 0|32=32, M),
+        // release (col2→3, m). The two `Moved` events are dropped.
+        assert_eq!(
+            pty, b"\x1b[<0;2;1M\x1b[<32;3;1M\x1b[<0;3;1m",
+            "ButtonMotion delivers motion only while held"
+        );
+    }
+
+    /// Non-Sgr encoding: when the child negotiates a reporting mode but NOT SGR
+    /// (`CSI ?1000h` with no `?1006h` → Default encoding), a click must NOT produce
+    /// a malformed SGR event. gutter fails loud — the dispatch arm panics rather
+    /// than forwarding garbage (the v1 abort, the E2E counterpart of the unit
+    /// `BailNonSgr` test).
+    #[test]
+    #[should_panic(expected = "non-SGR mouse encoding")]
+    fn mouse_non_sgr_encoding_panics_rather_than_forwarding_garbage() {
+        // No `?1006h`, so the encoding stays Default while the mode is reporting.
+        run_mouse(
+            10,
+            40,
+            vec![
+                (0u64, Msg::Pty(b"\x1b[?1000h".to_vec())),
+                (1, mouse_ev(MouseEventKind::Down(MouseButton::Left), 15, 0)),
+            ],
+        );
+    }
+
+    /// The forwarding gate is driven by the per-cycle poll of the live screen
+    /// modes: with mouse never negotiated (mode stays `None`), a click is
+    /// swallowed and the child receives nothing — the swallow side of the
+    /// poll-driven gate, proven through the real dispatch path.
+    #[test]
+    fn mouse_swallowed_when_child_never_negotiated() {
+        let pty = run_mouse(
+            10,
+            40,
+            vec![(1, mouse_ev(MouseEventKind::Down(MouseButton::Left), 15, 0))],
+        );
+        assert!(
+            pty.is_empty(),
+            "no negotiation → mode None → swallow, got {pty:?}"
         );
     }
 

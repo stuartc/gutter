@@ -14,9 +14,10 @@
 //!    the render path be unit-tested against a recording mock — physical-cell
 //!    assertions read back what was painted to which column.
 //!
-//! In slice 02 `pop_keyboard_flags` and `disable_mouse` are inert in the real
-//! impl (kitty is slice 04, mouse is slice 07) but stay in the restore sequence
-//! so those slices drop in without re-sequencing.
+//! Setup mirrors teardown: the eager startup `enable_mouse`
+//! (`EnableMouseCapture`, ADR-005) and the kitty push are paired with
+//! `disable_mouse`/`pop_keyboard_flags` in the restore — each undoes only what it
+//! actually set.
 
 use std::io::{self, Write};
 
@@ -43,6 +44,14 @@ pub trait OuterTerminal {
     ///
     /// [`pop_keyboard_flags`]: OuterTerminal::pop_keyboard_flags
     fn push_keyboard_flags(&mut self) -> io::Result<()>;
+    /// Enable mouse capture eagerly (ADR-005): crossterm emits the fixed bundle
+    /// `?1000h ?1002h ?1003h ?1015h ?1006h` (any-motion SGR reporting). Called
+    /// once at startup, after raw mode and the kitty push, before the alt screen.
+    /// Paired with [`disable_mouse`] in teardown — set once, never tracking the
+    /// child's mode (the forwarding gate narrows in software).
+    ///
+    /// [`disable_mouse`]: OuterTerminal::disable_mouse
+    fn enable_mouse(&mut self) -> io::Result<()>;
     /// Enter the alternate screen. Setup; after raw mode.
     fn enter_alt_screen(&mut self) -> io::Result<()>;
 
@@ -80,7 +89,12 @@ pub trait OuterTerminal {
     /// Pop kitty keyboard enhancement flags. Teardown step 2. No-op until
     /// slice 04 pushes them.
     fn pop_keyboard_flags(&mut self) -> io::Result<()>;
-    /// Disable mouse capture. Teardown step 3. No-op until slice 07 enables it.
+    /// Disable mouse capture. Teardown step 3 — after the kitty pop, before the
+    /// cursor show (ADR-010). Pairs with [`enable_mouse`]; runs via the explicit
+    /// restore (not a `Drop` guard — `process::exit` skips destructors, which
+    /// would leave the shell emitting mouse escapes after gutter dies).
+    ///
+    /// [`enable_mouse`]: OuterTerminal::enable_mouse
     fn disable_mouse(&mut self) -> io::Result<()>;
     /// Show the cursor. Teardown step 4.
     fn show_cursor(&mut self) -> io::Result<()>;
@@ -95,6 +109,9 @@ pub struct CrosstermTerminal {
     /// Whether kitty enhancement flags were pushed at startup — so teardown only
     /// pops what it actually set (ADR-003: don't pop flags you never pushed).
     kitty_pushed: bool,
+    /// Whether mouse capture was enabled at startup — so teardown only disables
+    /// what it actually enabled (symmetry with the kitty pop).
+    mouse_enabled: bool,
 }
 
 impl CrosstermTerminal {
@@ -102,6 +119,7 @@ impl CrosstermTerminal {
         Self {
             out: io::stdout(),
             kitty_pushed: false,
+            mouse_enabled: false,
         }
     }
 }
@@ -133,6 +151,14 @@ impl OuterTerminal for CrosstermTerminal {
         )?;
         self.out.flush()?;
         self.kitty_pushed = true;
+        Ok(())
+    }
+
+    fn enable_mouse(&mut self) -> io::Result<()> {
+        use crossterm::{event::EnableMouseCapture, queue};
+        queue!(self.out, EnableMouseCapture)?;
+        self.out.flush()?;
+        self.mouse_enabled = true;
         Ok(())
     }
 
@@ -220,8 +246,15 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn disable_mouse(&mut self) -> io::Result<()> {
-        // No-op in slice 02 — mouse capture is never enabled. Slice 07
-        // disables capture here.
+        // Only disable what was actually enabled (symmetry with the kitty pop):
+        // emitting `DisableMouseCapture` when we never captured would still be
+        // harmless, but mirroring the push/pop rule keeps the contract clean.
+        if self.mouse_enabled {
+            use crossterm::{event::DisableMouseCapture, queue};
+            queue!(self.out, DisableMouseCapture)?;
+            self.out.flush()?;
+            self.mouse_enabled = false;
+        }
         Ok(())
     }
 
@@ -252,6 +285,7 @@ pub mod mock {
         EnableRawMode,
         SupportsKeyboardEnhancement,
         PushKeyboardFlags,
+        EnableMouse,
         EnterAltScreen,
         MoveTo(u16, u16),
         WriteRow(Vec<u8>),
@@ -279,6 +313,10 @@ pub mod mock {
         /// so the mock's `pop` only records a [`Call::PopKeyboardFlags`] when
         /// flags were pushed, mirroring the real "pop only what you pushed" rule.
         kitty_pushed: bool,
+        /// Whether [`OuterTerminal::enable_mouse`] was actually called — so the
+        /// mock's `disable_mouse` only records a [`Call::DisableMouse`] when
+        /// capture was enabled, mirroring the real "disable only what you enabled".
+        mouse_enabled: bool,
     }
 
     impl MockTerminal {
@@ -360,6 +398,9 @@ pub mod mock {
             Ok(false)
         }
         fn push_keyboard_flags(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn enable_mouse(&mut self) -> io::Result<()> {
             Ok(())
         }
         fn enter_alt_screen(&mut self) -> io::Result<()> {
@@ -444,6 +485,11 @@ pub mod mock {
             self.kitty_pushed = true;
             Ok(())
         }
+        fn enable_mouse(&mut self) -> io::Result<()> {
+            self.calls.push(Call::EnableMouse);
+            self.mouse_enabled = true;
+            Ok(())
+        }
         fn enter_alt_screen(&mut self) -> io::Result<()> {
             self.calls.push(Call::EnterAltScreen);
             Ok(())
@@ -492,7 +538,11 @@ pub mod mock {
             Ok(())
         }
         fn disable_mouse(&mut self) -> io::Result<()> {
-            self.calls.push(Call::DisableMouse);
+            // Mirror the real impl: only disable what was actually enabled.
+            if self.mouse_enabled {
+                self.calls.push(Call::DisableMouse);
+                self.mouse_enabled = false;
+            }
             Ok(())
         }
         fn show_cursor(&mut self) -> io::Result<()> {

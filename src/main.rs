@@ -39,6 +39,7 @@ mod clock;
 mod geometry;
 mod input;
 mod keyboard;
+mod mouse;
 mod msg;
 mod pty;
 mod render;
@@ -161,6 +162,16 @@ fn run() -> i32 {
         if let Err(e) = terminal.push_keyboard_flags() {
             eprintln!("gutter: failed to push keyboard enhancement flags: {e}");
         }
+    }
+
+    // Eager outer mouse capture (ADR-005): enable ONCE here, before the alt
+    // screen, so the outer terminal is already in SGR-any-motion reporting at the
+    // first click after the child negotiates — the dropped-first-click race is
+    // removed by construction, not by timing. `DisableMouseCapture` fires once in
+    // the render thread's ordered teardown. Eager, not reactive: the outer mouse
+    // state never tracks the child's; the gate (slice 07) does the narrowing.
+    if let Err(e) = terminal.enable_mouse() {
+        eprintln!("gutter: failed to enable mouse capture: {e}");
     }
 
     if let Err(e) = terminal.enter_alt_screen() {
