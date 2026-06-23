@@ -207,6 +207,91 @@ pub mod mock {
         }
     }
 
+    /// A physical-cell-readback [`OuterTerminal`] (the ADR-006 seam). Unlike
+    /// [`MockTerminal`], which only records the *sequence* of calls, this paints
+    /// into an in-memory grid the size of the **real** outer terminal
+    /// (`phys_cols × rows`) by replaying gutter's own `move_to` + `write_row`
+    /// bytes through a `vt100` parser at that physical width. After a render the
+    /// test reads back cell `(row, margin + W)` and asserts it is blank — the
+    /// "no bleed past the band" assertion that `COLUMNS == W` can never make,
+    /// because the corruption lives in the physical outer cells, not the child
+    /// grid (ADR-006).
+    ///
+    /// Render-output calls (`move_to`/`write_row`/`place_cursor`/visibility) are
+    /// translated to the equivalent escape bytes and fed to the parser, exactly
+    /// as the real `CrosstermTerminal` would emit them to stdout. Lifecycle and
+    /// teardown calls are no-ops here (the ordered-restore assertion is
+    /// [`MockTerminal`]'s job).
+    pub struct RecordingGrid {
+        parser: vt100::Parser,
+    }
+
+    impl RecordingGrid {
+        /// A recording grid sized to the **physical** outer terminal.
+        pub fn new(phys_cols: u16, rows: u16) -> Self {
+            Self {
+                parser: vt100::Parser::new(rows, phys_cols, 0),
+            }
+        }
+
+        /// The trimmed contents of physical cell `(row, col)` — `""` when blank.
+        /// The edge-of-band assertion reads `(row, margin + W)` and expects `""`.
+        pub fn cell_contents(&self, row: u16, col: u16) -> String {
+            self.parser
+                .screen()
+                .cell(row, col)
+                .map(|c| c.contents().to_string())
+                .unwrap_or_default()
+        }
+    }
+
+    impl OuterTerminal for RecordingGrid {
+        fn enable_raw_mode(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn enter_alt_screen(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
+            // CSI row+1 ; col+1 H — vt100 is 1-based, gutter's API 0-based.
+            let seq = format!("\x1b[{};{}H", row + 1, col + 1);
+            self.parser.process(seq.as_bytes());
+            Ok(())
+        }
+        fn write_row(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.parser.process(bytes);
+            Ok(())
+        }
+        fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {
+            let seq = format!("\x1b[{};{}H", row + 1, col + 1);
+            self.parser.process(seq.as_bytes());
+            Ok(())
+        }
+        fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
+            self.parser
+                .process(if visible { b"\x1b[?25h" } else { b"\x1b[?25l" });
+            Ok(())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn leave_alt_screen(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn pop_keyboard_flags(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn disable_mouse(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn disable_raw_mode(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     impl OuterTerminal for MockTerminal {
         fn enable_raw_mode(&mut self) -> io::Result<()> {
             self.calls.push(Call::EnableRawMode);

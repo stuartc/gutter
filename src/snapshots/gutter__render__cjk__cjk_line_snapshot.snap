@@ -1,0 +1,9 @@
+---
+source: src/render.rs
+expression: painted
+---
+[
+    "一二三あいok",
+    "",
+    "",
+]
