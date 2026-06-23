@@ -67,6 +67,12 @@ pub trait OuterTerminal {
     /// Write a row's `rows_diff` byte run verbatim (it carries its own intra-row
     /// SGR and relative cursor moves, scoped to `[0, W)`).
     fn write_row(&mut self, bytes: &[u8]) -> io::Result<()>;
+    /// Advance the real terminal one line (`\r\n`), scrolling it when the cursor
+    /// is on the bottom row. The scroll-aware primary paint (ADR-013) emits a
+    /// departed top line then this newline so the line enters the **real
+    /// terminal's own** scrollback — gutter keeps vt100 at `scrollback=0` and lets
+    /// the real terminal be the store.
+    fn newline(&mut self) -> io::Result<()>;
     /// Clear the gutter columns — everything outside the band `[margin,
     /// margin + width)` across every physical row `[0, rows)` of a `real_cols`-wide
     /// terminal. Called on resize (ADR-008 step 4): a shrink that moved the margin
@@ -190,6 +196,12 @@ impl OuterTerminal for CrosstermTerminal {
         self.out.write_all(bytes)
     }
 
+    fn newline(&mut self) -> io::Result<()> {
+        // `\r\n` returns to column 0 then advances a line; on the bottom row the
+        // terminal scrolls and the line just written enters its scrollback.
+        self.out.write_all(b"\r\n")
+    }
+
     fn clear_gutter(
         &mut self,
         margin: u16,
@@ -308,6 +320,10 @@ pub mod mock {
         EnterAltScreen,
         MoveTo(u16, u16),
         WriteRow(Vec<u8>),
+        /// `\r\n` — a departed line was advanced into the real terminal's
+        /// scrollback (ADR-013). The count-based scroll-delta test asserts one
+        /// `Newline` per departed line, not per frame.
+        Newline,
         /// `clear_gutter(margin, width, real_cols, rows)`.
         ClearGutter(u16, u16, u16, u16),
         PlaceCursor(u16, u16),
@@ -400,6 +416,17 @@ pub mod mock {
             }
         }
 
+        /// A recording grid with a bounded scrollback (slice 04 / ADR-013) — models
+        /// the **real terminal's own scrollback store** so the scroll-off survival
+        /// assertions can read back the departed lines the `\r\n`s scrolled in. A
+        /// production terminal keeps history; the default `new` keeps `scrollback=0`
+        /// to mirror the edge-of-band physical-cell readback that needs no history.
+        pub fn with_scrollback(phys_cols: u16, rows: u16, scrollback: usize) -> Self {
+            Self {
+                parser: vt100::Parser::new(rows, phys_cols, scrollback),
+            }
+        }
+
         /// The trimmed contents of physical cell `(row, col)` — `""` when blank.
         /// The edge-of-band assertion reads `(row, margin + W)` and expects `""`.
         pub fn cell_contents(&self, row: u16, col: u16) -> String {
@@ -408,6 +435,41 @@ pub mod mock {
                 .cell(row, col)
                 .map(|c| c.contents().to_string())
                 .unwrap_or_default()
+        }
+
+        /// The visible band rows `[0, rows)`, each trimmed to the band columns
+        /// `[margin, margin + width)`. Used to assert what stayed on screen.
+        pub fn visible_band(&self, margin: u16, width: u16, rows: u16) -> Vec<String> {
+            (0..rows)
+                .map(|r| {
+                    let mut s = String::new();
+                    for c in margin..margin + width {
+                        s.push_str(&self.cell_contents(r, c));
+                    }
+                    s.trim_end().to_string()
+                })
+                .collect()
+        }
+
+        /// The lines in the recorder's scrollback, oldest first, each read across
+        /// the band columns `[0, width)` (the tests paint a margin-0 band). Walks
+        /// the scrollback offsets deepest-to-one, reading the top row at each — the
+        /// same way a user scrolling back through their terminal would see them.
+        pub fn scrollback_top_rows(&mut self, width: u16) -> Vec<String> {
+            // Probe the filled scrollback length by clamping the offset.
+            self.parser.screen_mut().set_scrollback(usize::MAX);
+            let n = self.parser.screen().scrollback();
+            let mut out = Vec::with_capacity(n);
+            for offset in (1..=n).rev() {
+                self.parser.screen_mut().set_scrollback(offset);
+                let mut s = String::new();
+                for c in 0..width {
+                    s.push_str(&self.cell_contents(0, c));
+                }
+                out.push(s.trim_end().to_string());
+            }
+            self.parser.screen_mut().set_scrollback(0);
+            out
         }
     }
 
@@ -435,6 +497,12 @@ pub mod mock {
         }
         fn write_row(&mut self, bytes: &[u8]) -> io::Result<()> {
             self.parser.process(bytes);
+            Ok(())
+        }
+        fn newline(&mut self) -> io::Result<()> {
+            // Feed `\r\n` through the physical-sized parser exactly as the real
+            // terminal would, so a departed line scrolls into the recording grid.
+            self.parser.process(b"\r\n");
             Ok(())
         }
         fn clear_gutter(
@@ -525,6 +593,10 @@ pub mod mock {
         }
         fn write_row(&mut self, bytes: &[u8]) -> io::Result<()> {
             self.calls.push(Call::WriteRow(bytes.to_vec()));
+            Ok(())
+        }
+        fn newline(&mut self) -> io::Result<()> {
+            self.calls.push(Call::Newline);
             Ok(())
         }
         fn clear_gutter(

@@ -393,6 +393,164 @@ fn multi_mb_scroll_stays_bounded() {
     drop(session);
 }
 
+/// **Scroll-off survival (the slice-04 gate, ADR-013).** A plain command that
+/// prints MORE than one screenful on the primary screen — 40 distinctly-tagged
+/// lines on a 24-row terminal — must have its early (scrolled-off) lines reach the
+/// **real terminal's own scrollback**, present in the drained bytes even though
+/// they are NOT in the visible last screenful. gutter keeps vt100 at
+/// `scrollback=0` and emits each departed top line into the terminal as it scrolls
+/// off, so the early tags appear in the stream via the scroll emit, not the band
+/// repaint. This flips the scroll-off case from slice 03's "last screenful
+/// survives" to "all lines reach scrollback".
+///
+/// The child paces one line per ~25ms so each render frame advances roughly one
+/// line — the count-based emit then captures every departed line deterministically
+/// regardless of coalescing (a single frame never swallows a whole screenful).
+#[test]
+fn scroll_off_lines_reach_real_terminal_scrollback() {
+    // 40 lines, each `SCROLLTAG-NN`, paced so the band scrolls steadily. No alt
+    // screen — a pure primary-screen command. Exits 0; we read the full stream
+    // (the scrolled-off lines were emitted into scrollback as they departed).
+    let child = "/bin/sh -c 'i=0; while [ $i -lt 40 ]; do printf \"SCROLLTAG-%02d\\n\" $i; i=$((i+1)); sleep 0.025; done; exit 0'";
+    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 --left {child}"));
+    let mut session = spawn(cmd);
+
+    // Drain through the whole run + teardown.
+    let bytes = drain_window(&mut session, Duration::from_secs(5));
+    let s = String::from_utf8_lossy(&bytes);
+
+    // gutter must never force the alt screen for this plain command.
+    assert!(
+        !s.contains("\u{1b}[?1049h") && !s.contains("\u{1b}[?1049l"),
+        "a plain scrolling command must never emit ?1049h/?1049l"
+    );
+
+    // Parse the outer-terminal bytes through a vt100 WITH scrollback — modelling
+    // the real terminal's own scrollback store. The discriminator: with the scroll
+    // emit, each departed top line was `\r\n`-advanced into scrollback, so the
+    // early lines survive in the scrollback region; without it (slice 03's in-place
+    // `[0, rows)` repaint) they would have been overwritten and NOT recoverable.
+    let mut parser = vt100::Parser::new(24, 80, 1000);
+    parser.process(&bytes);
+
+    // The final visible frame (offset 0) holds the LAST screenful — the early
+    // lines must NOT be visible there (they scrolled off).
+    let visible_text: String = parser.screen().rows(0, 80).collect::<Vec<_>>().join("\n");
+    assert!(
+        !visible_text.contains("SCROLLTAG-00"),
+        "the earliest line must have scrolled OFF the visible window, but it is \
+         still visible: {visible_text:?}"
+    );
+    assert!(
+        visible_text.contains("SCROLLTAG-39"),
+        "the final line must be in the visible window, got {visible_text:?}"
+    );
+
+    // Scroll the view up through the scrollback and assert the early scrolled-off
+    // lines are recoverable from the terminal's own scrollback — the slice-04 gate.
+    // Without the scroll emit these lines were repainted in place at `[0, rows)`
+    // and overwritten, so they would NOT be in scrollback.
+    let recovered = |parser: &mut vt100::Parser, tag: &str| -> bool {
+        for offset in 1..=60 {
+            parser.screen_mut().set_scrollback(offset);
+            let text: String = parser.screen().rows(0, 80).collect::<Vec<_>>().join("\n");
+            if text.contains(tag) {
+                return true;
+            }
+        }
+        false
+    };
+    for tag in ["SCROLLTAG-00", "SCROLLTAG-01", "SCROLLTAG-02", "SCROLLTAG-03"] {
+        assert!(
+            recovered(&mut parser, tag),
+            "early scrolled-off line {tag:?} must reach the real terminal's own \
+             scrollback (recoverable by scrolling back), got {} bytes of stream",
+            bytes.len()
+        );
+    }
+
+    assert_eq!(wait_status(session), Some(0), "gutter propagates the zero exit");
+}
+
+/// **Scroll-off survival under a COALESCED BURST (the slice-04 gate's hard case,
+/// ADR-007 + ADR-013).** The same > rows print, but emitted as fast as the child
+/// can — no per-line pacing — so the render loop drains a whole 16 ms window of
+/// PTY bytes into the parser before one `render_once`, advancing the content by
+/// far more than one band-height in a single frame (the real `cat largefile` /
+/// `make` / verbose-test path). The lines that arrive and depart within that one
+/// coalesced frame are never on a painted grid; a grid-overlap scroll-delta sees
+/// no surviving rows and reports 0, silently dropping the whole burst. The
+/// count-based emit (sourced from the scroll tracker, vt100's own scroll
+/// machinery) still lands every departed line in the real terminal's scrollback.
+///
+/// This is the discriminator the paced test cannot make: it deliberately drives a
+/// single-frame advance >= the band height, the exact gap the verifier flagged.
+#[test]
+fn scroll_off_burst_reaches_scrollback_without_pacing() {
+    // 120 lines, printed as fast as possible (no sleep): a single 16 ms frame
+    // swallows dozens at once on a 24-row terminal. Each line is uniquely tagged.
+    let child = "/bin/sh -c 'i=0; while [ $i -lt 120 ]; do printf \"BURSTTAG-%03d\\n\" $i; i=$((i+1)); done; exit 0'";
+    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 --left {child}"));
+    let mut session = spawn(cmd);
+
+    let bytes = drain_window(&mut session, Duration::from_secs(5));
+    let s = String::from_utf8_lossy(&bytes);
+
+    // Still a pure primary-screen command — never the alt screen.
+    assert!(
+        !s.contains("\u{1b}[?1049h") && !s.contains("\u{1b}[?1049l"),
+        "a plain bursting command must never emit ?1049h/?1049l"
+    );
+
+    // Model the real terminal's scrollback store.
+    let mut parser = vt100::Parser::new(24, 80, 4000);
+    parser.process(&bytes);
+
+    // The final visible frame holds the LAST screenful; the earliest line scrolled
+    // off and the last line is visible.
+    let visible_text: String = parser.screen().rows(0, 80).collect::<Vec<_>>().join("\n");
+    assert!(
+        !visible_text.contains("BURSTTAG-000"),
+        "the earliest burst line must have scrolled OFF the visible window: {visible_text:?}"
+    );
+    assert!(
+        visible_text.contains("BURSTTAG-119"),
+        "the final burst line must be in the visible window, got {visible_text:?}"
+    );
+
+    // The early lines — including ones that arrived and left within a single
+    // coalesced frame — must be recoverable from the terminal's own scrollback.
+    let recovered = |parser: &mut vt100::Parser, tag: &str| -> bool {
+        for offset in 1..=200 {
+            parser.screen_mut().set_scrollback(offset);
+            let text: String = parser.screen().rows(0, 80).collect::<Vec<_>>().join("\n");
+            if text.contains(tag) {
+                return true;
+            }
+        }
+        false
+    };
+    // Sample across the whole departed range, including the middle (the lines most
+    // likely to have arrived-and-departed inside one coalesced frame).
+    for tag in [
+        "BURSTTAG-000",
+        "BURSTTAG-001",
+        "BURSTTAG-040",
+        "BURSTTAG-080",
+        "BURSTTAG-090",
+    ] {
+        assert!(
+            recovered(&mut parser, tag),
+            "burst-scrolled-off line {tag:?} must reach scrollback under coalescing \
+             (the count-based emit must not drop a whole-frame turnover), got {} \
+             bytes of stream",
+            bytes.len()
+        );
+    }
+
+    assert_eq!(wait_status(session), Some(0), "gutter propagates the zero exit");
+}
+
 /// **Non-zero exit shows the dim `Exited with: N` status line (slice 02/03).** A
 /// plain child that exits non-zero: gutter mirrors the child's mode (ADR-012), so
 /// it never forces the alt screen — the band is painted onto the **primary**

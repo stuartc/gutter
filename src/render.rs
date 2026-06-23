@@ -42,6 +42,16 @@ use crate::terminal::OuterTerminal;
 /// The 60fps frame budget. One render per `FRAME` of wall (or virtual) time.
 pub const FRAME: Duration = Duration::from_millis(16);
 
+/// The scroll-tracker's bounded scrollback (ADR-013). It only ever needs to hold
+/// one frame's worth of scrolled-off lines (the tracker is reset to the live grid
+/// at the end of every `render_once`), so this caps a single coalesced frame's
+/// advance — a multi-MB burst still settles only a bounded number of lines in one
+/// 16 ms frame. Sized well above any realistic per-frame line count; if an
+/// extreme frame exceeds it, the oldest lines fall off the tracker's bound (the
+/// same backpressure ceiling the real terminal's own scrollback has), never the
+/// live parser's memory.
+const SCROLL_TRACKER_SCROLLBACK: usize = 4096;
+
 /// The render thread's state: the parser, the cached previous screen for the
 /// `rows_diff`, the band width, the left margin, and the last cursor-visibility
 /// we mirrored to the outer terminal.
@@ -49,6 +59,20 @@ pub struct Renderer {
     parser: vt100::Parser<GutterCallbacks>,
     /// The previous-frame screen the `rows_diff` is computed against.
     prev: vt100::Parser<GutterCallbacks>,
+    /// The scroll-off tracker (ADR-013, the primary-screen scrollback emit). A
+    /// second grid kept at the band's size, fed the **same** PTY bytes as the live
+    /// `parser` but with a small bounded scrollback, so vt100's own scroll
+    /// machinery records exactly which lines departed the top of the W-window and
+    /// in what order — the count-based delta the live `parser` (`scrollback=0`)
+    /// cannot reconstruct once a burst advances past a screenful in one frame.
+    ///
+    /// It is drained and reset to the live grid every `render_once`
+    /// ([`Renderer::drain_scrolled_off`]), so it never holds more than one frame's
+    /// advance: the live `parser` stays `scrollback=0` and the ADR-007 burst
+    /// memory profile is unchanged (ADR-013 keeps vt100 itself scrollback-free —
+    /// this is a per-frame detection device, the twin of the `prev` baseline, not
+    /// vt100 scrollback on the painted grid).
+    scroll_tracker: vt100::Parser<GutterCallbacks>,
     /// The current band width `W`. Constant for an absolute `--width`; recomputed
     /// on each resize for a proportional `--width Npct` (ADR-011).
     width: u16,
@@ -127,6 +151,16 @@ impl Renderer {
                 0,
                 GutterCallbacks::new(false),
             ),
+            // The scroll tracker mirrors the band's geometry but carries a small
+            // bounded scrollback so vt100 records the lines that scroll off the
+            // top (ADR-013). Diff-only like `prev`, so it never runs the clipboard
+            // or kitty paths (`GutterCallbacks::new(false)`).
+            scroll_tracker: vt100::Parser::new_with_callbacks(
+                rows,
+                width,
+                SCROLL_TRACKER_SCROLLBACK,
+                GutterCallbacks::new(false),
+            ),
             width,
             width_config,
             layout,
@@ -193,6 +227,14 @@ where
     match msg {
         Msg::Pty(bytes) => {
             renderer.parser.process(&bytes);
+            // Feed the same bytes to the scroll tracker (ADR-013) so vt100's
+            // scroll machinery captures the lines that depart the top of the
+            // W-window this frame — drained and reset in `render_once`. The live
+            // `parser` stays `scrollback=0`; the tracker is the count-based delta's
+            // source of truth, robust to a burst that turns the screen over
+            // entirely in one coalesced frame (where a grid-vs-grid diff sees no
+            // surviving overlap and would wrongly report zero).
+            renderer.scroll_tracker.process(&bytes);
             None
         }
         Msg::Input(crossterm::event::Event::Key(key)) => {
@@ -266,16 +308,17 @@ where
 ///    reset, cursor/scroll/saved-pos clamp, `col_clamp`).
 /// 3. **Recompute `left_margin`** from the new `real_cols` and `W` via the shared
 ///    [`geometry::margin`].
-/// 4. **Gutter clear + full repaint — alt screen only (ADR-012/013).** In the
-///    alt screen, blank the physical columns outside the band (a shrink can
-///    strand cells there), then force a full `rows_diff` repaint by resetting the
-///    `prev` baseline to a blank grid. The next `render_once` repaints every row;
-///    the child's own post-SIGWINCH repaint then overwrites the transient
-///    degraded grid wholesale. On the **primary** screen this absolute `[0, rows)`
-///    clear/repaint is **suppressed**: gutter doesn't own the whole primary
-///    screen, so blanking `[0, rows)` would erase the real shell's scrollback
-///    history above the band. This is the narrow "don't erase history" floor —
-///    the full primary-aware resize repaint is slice 04.
+/// 4. **Gutter clear + full repaint — primary-aware (ADR-012/013).** Both modes
+///    force a full `rows_diff` repaint by resetting the `prev` baseline to a blank
+///    grid of the new size, so the next `render_once` repaints the live band into
+///    the freshly-resized region. The two modes differ only in the **absolute**
+///    `[0, rows)` gutter clear: in the alt screen gutter owns the whole viewport,
+///    so it blanks the physical columns outside the band (a shrink can strand
+///    cells there). On the **primary** screen that absolute clear is **skipped** —
+///    gutter doesn't own the whole primary screen, so blanking outside the band
+///    would erase real shell history. The primary path narrows *what* is cleared
+///    (the band region repaints, the gutter/history is untouched); it does not
+///    reorder the ADR-008 `master.resize()` → `set_size` sequence above.
 fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     renderer: &mut Renderer,
     resizer: &R,
@@ -298,22 +341,23 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     // Step 3 — recompute the left margin from the new real_cols and W.
     renderer.left_margin = geometry::margin(renderer.layout, cols, w);
 
-    // Step 4 — the absolute `[0, rows)` gutter clear + full repaint, gated on the
-    // alt screen (ADR-012/013). The alt screen is gutter's whole viewport, so the
-    // absolute clear/repaint is safe and correct there. On the primary screen it
-    // would reach rows the real shell drew above the band — the user's scrollback
-    // history — and erase it, so it is suppressed. The full primary-aware resize
-    // repaint (recompute, scroll-aware) is slice 04.
+    // Step 4 — primary-aware gutter clear + full repaint (ADR-012/013). The
+    // absolute `[0, rows)` gutter clear is alt-screen only: there gutter owns the
+    // whole viewport, so blanking the stranded gutter cells is safe. On the
+    // primary screen it would reach rows outside the band that hold real shell
+    // history, so it is skipped.
     if renderer.outer_alt_active {
         // Step 4a — clear the physical gutter columns (cells stranded by a shrink).
         let _ = term.clear_gutter(renderer.left_margin, w, cols, rows);
-
-        // Step 4b — force a full repaint next frame: reset the diff baseline to a
-        // blank grid of the new size so `rows_diff` repaints every row into the
-        // freshly-resized band. (The render_once that follows this turn does the
-        // actual paint.)
-        renderer.reset_prev_baseline();
     }
+
+    // Step 4b — force a full repaint next frame in BOTH modes: reset the diff
+    // baseline to a blank grid of the new size so `rows_diff` repaints every row
+    // into the freshly-resized band. On the primary screen this repaints only the
+    // live band region (`[margin, margin + W)` over rows `[0, rows)`) — it never
+    // blanks the gutter, so real shell history is untouched. (The render_once that
+    // follows this turn does the actual paint.)
+    renderer.reset_prev_baseline();
 }
 
 /// Paint the current virtual grid to the outer terminal at the band's offset
@@ -328,20 +372,35 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
 /// screen is repainted whole rather than diffed against the stale alt frame. The
 /// `ever_entered_alt` latch is set whenever the child is in the alt screen.
 ///
-/// **Paint.** For each visible row, emit our own `move_to(left_margin, row)`
-/// then that row's `rows_diff` byte run (which carries its own intra-row SGR and
-/// relative cursor moves, scoped to `[0, W)`, so it paints into physical columns
-/// `[margin, margin + W)` and never past `margin + W` — vt100's margin rule
-/// guarantees the grid is exactly `W` columns). Empty diffs (unchanged rows) are
-/// skipped. The row paint is shared by both modes; the alt screen owns a fixed
-/// `[0, rows)` viewport and the constrained primary paint targets that same
-/// region (one screenful — the scroll-aware primary paint is slice 04).
+/// **Scroll emit (ADR-013, the primary screen only).** On the primary screen,
+/// drain the lines that scrolled off the top of the W-window this frame from the
+/// scroll tracker ([`Renderer::drain_scrolled_off`]). If any departed, paint the
+/// frame as a scrolling stream ([`emit_scroll_stream`]): `departed ++ band` printed
+/// top-down the band column, so the terminal's own scrolling carries exactly the
+/// departed lines into its **own** scrollback and leaves the current band visible.
+/// The count is the single correctness obligation the idempotent alt frame never
+/// had: under ADR-007 coalescing many lines advance in one frame, so emitting one
+/// line per frame would silently drop scrollback. The tracker carries the count via
+/// vt100's own scroll machinery, so a burst that turns the whole screen over in one
+/// frame — leaving no surviving overlap row a grid-diff could witness — still lands
+/// every departed line. When nothing departed, the ordinary per-row `rows_diff`
+/// paint runs instead. The alt screen never scrolls the outer terminal, so the
+/// scroll path is gated on the primary branch.
+///
+/// **Paint (the non-scroll path).** For each visible row, emit our own
+/// `move_to(left_margin, row)` then that row's `rows_diff` byte run (which carries
+/// its own intra-row SGR and relative cursor moves, scoped to `[0, W)`, so it
+/// paints into physical columns `[margin, margin + W)` and never past `margin + W`
+/// — vt100's margin rule guarantees the grid is exactly `W` columns). Empty diffs
+/// (unchanged rows) are skipped. This is the path for both an alt frame (a fixed
+/// `[0, rows)` viewport that never scrolls the outer terminal) and a primary frame
+/// that did not scroll; a primary frame that scrolled paints via the scroll stream
+/// above instead, which also lands the band at physical rows `[0, rows)`.
 ///
 /// After the repaint, mirror the child's cursor visibility and reposition the
-/// real cursor. The cursor row targets the **live physical row**: on the primary
-/// screen the band is painted at physical rows `[0, rows)` with no scroll yet, so
-/// the live physical row equals the grid cursor row — slice 04's scroll emit is
-/// what makes the two diverge.
+/// real cursor. The cursor row targets the **live physical row**: the primary
+/// scroll emit keeps the band painted at physical rows `[0, rows)`, so the live
+/// physical row equals the grid cursor row.
 fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
     // Mode mirror (ADR-012): edge-trigger the outer alt screen against the
     // child's, latching whether it was ever entered. Read the flag before the
@@ -360,20 +419,49 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
         renderer.outer_alt_active = child_alt;
     }
 
-    let screen = renderer.parser.screen();
-    let prev_screen = renderer.prev.screen();
+    // Scroll emit (ADR-013): on the primary screen, advance each line that
+    // scrolled off the top of the W-window this frame into the real terminal's
+    // own scrollback. The departed lines (with their real content, in order) come
+    // from the scroll tracker — robust to a coalesced burst that turned the whole
+    // screen over in one frame, where the lines that left were never on a painted
+    // grid. The alt screen never scrolls the outer terminal, so this is gated on
+    // the primary branch.
+    let departed = if renderer.outer_alt_active {
+        // Reset the tracker (keep it tracking the live grid) without emitting — an
+        // alt frame must drop any scroll the tracker saw, never advance the outer
+        // terminal.
+        renderer.drain_scrolled_off();
+        Vec::new()
+    } else {
+        renderer.drain_scrolled_off()
+    };
 
-    for (row, line) in screen.rows_diff(prev_screen, 0, renderer.width).enumerate() {
-        if line.is_empty() {
-            continue;
+    if departed.is_empty() {
+        // No scroll: the ordinary per-row diff paint (in-place edits, a filling
+        // screen, an alt frame, an unchanged screen). Only the rows that changed
+        // since the last frame are re-emitted, in place.
+        let screen = renderer.parser.screen();
+        let prev_screen = renderer.prev.screen();
+        for (row, line) in screen.rows_diff(prev_screen, 0, renderer.width).enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            let row = row as u16;
+            term.move_to(renderer.left_margin, row)?;
+            term.write_row(&line)?;
         }
-        let row = row as u16;
-        term.move_to(renderer.left_margin, row)?;
-        term.write_row(&line)?;
+    } else {
+        // A scroll happened: stream the departed lines followed by the current band
+        // down the band, letting the terminal's own scrolling carry exactly the
+        // `departed` lines into its scrollback (count-based, robust to a full-screen
+        // turnover) and leave the current band visible. `sync_prev` below then
+        // baselines `prev` to the painted band. This replaces the diff paint for
+        // this frame: the stream already painted every visible row.
+        emit_scroll_stream(renderer, term, &departed)?;
     }
 
-    // Capture the cursor state while the (immutable) screen borrow is live, so
-    // the mutable cursor-shape access below doesn't conflict with it.
+    // Capture the cursor state from the live screen for the tail below.
+    let screen = renderer.parser.screen();
     let visible = !screen.hide_cursor();
     let (crow, ccol) = screen.cursor_position();
 
@@ -399,6 +487,61 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
     // has no clone, so re-process the formatted state into `prev`. Cheap: it is
     // a single in-memory grid replay, not per-frame allocation churn at scale.
     renderer.sync_prev();
+    Ok(())
+}
+
+/// Paint a scrolling frame: stream the `departed` lines followed by the current
+/// band down the band column, so the terminal's own scrolling carries exactly the
+/// departed lines into its scrollback and leaves the current band visible
+/// (ADR-013, the primary screen only). `departed` is the count-based,
+/// content-bearing run from the scroll tracker (oldest first) — robust to a
+/// coalesced burst that turned the whole screen over in one frame, where the lines
+/// that left were never on any painted grid (a grid-overlap delta would see no
+/// surviving rows and report 0, dropping the burst).
+///
+/// The stream is `departed ++ band` (`delta + rows` lines). It is painted as a
+/// genuine top-down print: the first `rows` lines fill rows `[0, rows)` in place
+/// (overwriting whatever the previous frame left, so pre-existing screen content
+/// never leaks into scrollback), and each line beyond the bottom is preceded by a
+/// `newline()` that scrolls one row off the top into the terminal's own scrollback
+/// before writing the new line at the bottom. After the whole stream, the last
+/// `rows` lines (the band) are visible and exactly the first `delta` lines (the
+/// departed run) have entered scrollback, in order — the count-based obligation
+/// (ADR-007/013) a one-per-frame or witnessed-overlap delta could not meet, and
+/// without the per-frame band re-streaming that would bury early lines deep in
+/// scrollback.
+///
+/// Only the band columns `[margin, margin + W)` are written (each line is
+/// re-positioned to the margin); each `\r\n` scrolls the whole physical row, so any
+/// real shell history in the gutter scrolls up naturally — gutter never blanks or
+/// rewrites the gutter columns.
+fn emit_scroll_stream<T: OuterTerminal>(
+    renderer: &Renderer,
+    term: &mut T,
+    departed: &[Vec<u8>],
+) -> std::io::Result<()> {
+    let rows = renderer.parser.screen().size().0;
+    let bottom = rows.saturating_sub(1);
+    let band: Vec<Vec<u8>> = renderer
+        .parser
+        .screen()
+        .rows_formatted(0, renderer.width)
+        .collect();
+
+    for (i, line) in departed.iter().chain(band.iter()).enumerate() {
+        let i = i as u16;
+        if i <= bottom {
+            // Still filling the initial screen top-down — overwrite row `i` in
+            // place, no scroll yet (so nothing pre-existing leaks into scrollback).
+            term.move_to(renderer.left_margin, i)?;
+        } else {
+            // Past the bottom: scroll one row into the terminal's own scrollback,
+            // then write the new line at the bottom.
+            term.newline()?;
+            term.move_to(renderer.left_margin, bottom)?;
+        }
+        term.write_row(line)?;
+    }
     Ok(())
 }
 
@@ -487,9 +630,72 @@ impl Renderer {
     /// `rows_diff` differs on every non-empty row and forces a full repaint.
     /// Used on resize (ADR-008 step 4): after `set_size` the band geometry
     /// changed, so the cached previous frame is no longer a valid diff baseline.
+    ///
+    /// The scroll tracker is re-seeded to the live grid at the new size too, so it
+    /// keeps mirroring the live content and its scrollback detection stays sound
+    /// across the resize / the alt→primary edge that triggers this.
     fn reset_prev_baseline(&mut self) {
         let (rows, cols) = self.parser.screen().size();
         self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::new(false));
+        self.reset_scroll_tracker();
+    }
+
+    /// Drain the lines that scrolled off the top of the W-window this frame from
+    /// the scroll tracker (ADR-013), then reset the tracker to the live grid so
+    /// it starts the next frame with an empty scrollback (bounded memory).
+    ///
+    /// The tracker carries the **same** content as the live grid but with a small
+    /// bounded scrollback, so vt100's own scroll machinery has captured exactly
+    /// the departed lines — even across a coalesced burst that turned the screen
+    /// over entirely (the live `parser`, `scrollback=0`, dropped them; a grid-vs-
+    /// grid overlap heuristic would see no surviving rows and wrongly report
+    /// nothing). The lines are returned formatted, oldest first, ready for the
+    /// scrolling-band emit.
+    ///
+    /// Reading walks the tracker's scrollback offsets from deepest to one: at
+    /// offset `k` the row that is `k` lines above the current top sits at grid
+    /// row 0, so the top row at offsets `n..=1` yields the `n` departed lines in
+    /// order. The reset re-seeds the tracker from the live grid's formatted
+    /// contents, which leaves its scrollback empty — the same recreate-from-grid
+    /// pattern `sync_prev` uses for the diff baseline.
+    fn drain_scrolled_off(&mut self) -> Vec<Vec<u8>> {
+        let width = self.width;
+        // The tracker started this frame with an empty scrollback, so its current
+        // scrollback length is exactly the lines that departed this frame. vt100
+        // has no length accessor; probe by clamping the offset to its maximum.
+        self.scroll_tracker.screen_mut().set_scrollback(usize::MAX);
+        let n = self.scroll_tracker.screen().scrollback();
+
+        let mut departed = Vec::with_capacity(n);
+        for offset in (1..=n).rev() {
+            self.scroll_tracker.screen_mut().set_scrollback(offset);
+            // The top row at this offset is the next-oldest departed line.
+            if let Some(line) = self.scroll_tracker.screen().rows_formatted(0, width).next() {
+                departed.push(line);
+            }
+        }
+        self.scroll_tracker.screen_mut().set_scrollback(0);
+
+        // Reset the tracker to the live grid: re-seed from the current formatted
+        // contents so its scrollback is empty again for the next frame. Keeps the
+        // bounded scrollback so the next frame's scroll is captured the same way.
+        self.reset_scroll_tracker();
+        departed
+    }
+
+    /// Re-seed the scroll tracker from the live grid, leaving its scrollback
+    /// empty. Used after a drain and after a resize/baseline reset so the tracker
+    /// always mirrors the live grid's content at the band's current size.
+    fn reset_scroll_tracker(&mut self) {
+        let formatted = self.parser.screen().contents_formatted();
+        let (rows, cols) = self.parser.screen().size();
+        self.scroll_tracker = vt100::Parser::new_with_callbacks(
+            rows,
+            cols,
+            SCROLL_TRACKER_SCROLLBACK,
+            GutterCallbacks::new(false),
+        );
+        self.scroll_tracker.process(&formatted);
     }
 }
 
@@ -1292,17 +1498,19 @@ mod tests {
         );
     }
 
-    /// **Primary-mode resize preserves history above the band (ADR-012).** A plain
-    /// (non-alt) stream resized mid-run must NOT emit the absolute `clear_gutter`
-    /// or a full-band repaint — those would erase the real shell's scrollback above
-    /// the band on the primary screen. Contrast: an alt stream resized the same way
-    /// still does the absolute `[0, rows)` clear (the v1 behaviour, correct in the
-    /// alt screen). Pins the `outer_alt_active` gate in `handle_resize`.
+    /// **Primary-mode resize preserves history above the band (ADR-012/013).** A
+    /// plain (non-alt) stream resized mid-run must NOT emit the absolute
+    /// `clear_gutter` — that would erase the real shell's scrollback above the band
+    /// on the primary screen. (The band itself still repaints in full at the new
+    /// margin, in both modes — slice 04's `reset_prev_baseline`; this test pins the
+    /// suppressed *clear*, not the repaint.) Contrast: an alt stream resized the
+    /// same way still does the absolute `[0, rows)` clear (the v1 behaviour, correct
+    /// in the alt screen). Pins the `outer_alt_active` gate in `handle_resize`.
     #[test]
     fn primary_resize_preserves_history_alt_resize_clears() {
         use crossterm::event::Event;
 
-        // --- Primary (plain) stream resized: NO clear_gutter, NO repaint. ---
+        // --- Primary (plain) stream resized: NO clear_gutter (the band repaints). ---
         let script = vec![
             (0u64, Msg::Pty(b"primary content".to_vec())),
             // A resize arrives mid-run, BEFORE the child exits.
@@ -2150,6 +2358,294 @@ mod cjk {
     }
 }
 
+/// Primary-screen scroll emit (slice 04 / ADR-013): the count-based scroll-delta
+/// (sourced from the scroll tracker, robust to a burst that turns the screen over
+/// in one frame) and the emit of each departed top line into the real terminal's
+/// scrollback as a scrolling stream. Drives `render_once` directly against a
+/// [`MockTerminal`] (to count the per-departed-line `Newline`) and a physical-
+/// sized [`RecordingGrid`] **with scrollback** (to read back the scrolled-off
+/// content), so the assertions land on the real emit, not the loop plumbing.
+#[cfg(test)]
+mod primary_scroll {
+    use super::*;
+    use crate::terminal::mock::{Call, MockTerminal, RecordingGrid};
+
+    /// Feed bytes to the renderer exactly as the render loop's `Msg::Pty` dispatch
+    /// does — the live parser AND the scroll tracker — so the tests exercise the
+    /// real per-frame scroll detection rather than a parser the tracker never saw.
+    fn feed(renderer: &mut Renderer, bytes: &[u8]) {
+        renderer.parser.process(bytes);
+        renderer.scroll_tracker.process(bytes);
+    }
+
+    /// A renderer whose grid holds `lines` (one per row, no trailing newline so
+    /// nothing scrolled yet) with `prev` and the tracker synced to that settled
+    /// grid — the start state for asserting a known scroll-delta on the next frame.
+    fn renderer_primed(width: u16, rows: u16, lines: &[&str]) -> Renderer {
+        let mut renderer = Renderer::at_margin(width, rows, 0);
+        feed(&mut renderer, lines.join("\r\n").as_bytes());
+        // One render to settle `prev` and reset the tracker to the primed grid
+        // (whatever scrolled while filling is drained here, not in the test frame).
+        let mut sink = MockTerminal::new();
+        render_once(&mut renderer, &mut sink).unwrap();
+        renderer
+    }
+
+    /// **Count-based scroll-delta (the ADR-007/013 obligation).** Prime the grid
+    /// full, then advance it by THREE lines in a SINGLE frame (one `render_once`)
+    /// and assert ALL THREE departed lines (L0, L1, L2) reach the recorder's
+    /// scrollback, in order — the count is the number of lines advanced, NOT
+    /// one-per-frame. A one-per-frame regression would carry only ONE line into
+    /// scrollback under this coalesced burst and fail (L1 and L2 would be missing).
+    /// The two rows that stayed on screen (L3, L4) plus the fresh ones are the
+    /// visible band, not scrollback.
+    #[test]
+    fn scroll_delta_is_count_not_one_per_frame() {
+        let (w, rows, phys) = (20u16, 5u16, 20u16);
+        // Fill the 5-row screen: L0..L4, so the primed grid is exactly full.
+        let mut renderer = renderer_primed(w, rows, &["L0", "L1", "L2", "L3", "L4"]);
+
+        // Seed the scrollback recorder with the primed band (what is on screen).
+        let mut grid = RecordingGrid::with_scrollback(phys, rows, 1000);
+        for (r, line) in ["L0", "L1", "L2", "L3", "L4"].iter().enumerate() {
+            grid.move_to(0, r as u16).unwrap();
+            grid.write_row(line.as_bytes()).unwrap();
+        }
+
+        // Advance by three lines in ONE frame: from the last primed line, scroll
+        // three times (L5, L6, L7), no trailing newline. Content scrolls up by 3 →
+        // L0, L1, L2 depart the top. Grid ends [L3, L4, L5, L6, L7].
+        feed(&mut renderer, b"\r\nL5\r\nL6\r\nL7");
+        render_once(&mut renderer, &mut grid).unwrap();
+
+        // All three departed lines reached the recorder's scrollback, in order.
+        let history = grid.scrollback_top_rows(w);
+        for tag in ["L0", "L1", "L2"] {
+            assert!(
+                history.iter().any(|r| r.contains(tag)),
+                "departed line {tag} must reach scrollback (count-based, not \
+                 one-per-frame), scrollback = {history:?}"
+            );
+        }
+        // L3/L4 stayed on screen, so they are the visible band, not scrollback.
+        let visible = grid.visible_band(0, w, rows);
+        assert!(
+            visible.iter().any(|r| r.contains("L7")),
+            "the last line must be visible in the band, got {visible:?}"
+        );
+        // A Newline did fire (the emit ran) — guards against a no-op emit.
+        let mut counter = MockTerminal::new();
+        // (Re-run the same one frame against a call recorder to confirm the emit
+        // advances the terminal at all.)
+        let mut r2 = renderer_primed(w, rows, &["L0", "L1", "L2", "L3", "L4"]);
+        feed(&mut r2, b"\r\nL5\r\nL6\r\nL7");
+        render_once(&mut r2, &mut counter).unwrap();
+        assert!(
+            counter.calls.contains(&Call::Newline),
+            "the scroll emit must advance the terminal (at least one Newline)"
+        );
+    }
+
+    /// **The whole-screen-turnover burst — the case a witnessed-overlap delta
+    /// drops.** Prime a 4-row band full, then advance it by EIGHT lines in a SINGLE
+    /// frame (twice the band height) so the new grid shares NO row with the old —
+    /// there is no surviving overlap to witness the scroll, the exact case the
+    /// previous grid-diff delta returned 0 for and silently lost. Replay the frame
+    /// into a real-terminal-shaped [`RecordingGrid`] **with scrollback** and assert
+    /// every one of the eight departed lines (including the ones that arrived and
+    /// left within the single frame, never on any painted grid) is recoverable from
+    /// the recorder's scrollback, in order, and the last screenful is visible.
+    #[test]
+    fn full_turnover_burst_reaches_scrollback() {
+        let (w, rows, phys) = (20u16, 4u16, 20u16);
+        let mut renderer = renderer_primed(w, rows, &["L0", "L1", "L2", "L3"]);
+
+        // Seed the recorder with the primed band so it mirrors what is on screen.
+        let mut grid = RecordingGrid::with_scrollback(phys, rows, 1000);
+        for (r, line) in ["L0", "L1", "L2", "L3"].iter().enumerate() {
+            grid.move_to(0, r as u16).unwrap();
+            grid.write_row(line.as_bytes()).unwrap();
+        }
+
+        // EIGHT lines in ONE frame: L4..L11. The grid ends [L8,L9,L10,L11]; L0..L7
+        // all departed — and L4..L7 were never on a painted grid (they scrolled
+        // through within the single coalesced frame). A grid-overlap delta sees
+        // [L8..L11] vs [L0..L3], no overlap, and reports 0 — losing all eight.
+        feed(&mut renderer, b"\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9\r\nL10\r\nL11");
+        render_once(&mut renderer, &mut grid).unwrap();
+
+        // The eight departed lines are recoverable from the recorder's OWN
+        // scrollback (what a real terminal stores), in order.
+        let history = grid.scrollback_top_rows(w);
+        for tag in ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7"] {
+            assert!(
+                history.iter().any(|r| r.contains(tag)),
+                "departed line {tag} must reach the recorder's scrollback under a \
+                 full-screen-turnover burst, scrollback = {history:?}"
+            );
+        }
+        // The order is preserved (L0 before L7 in history).
+        let pos = |t: &str| history.iter().position(|r| r.contains(t));
+        assert!(
+            pos("L0") < pos("L7"),
+            "scrollback order must be preserved (L0 before L7), got {history:?}"
+        );
+
+        // The last screenful is visible in the band; the mid-burst departed lines
+        // are NOT in the visible frame (they live in scrollback only).
+        let visible = grid.visible_band(0, w, rows);
+        assert!(
+            visible.iter().any(|r| r.contains("L11")),
+            "the last line must be visible in the band, got {visible:?}"
+        );
+        assert!(
+            !visible.iter().any(|r| r.contains("L4")),
+            "a mid-burst departed line must NOT be in the visible band, got {visible:?}"
+        );
+    }
+
+    /// **A still screen emits nothing.** With no advance between frames the
+    /// scroll-delta is zero, so no Newline — the emit only fires on a real scroll.
+    #[test]
+    fn no_scroll_emits_no_newline() {
+        let (w, rows) = (20u16, 5u16);
+        let mut renderer = renderer_primed(w, rows, &["A", "B", "C"]);
+
+        // Re-render the SAME grid (no new bytes) — nothing scrolled.
+        let mut term = MockTerminal::new();
+        render_once(&mut renderer, &mut term).unwrap();
+        assert_eq!(
+            term.calls.iter().filter(|c| **c == Call::Newline).count(),
+            0,
+            "an unchanged screen scrolls nothing → zero Newlines"
+        );
+    }
+
+    /// **The first primary frame, filling the screen, pushes nothing into
+    /// scrollback.** A fresh renderer fed less than one screenful is still
+    /// filling — content grows downward, nothing departs — so no Newline.
+    #[test]
+    fn first_frame_filling_emits_nothing() {
+        let (w, rows) = (20u16, 5u16);
+        let mut renderer = Renderer::at_margin(w, rows, 0);
+        feed(&mut renderer, b"only line\r\n");
+        let mut term = MockTerminal::new();
+        render_once(&mut renderer, &mut term).unwrap();
+        assert_eq!(
+            term.calls.iter().filter(|c| **c == Call::Newline).count(),
+            0,
+            "a screen still filling must not push anything into scrollback"
+        );
+    }
+
+    /// **The alt screen never scrolls the outer terminal.** Even when the child's
+    /// alt-screen content changes between frames, no Newline is emitted — the
+    /// scroll emit is primary-only (an alt screen owns a fixed viewport), and the
+    /// tracker is drained-and-dropped without advancing the terminal.
+    #[test]
+    fn alt_screen_emits_no_newline() {
+        let (w, rows) = (20u16, 5u16);
+        let mut renderer = Renderer::at_margin(w, rows, 0);
+        // Enter the alt screen, fill it, render (settles `outer_alt_active`).
+        feed(&mut renderer, b"\x1b[?1049h");
+        for line in ["X0", "X1", "X2", "X3", "X4"] {
+            feed(&mut renderer, line.as_bytes());
+            feed(&mut renderer, b"\r\n");
+        }
+        let mut sink = MockTerminal::new();
+        render_once(&mut renderer, &mut sink).unwrap();
+
+        // Advance the alt-screen content by several lines in one frame.
+        feed(&mut renderer, b"X5\r\nX6\r\nX7\r\n");
+        let mut term = MockTerminal::new();
+        render_once(&mut renderer, &mut term).unwrap();
+        assert_eq!(
+            term.calls.iter().filter(|c| **c == Call::Newline).count(),
+            0,
+            "the alt screen must never scroll the outer terminal (no Newline)"
+        );
+    }
+
+    /// **Scrolled-off lines are emitted, frame after frame, and the band stays the
+    /// last screenful.** Drive more lines than fit the band, one line per frame,
+    /// across the whole run into a real-terminal-shaped [`RecordingGrid`] **with
+    /// scrollback**: the early lines that scroll off the top must each be
+    /// recoverable from the recorder's scrollback (the count is what carries them
+    /// in), and the recorder must end with the last screenful visible.
+    #[test]
+    fn scrolled_off_lines_are_emitted_into_the_terminal() {
+        let (w, rows, phys) = (20u16, 4u16, 30u16);
+        let total = 10usize;
+
+        // Run 1 — count the departed-line emits over the run on a MockTerminal.
+        let mut counter = Renderer::at_margin(w, rows, 0);
+        let mut total_newlines = 0usize;
+        for i in 0..total {
+            feed(&mut counter, format!("line{i}").as_bytes());
+            let mut term = MockTerminal::new();
+            render_once(&mut counter, &mut term).unwrap();
+            total_newlines += term.calls.iter().filter(|c| **c == Call::Newline).count();
+            feed(&mut counter, b"\r\n");
+        }
+        // Lines beyond the first screenful scroll off; with a 4-row band at least
+        // `total - rows` lines must have departed into scrollback.
+        assert!(
+            total_newlines >= total - rows as usize,
+            "early lines must be emitted into scrollback: {total_newlines} departed \
+             is below the {} that scrolled off",
+            total - rows as usize
+        );
+
+        // Run 2 — replay the identical frames into a scrollback-enabled recorder.
+        let mut painter = Renderer::at_margin(w, rows, 0);
+        let mut grid = RecordingGrid::with_scrollback(phys, rows, 1000);
+        for i in 0..total {
+            feed(&mut painter, format!("line{i}").as_bytes());
+            render_once(&mut painter, &mut grid).unwrap();
+            feed(&mut painter, b"\r\n");
+        }
+
+        // The early scrolled-off lines are recoverable from the recorder's own
+        // scrollback; the final line is visible in the band.
+        let history = grid.scrollback_top_rows(w);
+        assert!(
+            history.iter().any(|r| r.contains("line0")),
+            "the earliest line must reach the recorder's scrollback, got {history:?}"
+        );
+        let visible = grid.visible_band(0, w, rows);
+        assert!(
+            visible.iter().any(|r| r.contains(&format!("line{}", total - 1))),
+            "the last line must be visible in the band, got {visible:?}"
+        );
+    }
+
+    /// **The tracker's bounded scrollback does not accumulate across frames.** The
+    /// tracker is reset to the live grid every `render_once`, so after many
+    /// scrolling frames its scrollback length is back to zero between frames — the
+    /// ADR-013 backpressure guarantee that this detection device stays bounded and
+    /// never grows like vt100 `set_scrollback` would. We probe the tracker length
+    /// directly after a render.
+    #[test]
+    fn tracker_scrollback_is_reset_each_frame() {
+        let (w, rows) = (20u16, 4u16);
+        let mut renderer = renderer_primed(w, rows, &["a", "b", "c", "d"]);
+
+        for i in 0..50 {
+            feed(&mut renderer, format!("\r\nfill{i}").as_bytes());
+            let mut term = MockTerminal::new();
+            render_once(&mut renderer, &mut term).unwrap();
+            // After the drain+reset the tracker holds no scrollback.
+            renderer.scroll_tracker.screen_mut().set_scrollback(usize::MAX);
+            let len = renderer.scroll_tracker.screen().scrollback();
+            renderer.scroll_tracker.screen_mut().set_scrollback(0);
+            assert_eq!(
+                len, 0,
+                "the tracker scrollback must reset to 0 after each frame (frame {i})"
+            );
+        }
+    }
+}
+
 /// Resize (slice 05 / ADR-008 / ADR-011): the SIGWINCH ordering, the proportional
 /// `--width Npct` recompute, the centred-offset recompute, the gutter clear, and
 /// the stress / floor-cap criteria. Drives `handle_resize` directly (every
@@ -2482,6 +2978,57 @@ mod resize {
             term.calls.contains(&Call::ClearGutter(20, 80, 120, 30)),
             "gutter clear must run with the recomputed geometry, calls = {:?}",
             term.calls
+        );
+    }
+
+    /// **Primary-aware resize clears only the live band region (slice 04 /
+    /// ADR-013).** On the **primary** screen a resize must NOT emit the absolute
+    /// `[0, rows)` `clear_gutter` (that would blank rows holding real shell
+    /// history), but it must still force a full band repaint so the band tracks
+    /// the new margin/width. Driving `handle_resize` directly then one
+    /// `render_once`: no `ClearGutter`, yet the band content is repainted in full
+    /// at the new margin (the diff baseline was reset, so every populated row is
+    /// re-emitted) — the "narrow what is cleared, not whether the band repaints"
+    /// contract.
+    #[test]
+    fn primary_resize_repaints_band_without_absolute_clear() {
+        // A primary-screen renderer (never entered the alt screen) with content.
+        let mut r = renderer(40, 6, 100, Layout::Center, Width::Cols(40));
+        r.parser.process(b"\x1b[1;1Hbanded primary content");
+        // Settle `prev` to the current grid so a plain re-render would diff to
+        // nothing — the resize must be what forces the repaint below.
+        let mut sink = MockTerminal::new();
+        render_once(&mut r, &mut sink).unwrap();
+
+        let resizer = RecResizer::default();
+        let mut term = MockTerminal::new();
+        handle_resize(&mut r, &resizer, &mut term, 120, 10);
+
+        // No absolute gutter clear on the primary screen — real history is safe.
+        assert!(
+            !term.calls.iter().any(|c| matches!(c, Call::ClearGutter(..))),
+            "primary resize must not clear_gutter (would erase history), calls = {:?}",
+            term.calls
+        );
+
+        // The band still repaints in full at the new margin: render once and assert
+        // the content row was re-emitted at the recomputed margin ((120-40)/2 = 40).
+        let mut term2 = MockTerminal::new();
+        render_once(&mut r, &mut term2).unwrap();
+        let painted_band = term2.calls.iter().any(|c| {
+            matches!(c, Call::WriteRow(b) if String::from_utf8_lossy(b).contains("banded"))
+        });
+        assert!(
+            painted_band,
+            "primary resize must force a full band repaint at the new geometry, \
+             calls = {:?}",
+            term2.calls
+        );
+        let repainted_at_margin = term2.calls.contains(&Call::MoveTo(40, 0));
+        assert!(
+            repainted_at_margin,
+            "the repainted band row must land at the recomputed margin 40, calls = {:?}",
+            term2.calls
         );
     }
 }
