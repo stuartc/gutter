@@ -32,6 +32,11 @@ fn gutter_cmd(child_argv: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gutter"));
     cmd.args(child_argv);
     cmd.env("TERM", "xterm-256color");
+    // A dumb test PTY can't answer the kitty probe, so the real
+    // `supports_keyboard_enhancement()` would stall ~2s before returning false.
+    // This suite is not about the keyboard; inject the known result to skip the
+    // stall (slice 04's injectable-capability seam).
+    cmd.env("GUTTER_FORCE_KITTY", "0");
     cmd
 }
 

@@ -13,13 +13,18 @@
 //! - Thread 4 (`waiter::run`)     — blocks on `child.wait()`, the authoritative
 //!   child-death signal (ADR-010).
 //!
-//! Slice 02 (virtual grid + offset repaint): the PTY is sized `W × real_rows`
+//! Virtual grid + offset repaint (slice 02): the PTY is sized `W × real_rows`
 //! so the child believes it owns a `W`-wide terminal; its output is parsed into
 //! a `W`-column vt100 grid on the render thread and repainted to the real
-//! terminal at a left-margin column offset (left-aligned, fixed `W`). Keyboard
-//! stays the slice-01 passthrough placeholder (real re-encoding is slice 04);
-//! OSC 52 (slice 06), mouse (slice 07), resize and proportional width (slice 05)
-//! land later, their modules declared by the slices that implement them.
+//! terminal at a left-margin column offset (left-aligned, fixed `W`).
+//!
+//! Keyboard re-encode + kitty negotiation (slice 04): gutter ALWAYS re-encodes
+//! each `KeyEvent` (crossterm gives no raw bytes) at the child's negotiated
+//! kitty level, tracking the child's `CSI > N u` push/pop stack via the shared
+//! callbacks struct and clamping it to the outer terminal's
+//! `supports_keyboard_enhancement()` capability (ADR-002/003). OSC 52 (slice 06),
+//! mouse (slice 07), resize and proportional width (slice 05) land later, their
+//! modules declared by the slices that implement them.
 
 mod callbacks;
 mod cli;
@@ -117,12 +122,36 @@ fn run() -> i32 {
     // Spawned but never joined; reaped by process::exit on teardown (ADR-010).
     thread::spawn(move || input::run(merged_tx));
 
-    // --- Outer terminal setup: raw mode then alt screen ---
+    // --- Outer terminal setup: raw mode, kitty probe, then alt screen ---
     let mut terminal = CrosstermTerminal::new();
     if let Err(e) = terminal.enable_raw_mode() {
         eprintln!("gutter: failed to enable raw mode: {e}");
         return 1;
     }
+
+    // Kitty keyboard capability (ADR-003): probe AFTER raw mode (the probe does a
+    // `CSI ? u` round-trip on the real terminal). If the outer terminal can
+    // source kitty, push the disambiguation flags so crossterm thereafter
+    // distinguishes Shift+Enter from Enter; pair the pop in teardown. The result
+    // is the clamp fed to the child's kitty state — when false, the child's
+    // `CSI > N u` enable is neutralised and Shift+Enter degrades predictably.
+    // The probe queries the real terminal; a test harness cannot make a dumb PTY
+    // answer the `CSI ? u` round-trip, so `GUTTER_FORCE_KITTY` overrides the
+    // result (`1` → forced true for case A, `0` → forced false for case B). This
+    // is the injectable seam the PRD's Testing Decisions call for — the
+    // `outer_supports` bool is a plain value the harness can set. Absent the env
+    // var, the real probe decides.
+    let outer_supports_kitty = match std::env::var("GUTTER_FORCE_KITTY").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => terminal.supports_keyboard_enhancement().unwrap_or(false),
+    };
+    if outer_supports_kitty {
+        if let Err(e) = terminal.push_keyboard_flags() {
+            eprintln!("gutter: failed to push keyboard enhancement flags: {e}");
+        }
+    }
+
     if let Err(e) = terminal.enter_alt_screen() {
         let _ = terminal.disable_raw_mode();
         eprintln!("gutter: failed to enter alt screen: {e}");
@@ -130,7 +159,7 @@ fn run() -> i32 {
     }
 
     // --- Thread 2: the render loop, on the main thread ---
-    let mut renderer = Renderer::new(width, rows, left_margin);
+    let mut renderer = Renderer::new(width, rows, left_margin, outer_supports_kitty);
     let mut clock = RealClock::new(merged_rx);
     let code = render::run(&mut clock, &mut renderer, &mut terminal, &mut pty_writer);
 

@@ -55,19 +55,24 @@ pub struct Renderer {
 
 impl Renderer {
     /// Build a renderer for a `width × rows` virtual grid at `left_margin`.
-    pub fn new(width: u16, rows: u16, left_margin: u16) -> Self {
+    ///
+    /// `outer_supports_kitty` is the startup `supports_keyboard_enhancement()`
+    /// probe — it clamps the child's kitty negotiation (ADR-003). The live
+    /// `parser` carries it; `prev` is a diff-baseline that only replays formatted
+    /// content and never tracks kitty, so its clamp is irrelevant (`false`).
+    pub fn new(width: u16, rows: u16, left_margin: u16, outer_supports_kitty: bool) -> Self {
         Self {
             parser: vt100::Parser::new_with_callbacks(
                 rows,
                 width,
                 0,
-                GutterCallbacks,
+                GutterCallbacks::new(outer_supports_kitty),
             ),
             prev: vt100::Parser::new_with_callbacks(
                 rows,
                 width,
                 0,
-                GutterCallbacks,
+                GutterCallbacks::new(false),
             ),
             width,
             left_margin,
@@ -98,7 +103,13 @@ fn dispatch<P: Write>(msg: Msg, renderer: &mut Renderer, pty_writer: &mut P) -> 
         }
         Msg::Input(event) => {
             if let crossterm::event::Event::Key(key) = event {
-                if let Some(bytes) = keyboard::encode(&key) {
+                // Re-encode at the child's CURRENT kitty level (ADR-002/003).
+                // The level lives on the parser's callbacks — read lock-free
+                // because the parser and the encoder both run on this thread.
+                let level: keyboard::KittyLevel =
+                    renderer.parser.callbacks().kitty_state.current();
+                let bytes = keyboard::encode_key(&key, level);
+                if !bytes.is_empty() {
                     let _ = pty_writer.write_all(&bytes);
                     let _ = pty_writer.flush();
                 }
@@ -232,7 +243,7 @@ impl Renderer {
         // cells from a shrunk region don't linger. `set_size` is cheap and
         // clears wrap flags; the formatted replay repaints the live content.
         let (rows, cols) = self.parser.screen().size();
-        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks);
+        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::new(false));
         self.prev.process(&formatted);
     }
 }
@@ -408,7 +419,7 @@ mod tests {
 
     fn run_with(script: Vec<(u64, Msg)>, width: u16, rows: u16) -> (usize, MockTerminal, Vec<u8>, Renderer, Option<i32>) {
         let mut clock = VirtualClock::new(script);
-        let mut renderer = Renderer::new(width, rows, 0);
+        let mut renderer = Renderer::new(width, rows, 0, false);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         let code = run(&mut clock, &mut renderer, &mut term, &mut pty);
@@ -447,7 +458,7 @@ mod tests {
 
         // Completeness: replay every PTY byte into a fresh parser; same grid.
         let mut reference: vt100::Parser<GutterCallbacks> =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks);
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(false));
         for p in &payloads {
             reference.process(p);
         }
@@ -491,7 +502,7 @@ mod tests {
     #[test]
     fn idle_park_zero_renders_zero_wakeups() {
         let mut clock = VirtualClock::new(vec![]);
-        let mut renderer = Renderer::new(80, 24, 0);
+        let mut renderer = Renderer::new(80, 24, 0, false);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
 
@@ -534,7 +545,7 @@ mod tests {
         // 16ms window — we assert the writer is non-empty immediately after the
         // run and that it landed before the burst's end is processed.
         let mut clock = VirtualClock::new(script);
-        let mut renderer = Renderer::new(80, 24, 0);
+        let mut renderer = Renderer::new(80, 24, 0, false);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         let code = run(&mut clock, &mut renderer, &mut term, &mut pty);
@@ -551,12 +562,48 @@ mod tests {
     /// Child-exit-restore (ADR-010): enqueue `Msg::ChildExited` with no input
     /// event; the restore side effects must fire in order, the loop must exit
     /// rather than park, and the exit code must match `status.exit_code()`.
+    ///
+    /// Non-kitty outer terminal (nothing pushed at startup): `PopKeyboardFlags`
+    /// must NOT fire — we only pop what we pushed (ADR-003).
     #[test]
-    fn child_exit_restores_in_order_and_returns_code() {
+    fn child_exit_restores_in_order_no_kitty_pop_when_not_pushed() {
         let script = vec![(0u64, Msg::ChildExited(ExitStatus::with_exit_code(42)))];
         let (_flushes, term, _pty, _r, code) = run_with(script, 80, 24);
 
         assert_eq!(code, Some(42), "exit code must equal status.exit_code()");
+        assert_eq!(
+            term.restore_calls(),
+            vec![
+                Call::LeaveAltScreen,
+                Call::DisableMouse,
+                Call::ShowCursor,
+                Call::DisableRawMode,
+            ],
+            "restore order with NO kitty pop (nothing was pushed)"
+        );
+    }
+
+    /// Child-exit-restore with a kitty-capable outer terminal: the startup push
+    /// (modelled here by pushing flags on the mock before `run`) must be paired
+    /// with a `PopKeyboardFlags` in the correct restore slot — after
+    /// leave-alt-screen, before disable-raw-mode (ADR-010/003).
+    #[test]
+    fn child_exit_pops_kitty_flags_when_pushed_at_startup() {
+        use crate::terminal::OuterTerminal;
+        let mut clock = VirtualClock::new(vec![(
+            0u64,
+            Msg::ChildExited(ExitStatus::with_exit_code(0)),
+        )]);
+        let mut renderer = Renderer::new(80, 24, 0, true);
+        let mut term = MockTerminal::kitty_capable();
+        // Simulate the startup probe + push that main.rs performs.
+        assert!(term.supports_keyboard_enhancement().unwrap());
+        term.push_keyboard_flags().unwrap();
+        let mut pty: Vec<u8> = Vec::new();
+
+        let code = run(&mut clock, &mut renderer, &mut term, &mut pty);
+
+        assert_eq!(code, Some(0));
         assert_eq!(
             term.restore_calls(),
             vec![
@@ -566,7 +613,77 @@ mod tests {
                 Call::ShowCursor,
                 Call::DisableRawMode,
             ],
-            "restore must fire in the ADR-010 order"
+            "kitty flags pushed at startup must be popped in the ADR-010 slot"
+        );
+    }
+
+    /// End-to-end through the render loop's dispatch arm: once the child has
+    /// enabled kitty on its output (`CSI > 1 u` arrives as a `Msg::Pty`), a
+    /// subsequent Enter and Shift+Enter re-encode at the negotiated level and
+    /// reach the PTY writer as the DISTINCT kitty `CSI 13 u` / `CSI 13 ; 2 u`
+    /// byte sequences. This is the case-A contract proven through the real
+    /// dispatch path (not just the pure encoder), with a kitty-capable outer.
+    #[test]
+    fn dispatch_reencodes_at_child_kitty_level() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let script = vec![
+            // Child enables kitty on its output.
+            (0u64, Msg::Pty(b"\x1b[>1u".to_vec())),
+            // Then the user presses Enter, then Shift+Enter.
+            (
+                1,
+                Msg::Input(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))),
+            ),
+            (
+                1,
+                Msg::Input(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))),
+            ),
+            (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ];
+        let mut clock = VirtualClock::new(script);
+        // Kitty-capable outer: the child's enable is honoured (not clamped).
+        let mut renderer = Renderer::new(80, 24, 0, true);
+        let mut term = MockTerminal::kitty_capable();
+        let mut pty: Vec<u8> = Vec::new();
+        run(&mut clock, &mut renderer, &mut term, &mut pty);
+
+        assert_eq!(
+            pty, b"\x1b[13u\x1b[13;2u",
+            "Enter → CSI 13 u, Shift+Enter → CSI 13 ; 2 u, distinct"
+        );
+    }
+
+    /// Case B through the dispatch path: with the outer terminal unable to source
+    /// kitty (`outer_supports_kitty = false`), the child's `CSI > 1 u` enable is
+    /// clamped to a no-op, so Enter and Shift+Enter both degrade to the SAME
+    /// legacy byte (`\r`). The tested degradation contract.
+    #[test]
+    fn dispatch_clamps_to_legacy_when_outer_unsupported() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let script = vec![
+            (0u64, Msg::Pty(b"\x1b[>1u".to_vec())),
+            (
+                1,
+                Msg::Input(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))),
+            ),
+            (
+                1,
+                Msg::Input(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))),
+            ),
+            (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ];
+        let mut clock = VirtualClock::new(script);
+        // Non-kitty outer: the child's enable is neutralised.
+        let mut renderer = Renderer::new(80, 24, 0, false);
+        let mut term = MockTerminal::new();
+        let mut pty: Vec<u8> = Vec::new();
+        run(&mut clock, &mut renderer, &mut term, &mut pty);
+
+        assert_eq!(
+            pty, b"\r\r",
+            "both Enters degrade to the same legacy byte under the clamp"
         );
     }
 
@@ -607,7 +724,7 @@ mod tests {
             (0u64, Msg::Pty(b"hi".to_vec())),
             (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ]);
-        let mut renderer = Renderer::new(20, 5, 7); // margin 7
+        let mut renderer = Renderer::new(20, 5, 7, false); // margin 7
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         run(&mut clock, &mut renderer, &mut term, &mut pty);
@@ -666,7 +783,7 @@ line two\r\n\
             (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ];
         let mut clock = VirtualClock::new(script);
-        let mut renderer = Renderer::new(width, 5, 0);
+        let mut renderer = Renderer::new(width, 5, 0, false);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         run(&mut clock, &mut renderer, &mut term, &mut pty);
@@ -734,7 +851,7 @@ mod cjk {
         margin: u16,
         phys_cols: u16,
     ) -> (Renderer, RecordingGrid) {
-        let mut renderer = Renderer::new(width, rows, margin);
+        let mut renderer = Renderer::new(width, rows, margin, false);
         renderer.parser.process(bytes);
         let mut grid = RecordingGrid::new(phys_cols, rows);
         render_once(&mut renderer, &mut grid).unwrap();
@@ -749,7 +866,7 @@ mod cjk {
         margin: u16,
         phys_cols: u16,
     ) -> (Renderer, RecordingGrid) {
-        let mut renderer = Renderer::new(width, rows, margin);
+        let mut renderer = Renderer::new(width, rows, margin, false);
         renderer.parser.process(bytes);
         let mut grid = RecordingGrid::new(phys_cols, rows);
         render_cell_walk(renderer.parser.screen(), margin, width, &mut grid).unwrap();
@@ -939,7 +1056,7 @@ mod cjk {
     fn case4_fallback_emits_no_move_for_continuation() {
         use crate::terminal::mock::{Call, MockTerminal};
         let (w, rows, margin) = (8u16, 4u16, 6u16);
-        let mut renderer = Renderer::new(w, rows, margin);
+        let mut renderer = Renderer::new(w, rows, margin, false);
         renderer
             .parser
             .process(format!("\x1b[1;1H{HAN}\u{4e8c}").as_bytes());
@@ -1022,7 +1139,7 @@ mod cjk {
     #[test]
     fn wide_glyph_does_not_drift_band_width() {
         let (w, rows) = (10u16, 4u16);
-        let mut renderer = Renderer::new(w, rows, 0);
+        let mut renderer = Renderer::new(w, rows, 0, false);
         renderer
             .parser
             .process(format!("\x1b[1;{w}H{HAN}").as_bytes());

@@ -24,8 +24,13 @@ fn gutter_bin() -> String {
 /// `sh -c 'stty cols C rows R; exec gutter <args>'`. `stty` sets gutter's own
 /// controlling-terminal size BEFORE it reads it at startup — no resize race.
 fn gutter_in_terminal(outer_cols: u16, outer_rows: u16, gutter_args: &str) -> std::process::Command {
+    // `GUTTER_FORCE_KITTY=0`: this suite is not about the keyboard, and a dumb
+    // test PTY cannot answer the `supports_keyboard_enhancement()` query — the
+    // real probe would stall ~2s on its timeout and then return false anyway.
+    // Injecting the known result skips the stall without changing behaviour
+    // (slice 04's injectable-capability seam).
     let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec {} {gutter_args}",
+        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 {} {gutter_args}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");

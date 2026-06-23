@@ -29,6 +29,20 @@ pub trait OuterTerminal {
     // --- Setup ---
     /// Enter raw mode. Setup; first thing after the PTY is up.
     fn enable_raw_mode(&mut self) -> io::Result<()>;
+    /// Probe whether the outer terminal supports the kitty keyboard protocol —
+    /// the inbound `CSI ? u` grant `vt100` cannot observe (ADR-003). Called once
+    /// at startup, after raw mode, before spawning the child. Wraps crossterm's
+    /// `supports_keyboard_enhancement()`. The returned bool is the
+    /// `outer_supports` clamp fed to the child's kitty state and the encoder.
+    fn supports_keyboard_enhancement(&mut self) -> io::Result<bool>;
+    /// Push the kitty enhancement flags (`DISAMBIGUATE_ESCAPE_CODES |
+    /// REPORT_EVENT_TYPES`) onto the outer terminal so crossterm thereafter
+    /// delivers `KeyEvent`s that distinguish Shift+Enter from Enter (ADR-003).
+    /// Called at startup **only when** the probe returned `true`; paired with
+    /// [`pop_keyboard_flags`] in teardown.
+    ///
+    /// [`pop_keyboard_flags`]: OuterTerminal::pop_keyboard_flags
+    fn push_keyboard_flags(&mut self) -> io::Result<()>;
     /// Enter the alternate screen. Setup; after raw mode.
     fn enter_alt_screen(&mut self) -> io::Result<()>;
 
@@ -65,11 +79,17 @@ pub trait OuterTerminal {
 /// The real outer terminal, backed by crossterm against stdout.
 pub struct CrosstermTerminal {
     out: io::Stdout,
+    /// Whether kitty enhancement flags were pushed at startup — so teardown only
+    /// pops what it actually set (ADR-003: don't pop flags you never pushed).
+    kitty_pushed: bool,
 }
 
 impl CrosstermTerminal {
     pub fn new() -> Self {
-        Self { out: io::stdout() }
+        Self {
+            out: io::stdout(),
+            kitty_pushed: false,
+        }
     }
 }
 
@@ -82,6 +102,25 @@ impl Default for CrosstermTerminal {
 impl OuterTerminal for CrosstermTerminal {
     fn enable_raw_mode(&mut self) -> io::Result<()> {
         crossterm::terminal::enable_raw_mode()
+    }
+
+    fn supports_keyboard_enhancement(&mut self) -> io::Result<bool> {
+        crossterm::terminal::supports_keyboard_enhancement()
+    }
+
+    fn push_keyboard_flags(&mut self) -> io::Result<()> {
+        use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+        use crossterm::queue;
+        queue!(
+            self.out,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
+        )?;
+        self.out.flush()?;
+        self.kitty_pushed = true;
+        Ok(())
     }
 
     fn enter_alt_screen(&mut self) -> io::Result<()> {
@@ -127,8 +166,15 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn pop_keyboard_flags(&mut self) -> io::Result<()> {
-        // No-op in slice 02 — nothing was pushed. Slice 04 pops the kitty
-        // enhancement flags here.
+        // Only pop what was actually pushed (ADR-003) — popping flags we never
+        // set would corrupt an unrelated terminal state.
+        if self.kitty_pushed {
+            use crossterm::event::PopKeyboardEnhancementFlags;
+            use crossterm::queue;
+            queue!(self.out, PopKeyboardEnhancementFlags)?;
+            self.out.flush()?;
+            self.kitty_pushed = false;
+        }
         Ok(())
     }
 
@@ -163,6 +209,8 @@ pub mod mock {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Call {
         EnableRawMode,
+        SupportsKeyboardEnhancement,
+        PushKeyboardFlags,
         EnterAltScreen,
         MoveTo(u16, u16),
         WriteRow(Vec<u8>),
@@ -180,11 +228,27 @@ pub mod mock {
     #[derive(Default)]
     pub struct MockTerminal {
         pub calls: Vec<Call>,
+        /// What the kitty-capability probe should report. Lets the teardown test
+        /// drive both the kitty-capable (push then pop) and non-kitty (neither)
+        /// paths without a real terminal.
+        pub supports_kitty: bool,
+        /// Whether [`OuterTerminal::push_keyboard_flags`] was actually called —
+        /// so the mock's `pop` only records a [`Call::PopKeyboardFlags`] when
+        /// flags were pushed, mirroring the real "pop only what you pushed" rule.
+        kitty_pushed: bool,
     }
 
     impl MockTerminal {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// A mock that reports the outer terminal as kitty-capable.
+        pub fn kitty_capable() -> Self {
+            Self {
+                supports_kitty: true,
+                ..Self::default()
+            }
         }
 
         /// The restore subsequence only, for the ADR-010 order assertion —
@@ -249,6 +313,12 @@ pub mod mock {
         fn enable_raw_mode(&mut self) -> io::Result<()> {
             Ok(())
         }
+        fn supports_keyboard_enhancement(&mut self) -> io::Result<bool> {
+            Ok(false)
+        }
+        fn push_keyboard_flags(&mut self) -> io::Result<()> {
+            Ok(())
+        }
         fn enter_alt_screen(&mut self) -> io::Result<()> {
             Ok(())
         }
@@ -297,6 +367,15 @@ pub mod mock {
             self.calls.push(Call::EnableRawMode);
             Ok(())
         }
+        fn supports_keyboard_enhancement(&mut self) -> io::Result<bool> {
+            self.calls.push(Call::SupportsKeyboardEnhancement);
+            Ok(self.supports_kitty)
+        }
+        fn push_keyboard_flags(&mut self) -> io::Result<()> {
+            self.calls.push(Call::PushKeyboardFlags);
+            self.kitty_pushed = true;
+            Ok(())
+        }
         fn enter_alt_screen(&mut self) -> io::Result<()> {
             self.calls.push(Call::EnterAltScreen);
             Ok(())
@@ -326,7 +405,11 @@ pub mod mock {
             Ok(())
         }
         fn pop_keyboard_flags(&mut self) -> io::Result<()> {
-            self.calls.push(Call::PopKeyboardFlags);
+            // Mirror the real impl: only pop what was actually pushed.
+            if self.kitty_pushed {
+                self.calls.push(Call::PopKeyboardFlags);
+                self.kitty_pushed = false;
+            }
             Ok(())
         }
         fn disable_mouse(&mut self) -> io::Result<()> {
