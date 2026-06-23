@@ -565,11 +565,30 @@ fn emit_scroll_stream<T: OuterTerminal>(
 /// column — we never advance the physical cursor twice for one glyph, and we
 /// never paint the lead glyph's right half into `left_margin + W`.
 ///
-/// No production call site wires the fallback yet — slice 02 stood up the
-/// primary `rows_diff` path and did not build the absolute-column branch
-/// chooser, and this slice (per ADR-006) finishes *what the fallback does*, not
-/// *when it fires*. The branch chooser lands with the path that needs it; this
-/// function is exercised by the cell-walking edge-of-band tests now.
+/// **Dormant by decision (A1, iteration-02).** gutter renders via the primary
+/// `rows_diff` path *only*; right-edge safety rests on vt100's margin rule, not
+/// on this walk (ADR-006: `text()` wraps a wide glyph rather than placing its
+/// lead at `W-1`, so nothing ever paints past `margin + W`). This function is
+/// tested-but-dormant insurance against a corrupting cell the design believes
+/// cannot occur on the live path — so it has no production caller, and no branch
+/// chooser is wired (no `if`/`match` at the `render_once` call site, no config
+/// toggle, no per-frame heuristic). The reason it stays dormant rather than live
+/// is that there is **no runtime signal** to feed a chooser: `rows_diff` returns
+/// relative byte runs and never flags an unsafe frame, the `Renderer` carries no
+/// such flag, and vt100 exposes no "`rows_diff` is unsafe here" predicate. A
+/// chooser today would have no honest input.
+///
+/// What would make it live: a corrupting cell actually observed on the live
+/// `rows_diff` path — most plausibly surfaced by the A2 wide-edge equivalence
+/// fixture (slice 06), the CJK/emoji-at-band-edge `.cast` designed to put real
+/// pressure on vt100's margin rule. If that fixture ever produces a corrupting
+/// cell, A1 reopens with a concrete reason and a known trigger, and only the
+/// chooser/refactor remains: wiring it live would mean factoring the
+/// cursor-mirroring/baseline-sync tail out of `render_once` to share it (this
+/// function takes `(screen, left_margin, width, term)` directly and neither
+/// mirrors the cursor nor updates the diff baseline) and inventing the decision
+/// input that does not exist today. Until then, the fallback is kept correct and
+/// ready, exercised by the cell-walking edge-of-band tests.
 #[allow(dead_code)]
 fn render_cell_walk<T: OuterTerminal>(
     screen: &vt100::Screen,
