@@ -18,7 +18,13 @@ target/
 
 # Editor / OS noise
 .DS_Store
-*.swp
+# Vim/Neovim swap, undo and session files (incl. the bare, filename-less ones)
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+[._]s[a-v][a-z]
+[._]sw[a-p]
+[._]*.un~
+Session.vim
 
 # Machine-local symlink to the planning docs, not part of the code
 .context/
