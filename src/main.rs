@@ -136,10 +136,6 @@ fn run() -> i32 {
         thread::spawn(move || waiter::run(child, merged_tx));
     }
 
-    // --- Thread 3: input reader — DETACHED (un-interruptible read()) ---
-    // Spawned but never joined; reaped by process::exit on teardown (ADR-010).
-    thread::spawn(move || input::run(merged_tx));
-
     // --- Outer terminal setup: raw mode, kitty probe, eager mouse capture ---
     // No forced alt screen (ADR-012): the render thread mirrors the child's mode.
     let mut terminal = CrosstermTerminal::new();
@@ -170,6 +166,19 @@ fn run() -> i32 {
             eprintln!("gutter: failed to push keyboard enhancement flags: {e}");
         }
     }
+
+    // --- Thread 3: input reader — DETACHED (un-interruptible read()) ---
+    // Spawned but never joined; reaped by process::exit on teardown (ADR-010).
+    //
+    // ORDERING (load-bearing): this spawn MUST stay after the kitty probe above.
+    // Thread 3 drains crossterm's event source, and the probe's `CSI ? u` reply
+    // returns through that same source — a Thread 3 started first would consume
+    // the reply, forcing the probe to its full ~2 s timeout and a permanent
+    // `false` (kitty silently clamped off even on capable terminals). The span
+    // from `enable_raw_mode()` down to this spawn is the exclusive
+    // pre-input-thread window: the only place an outer round-trip query can read
+    // its own reply uncontended.
+    thread::spawn(move || input::run(merged_tx));
 
     // Eager outer mouse capture (ADR-005): enable ONCE here, before the alt
     // screen, so the outer terminal is already in SGR-any-motion reporting at the
