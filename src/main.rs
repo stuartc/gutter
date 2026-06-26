@@ -168,6 +168,27 @@ fn run() -> i32 {
         }
     }
 
+    // Capture the launch cursor row (ADR-013, the inline anchor) in the SAME
+    // exclusive pre-input-thread window the kitty probe just used (slice 08). The
+    // input thread, once spawned, owns crossterm's event source and would consume
+    // the `ESC[6n` CPR reply, so the query must run while nothing else is draining
+    // the terminal — the mirror operation of the kitty probe, sharing one window.
+    // The row anchors grid row 0 so a plain command grows downward from where
+    // gutter was launched instead of overpainting the scrollback above it.
+    // `GUTTER_FORCE_ANCHOR_ROW` mirrors `GUTTER_FORCE_KITTY`: a test harness's
+    // kernel PTY never answers CPR, so the tests inject the launch row directly.
+    // When the query fails — a non-tty (`Err` returns at once) or the rare tty that
+    // ignores the CPR request — fall back to the bottom line (`real_rows - 1`), the
+    // overwhelmingly common launch point; falling back to 0 would reproduce the
+    // overpaint this anchor exists to prevent. `position()` has no timeout: a real
+    // tty that answers CPR (effectively all of them) returns its reply here.
+    let anchor_row = match std::env::var("GUTTER_FORCE_ANCHOR_ROW").ok() {
+        Some(v) => v.parse::<u16>().unwrap_or(rows.saturating_sub(1)),
+        None => crossterm::cursor::position()
+            .map(|(_col, row)| row)
+            .unwrap_or(rows.saturating_sub(1)),
+    };
+
     // --- Thread 3: input reader — DETACHED (un-interruptible read()) ---
     // Spawned but never joined; reaped by process::exit on teardown (ADR-010).
     //
@@ -219,6 +240,7 @@ fn run() -> i32 {
         width_config,
         outer_supports_kitty,
         clipboard_out,
+        anchor_row,
     );
     let mut clock = RealClock::new(merged_rx);
     let code = render::run(

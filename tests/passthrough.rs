@@ -41,6 +41,7 @@ fn gutter_cmd(child_argv: &[&str]) -> Command {
     // This suite is not about the keyboard; inject the known result to skip the
     // stall (slice 04's injectable-capability seam).
     cmd.env("GUTTER_FORCE_KITTY", "0");
+    cmd.env("GUTTER_FORCE_ANCHOR_ROW", "0");
     cmd
 }
 

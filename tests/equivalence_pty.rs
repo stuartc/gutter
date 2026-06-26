@@ -57,7 +57,7 @@ fn gutter_replaying_fixture(
     // stays painted for the capture window.
     let child = format!("/bin/sh -c 'cat {fixture}; sleep 4'");
     let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 {} {gutter_flags} {child}",
+        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_flags} {child}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -77,7 +77,7 @@ fn gutter_replaying_then_exit(
 ) -> OsSession {
     let child = format!("/bin/sh -c 'cat {fixture}; exit 0'");
     let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 {} {gutter_flags} {child}",
+        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_flags} {child}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -147,7 +147,7 @@ fn reverse_video_statusline_highlight_stops_at_band_edge() {
     let child =
         "/bin/sh -c 'printf \"\\033[?1049h\\033[?25l\\033[1;1H\\033[7m\\033[K\"; sleep 4'";
     let script = format!(
-        "stty cols 80 rows 24; exec env GUTTER_FORCE_KITTY=0 {} --width 60 --center {child}",
+        "stty cols 80 rows 24; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} --width 60 --center {child}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -346,7 +346,7 @@ fn child_exit_mid_alt_screen_restores_and_propagates_code() {
     // failure mode the ADR-010 restore must prevent.
     let child = "/bin/sh -c 'printf \"\\033[?1049h\\033[?25l\\033[1;1Hclaude\"; exit 7'";
     let script = format!(
-        "stty cols 100 rows 30; exec env GUTTER_FORCE_KITTY=0 {} --width 70 --center {child}",
+        "stty cols 100 rows 30; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} --width 70 --center {child}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -384,7 +384,7 @@ fn child_sees_band_width_while_replaying_fixture() {
         fixture_path()
     );
     let script = format!(
-        "stty cols 120 rows 30; exec env GUTTER_FORCE_KITTY=0 {} --width 80 --left {child}",
+        "stty cols 120 rows 30; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} --width 80 --left {child}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -400,6 +400,228 @@ fn child_sees_band_width_while_replaying_fixture() {
         "the child must see the band width W=80 while the fixture replays"
     );
     drop(session);
+}
+
+/// **Inline anchor no-top-overlap (slice 10 / ADR-013 — the gate for this slice).**
+/// Seed ten history lines on the real terminal, then launch gutter with the band
+/// anchored at row 10 (`GUTTER_FORCE_ANCHOR_ROW` — the kernel PTY can't answer the
+/// CPR query). A child prints three band lines and idles. The history above the
+/// anchor must survive untouched and the band must paint at physical rows `>= 10` —
+/// never over row 0, the absolute-paint overpaint this slice exists to fix. This is
+/// the test most likely to fail first if the offset paint regresses to absolute rows.
+#[test]
+fn inline_anchor_does_not_overpaint_history_above() {
+    let child = "/bin/sh -c 'printf \"BAND-A\\nBAND-B\\nBAND-C\"; sleep 4'";
+    let seed = "i=1; while [ $i -le 10 ]; do printf 'HIST-%02d\\n' \"$i\"; i=$((i+1)); done;";
+    let script = format!(
+        "stty cols 80 rows 24; {seed} exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=10 {} --width 60 --left {child}",
+        gutter_bin()
+    );
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c").arg(script);
+    let mut session = OsSession::spawn(cmd).expect("spawn gutter under PTY");
+
+    let bytes = drain_window(&mut session, Duration::from_millis(900));
+    assert!(!bytes.is_empty(), "gutter must paint the band frame");
+
+    let parser = outer_grid(&bytes, 80, 24);
+    let screen = parser.screen();
+    let rows_text: Vec<String> = screen.rows(0, 80).map(|r| r.trim_end().to_string()).collect();
+
+    // The history above the anchor survives — HIST-01 is still at the very top.
+    assert!(
+        rows_text[0].contains("HIST-01"),
+        "history line 1 must survive at row 0, got {:?}",
+        rows_text[0]
+    );
+    // Row 0 was NOT overpainted by the band — the bug this slice fixes.
+    assert!(
+        !rows_text[0].contains("BAND"),
+        "the band must not overpaint the top of the screen, row 0 = {:?}",
+        rows_text[0]
+    );
+    // The band paints at or below the launch anchor (row 10), never above it.
+    let band_row = rows_text
+        .iter()
+        .position(|r| r.contains("BAND-A"))
+        .expect("the band's first line must be painted somewhere");
+    assert!(
+        band_row >= 10,
+        "the band must paint at or below the launch row 10, found BAND-A at row {band_row}"
+    );
+
+    drop(session);
+}
+
+/// **Inline clean hand-back, zero and non-zero (slice 10 / ADR-013).** A plain child
+/// prints three lines from a mid-screen anchor (row 3) and exits. The lines survive
+/// on the primary screen, the final cursor lands on a **fresh line below** the band
+/// (a following prompt would not overlap it), and the dim status line is present
+/// **only** on the non-zero exit.
+#[test]
+fn inline_clean_hand_back_below_band() {
+    for (exit_code, expect_status) in [(0i32, false), (5i32, true)] {
+        let child = format!("/bin/sh -c \"printf 'HB-1\\nHB-2\\nHB-3'; exit {exit_code}\"");
+        let script = format!(
+            "stty cols 80 rows 24; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=3 {} --width 60 --left {child}",
+            gutter_bin()
+        );
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        let mut session = OsSession::spawn(cmd).expect("spawn gutter under PTY");
+
+        let bytes = drain_window(&mut session, Duration::from_secs(3));
+        let s = String::from_utf8_lossy(&bytes);
+
+        let mut parser = vt100::Parser::new(24, 80, 100);
+        parser.process(&bytes);
+        let screen = parser.screen();
+        let rows_text: Vec<String> = screen.rows(0, 80).map(|r| r.trim_end().to_string()).collect();
+
+        for tag in ["HB-1", "HB-2", "HB-3"] {
+            assert!(
+                rows_text.iter().any(|r| r.contains(tag)),
+                "{tag} must survive on the primary screen (exit {exit_code}), rows = {rows_text:?}"
+            );
+        }
+
+        // The band sits at rows 3..5 (anchor 3); the final cursor lands below it.
+        let band_bottom = rows_text
+            .iter()
+            .rposition(|r| r.contains("HB-3"))
+            .expect("the last band line must be present");
+        let (crow, _ccol) = screen.cursor_position();
+        assert!(
+            crow as usize > band_bottom,
+            "the final cursor must land on a fresh line below the band (cursor row {crow} > band bottom {band_bottom}), exit {exit_code}"
+        );
+
+        // The dim status line rides only the non-zero exit.
+        assert_eq!(
+            s.contains("Exited with:"),
+            expect_status,
+            "status line presence must match the exit code {exit_code}, got {s:?}"
+        );
+
+        assert_eq!(
+            wait_status(session),
+            Some(exit_code),
+            "gutter must propagate the exit code {exit_code}"
+        );
+    }
+}
+
+/// **Inline mid-screen scroll-through preserves history (slice 10 / ADR-013).** Seed
+/// twelve history lines, anchor the band mid-screen (row 12), and have the child
+/// print well past a screenful so the band fills, `base_row` reaches 0, and slice
+/// 04's scroll-emit engine takes over. The seeded history above the band must
+/// survive into the **real terminal's own scrollback** through the `base_row → 0`
+/// transition, and the band's own early lines must reach scrollback too.
+#[test]
+fn inline_mid_screen_scroll_through_preserves_history() {
+    let child = "/bin/sh -c 'i=0; while [ $i -lt 40 ]; do printf \"FLOW-%02d\\n\" \"$i\"; i=$((i+1)); done; sleep 1'";
+    let seed = "i=1; while [ $i -le 12 ]; do printf 'OLD-%02d\\n' \"$i\"; i=$((i+1)); done;";
+    let script = format!(
+        "stty cols 80 rows 24; {seed} exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=12 {} --width 60 --left {child}",
+        gutter_bin()
+    );
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c").arg(script);
+    let mut session = OsSession::spawn(cmd).expect("spawn gutter under PTY");
+
+    let bytes = drain_window(&mut session, Duration::from_secs(3));
+
+    // Parse with a generous scrollback store — modelling the real terminal's history.
+    let mut parser = vt100::Parser::new(24, 80, 2000);
+    parser.process(&bytes);
+
+    let recovered = |parser: &mut vt100::Parser, tag: &str| -> bool {
+        for offset in 0..=300 {
+            parser.screen_mut().set_scrollback(offset);
+            let text: String = parser.screen().rows(0, 80).collect::<Vec<_>>().join("\n");
+            if text.contains(tag) {
+                parser.screen_mut().set_scrollback(0);
+                return true;
+            }
+        }
+        parser.screen_mut().set_scrollback(0);
+        false
+    };
+
+    assert!(
+        recovered(&mut parser, "OLD-01"),
+        "seeded history must survive into the terminal's scrollback through base_row -> 0"
+    );
+    assert!(
+        recovered(&mut parser, "FLOW-00"),
+        "the band's early lines must reach scrollback once the engine takes over"
+    );
+
+    drop(session);
+}
+
+/// **Inline alt excursion preserves the anchor (bash->vim->bash, slice 10 / ADR-013).**
+/// A child prints two inline lines, enters the alt screen and paints a frame, leaves
+/// the alt screen, prints two more inline lines, then exits — the bash->vim->bash
+/// shape. gutter must toggle the outer alt screen exactly once each way, restore the
+/// pre-alt band at its anchor, append the post-alt lines **below** it (the anchor
+/// preserved across the excursion), and hand back cleanly on the zero exit.
+#[test]
+fn inline_alt_excursion_preserves_anchor() {
+    let child = "/bin/sh -c \"printf 'PRE-1\\nPRE-2\\n'; sleep 0.3; printf '\\033[?1049h\\033[1;1HALT-FRAME'; sleep 0.3; printf '\\033[?1049l'; sleep 0.1; printf 'POST-1\\nPOST-2'; exit 0\"";
+    let script = format!(
+        "stty cols 80 rows 24; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=5 {} --width 60 --left {child}",
+        gutter_bin()
+    );
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c").arg(script);
+    let mut session = OsSession::spawn(cmd).expect("spawn gutter under PTY");
+
+    let bytes = drain_window(&mut session, Duration::from_secs(3));
+    let s = String::from_utf8_lossy(&bytes);
+
+    // Exactly one outer alt-enter and one outer alt-leave (gutter's own toggles,
+    // never the child's — gutter parses those into its grid, it does not echo them).
+    assert_eq!(
+        s.matches("\u{1b}[?1049h").count(),
+        1,
+        "exactly one outer alt-enter, got {s:?}"
+    );
+    assert_eq!(
+        s.matches("\u{1b}[?1049l").count() + s.matches("\u{1b}[?47l").count(),
+        1,
+        "exactly one outer alt-leave, got {s:?}"
+    );
+
+    // Replay the full stream (it carries gutter's own alt enter/leave): the final
+    // primary screen has the pre-alt band restored and the post-alt lines below it.
+    let mut parser = vt100::Parser::new(24, 80, 100);
+    parser.process(&bytes);
+    let screen = parser.screen();
+    let rows_text: Vec<String> = screen.rows(0, 80).map(|r| r.trim_end().to_string()).collect();
+
+    let pre_row = rows_text
+        .iter()
+        .position(|r| r.contains("PRE-1"))
+        .expect("the pre-alt band must be restored after the excursion");
+    let post_row = rows_text
+        .iter()
+        .position(|r| r.contains("POST-1"))
+        .expect("the post-alt lines must be present");
+    assert!(
+        post_row > pre_row,
+        "post-alt lines must sit below the pre-alt band (anchor preserved), pre = {pre_row}, post = {post_row}"
+    );
+    assert_eq!(
+        pre_row, 5,
+        "the pre-alt band stays anchored at the launch row 5 across the alt excursion"
+    );
+
+    assert_eq!(
+        wait_status(session),
+        Some(0),
+        "the inline hand-back propagates the zero exit"
+    );
 }
 
 /// Block on the wrapped process and return its exit code, if any.

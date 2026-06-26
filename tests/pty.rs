@@ -49,7 +49,7 @@ fn gutter_in_terminal(
     // returning false. This suite is not about the keyboard; inject the known
     // result to skip the stall (slice 04's injectable-capability seam).
     let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 {} {gutter_args}",
+        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -551,12 +551,16 @@ fn scroll_off_burst_reaches_scrollback_without_pacing() {
     assert_eq!(wait_status(session), Some(0), "gutter propagates the zero exit");
 }
 
-/// **Non-zero exit shows the dim `Exited with: N` status line (slice 02/03).** A
-/// plain child that exits non-zero: gutter mirrors the child's mode (ADR-012), so
-/// it never forces the alt screen — the band is painted onto the **primary**
-/// screen and the Option C replay emits the dim `\r\n\x1b[2mExited with: N\x1b[0m`
-/// there on exit. Asserted on the raw teardown bytes: the status line is present
-/// AND gutter never emits `?1049h`/`?1049l` for this plain command.
+/// **Non-zero exit shows the dim `Exited with: N` status line (slice 02/03,
+/// reworked as the inline hand-back in slice 10/ADR-013).** A plain child that exits
+/// non-zero with **no** inline output: gutter mirrors the child's mode (ADR-012), so
+/// it never forces the alt screen, and the teardown hand-back still emits the dim
+/// `\r\n\x1b[2mExited with: N\x1b[0m` at the anchor row on exit. This pins the
+/// slice-02 contract that a failure surfaces its status even when the child printed
+/// nothing (`gutter false`): the `ever_painted_inline` gate that silences alt-only
+/// TUIs (`gutter vim`, exit 0) must NOT also swallow a no-output failure. Asserted on
+/// the raw teardown bytes: the status line is present AND gutter never emits
+/// `?1049h`/`?1049l` for this plain command.
 #[test]
 fn non_zero_exit_shows_dim_status_line() {
     let child = "/bin/sh -c 'exit 3'";

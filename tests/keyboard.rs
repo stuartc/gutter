@@ -42,7 +42,7 @@ fn gutter_in_terminal(
         None => "",
     };
     let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env {force}{} {gutter_args}",
+        "stty cols {outer_cols} rows {outer_rows}; exec env {force}GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");

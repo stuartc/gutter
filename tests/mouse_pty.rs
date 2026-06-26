@@ -40,7 +40,7 @@ fn gutter_bin() -> String {
 /// can't answer the kitty `CSI ? u` probe.
 fn gutter_in_terminal(outer_cols: u16, outer_rows: u16, gutter_args: &str) -> std::process::Command {
     let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 {} {gutter_args}",
+        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
