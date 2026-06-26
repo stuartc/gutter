@@ -65,8 +65,18 @@ fn parse_param(field: &[u8], default: u16) -> u16 {
 /// Returns the run unchanged when it carries no `ESC[K`. The column tracker
 /// honours the full row vocabulary (literals, `MoveRight`, `Backspace`, absolute
 /// `CUP`/`CHA`) so the fill length is correct even after a backward cursor jump.
+#[cfg(test)]
 pub fn clip_row_to_width(run: &[u8], w: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(run.len());
+    clip_row_to_width_into(run, w, &mut out);
+    out
+}
+
+/// As [`clip_row_to_width`], but **append** the clipped run to a caller-owned
+/// buffer instead of allocating a fresh `Vec`. The paint hot path seeds `out` with
+/// the per-row `ESC[m` reset and clips straight into it, so a painted row is built
+/// in one allocation rather than two.
+pub fn clip_row_to_width_into(run: &[u8], w: u16, out: &mut Vec<u8>) {
     let mut col: u16 = 0;
     let mut i = 0;
 
@@ -174,8 +184,6 @@ pub fn clip_row_to_width(run: &[u8], w: u16) -> Vec<u8> {
         out.extend_from_slice(bytes);
         i = end;
     }
-
-    out
 }
 
 /// The byte length of a UTF-8 sequence from its lead byte (1 for ASCII / a stray

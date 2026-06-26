@@ -552,18 +552,17 @@ fn scroll_off_burst_reaches_scrollback_without_pacing() {
 }
 
 /// **Non-zero exit shows the dim `Exited with: N` status line (slice 02/03,
-/// reworked as the inline hand-back in slice 10/ADR-013).** A plain child that exits
-/// non-zero with **no** inline output: gutter mirrors the child's mode (ADR-012), so
-/// it never forces the alt screen, and the teardown hand-back still emits the dim
-/// `\r\n\x1b[2mExited with: N\x1b[0m` at the anchor row on exit. This pins the
-/// slice-02 contract that a failure surfaces its status even when the child printed
-/// nothing (`gutter false`): the `ever_painted_inline` gate that silences alt-only
-/// TUIs (`gutter vim`, exit 0) must NOT also swallow a no-output failure. Asserted on
-/// the raw teardown bytes: the status line is present AND gutter never emits
-/// `?1049h`/`?1049l` for this plain command.
+/// reworked as the inline hand-back in slice 10/ADR-013).** A plain child that prints
+/// inline output and then exits non-zero: gutter mirrors the child's mode (ADR-012),
+/// so it never forces the alt screen, and the teardown hand-back emits the dim
+/// `\r\n\x1b[2mExited with: N\x1b[0m` below the band on exit. The hand-back is gated
+/// on the positive `ever_painted_inline` signal (slice 10/ADR-013): the status line
+/// captions the band, so it surfaces when a non-zero exit follows real inline output.
+/// Asserted on the raw teardown bytes: the status line is present AND gutter never
+/// emits `?1049h`/`?1049l` for this plain command.
 #[test]
 fn non_zero_exit_shows_dim_status_line() {
-    let child = "/bin/sh -c 'exit 3'";
+    let child = "/bin/sh -c 'printf boom; exit 3'";
     let cmd = gutter_in_terminal(80, 24, &format!("--width 60 {child}"));
     let mut session = spawn(cmd);
 
@@ -585,6 +584,32 @@ fn non_zero_exit_shows_dim_status_line() {
         wait_status(session),
         Some(3),
         "gutter must propagate the non-zero exit code"
+    );
+}
+
+/// **A no-output non-zero exit is silent (slice 10/ADR-013, BUG[1]).** The inline
+/// hand-back is gated on `ever_painted_inline` alone, never the exit code: a child
+/// that prints nothing (`gutter false`) has no band to caption, so no dim status
+/// line is stamped onto the restored shell — and crucially the exit code still
+/// propagates. This locks the gate so a TUI that drops back to the primary screen
+/// and exits non-zero (indistinguishable here by live state) can never be captioned.
+#[test]
+fn no_output_nonzero_exit_is_silent() {
+    let child = "/bin/sh -c 'exit 3'";
+    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 {child}"));
+    let mut session = spawn(cmd);
+
+    let bytes = drain_window(&mut session, Duration::from_secs(3));
+    let s = String::from_utf8_lossy(&bytes);
+
+    assert!(
+        !s.contains("Exited with:"),
+        "a no-output non-zero exit must not stamp a status line, got {s:?}"
+    );
+    assert_eq!(
+        wait_status(session),
+        Some(3),
+        "gutter must still propagate the non-zero exit code"
     );
 }
 

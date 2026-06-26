@@ -37,7 +37,7 @@ use crate::keyboard;
 use crate::mouse::{MouseDecision, MouseGate};
 use crate::msg::Msg;
 use crate::pty::PtyResizer;
-use crate::rowclip::clip_row_to_width;
+use crate::rowclip::clip_row_to_width_into;
 use crate::terminal::OuterTerminal;
 
 /// The 60fps frame budget. One render per `FRAME` of wall (or virtual) time.
@@ -491,11 +491,24 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
     // has driven `base_row` to exactly 0 and the scroll-emit branch owns the rest.
     if !renderer.outer_alt_active && renderer.base_row > 0 {
         let real_rows = renderer.parser.screen().size().0;
-        let bottom = renderer.deepest_live_row();
-        let delta = renderer
-            .base_row
-            .saturating_add(bottom)
-            .saturating_sub(real_rows.saturating_sub(1));
+        // A non-empty `departed` proves vt100's W-window filled and scrolled
+        // internally this frame, which can only happen once the band spans the
+        // whole screen — so `base_row` MUST reach 0 before the scroll-emit branch
+        // paints `[0, rows)`, or that paint overwrites the pre-launch history above
+        // the launch row instead of leaving it in scrollback. The settled grid can
+        // read near-blank here (a coalesced `seq … ; clear` in one frame), so the
+        // deepest-live-row overshoot would under-scroll; the departed signal is the
+        // authority. Scrolling the full remaining `base_row` pushes exactly that
+        // history into scrollback and drives `base_row` to 0.
+        let delta = if departed.is_empty() {
+            let bottom = renderer.deepest_live_row();
+            renderer
+                .base_row
+                .saturating_add(bottom)
+                .saturating_sub(real_rows.saturating_sub(1))
+        } else {
+            renderer.base_row
+        };
         if delta > 0 {
             term.move_to(0, real_rows.saturating_sub(1))?;
             for _ in 0..delta {
@@ -584,7 +597,7 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
 fn prepare_row(line: &[u8], width: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(line.len() + 3);
     out.extend_from_slice(b"\x1b[m");
-    out.extend(clip_row_to_width(line, width));
+    clip_row_to_width_into(line, width, &mut out);
     out
 }
 
@@ -819,17 +832,40 @@ impl Renderer {
     /// further down, the cursor row or the last non-blank row. Drives the make-room overshoot
     /// (ADR-013) and the teardown hand-back — both need to know how far down the
     /// band actually reaches, not just where the cursor sits.
+    ///
+    /// "Live" is a **cell** property, not a text one: a full-width reverse-video
+    /// status bar erased under a background SGR carries no glyphs (its row text is
+    /// blank), so a text-only scan would miss it and under-scroll. Scan the rows
+    /// from the bottom up and stop at the first that holds any live cell.
     fn deepest_live_row(&self) -> u16 {
         let screen = self.parser.screen();
         let (crow, _) = screen.cursor_position();
-        let mut last_nonblank = 0u16;
-        for (row, text) in screen.rows(0, self.width).enumerate() {
-            if !text.trim_end().is_empty() {
-                last_nonblank = row as u16;
+        let (rows, _) = screen.size();
+        for row in (0..rows).rev() {
+            for col in 0..self.width {
+                if screen.cell(row, col).is_some_and(cell_is_live) {
+                    return crow.max(row);
+                }
             }
         }
-        crow.max(last_nonblank)
+        crow
     }
+}
+
+/// Whether a vt100 cell carries anything the band must keep on-screen: a glyph
+/// (any non-space content) or a non-default visual attribute. The attribute arm
+/// is what catches an erased reverse-video status bar — a coloured background with
+/// no glyphs, which a content-only read calls blank.
+fn cell_is_live(cell: &vt100::Cell) -> bool {
+    let c = cell.contents();
+    (!c.is_empty() && c != " ")
+        || cell.inverse()
+        || cell.bold()
+        || cell.dim()
+        || cell.italic()
+        || cell.underline()
+        || cell.fgcolor() != vt100::Color::Default
+        || cell.bgcolor() != vt100::Color::Default
 }
 
 /// Run the render loop until the child exits, then restore the terminal in order
@@ -931,19 +967,21 @@ where
 /// **inline** hands back below the band instead: its output is already on the
 /// primary screen, so teardown only drops the cursor to a fresh line below it.
 ///
-/// **Inline hand-back, gated on `ever_painted_inline || exit_code != 0`.** A plain
-/// command's band is painted in place (at `base_row + grid_row`), so there is nothing
-/// to replay — the hand-back just moves the cursor to a fresh line below the band's
+/// **Inline hand-back, gated on `ever_painted_inline` alone.** A plain command's
+/// band is painted in place (at `base_row + grid_row`), so there is nothing to
+/// replay — the hand-back just moves the cursor to a fresh line below the band's
 /// last content and, on a non-zero exit, prints the dim `Exited with: N` status line
 /// there, so the parent shell's next prompt resumes below the output rather than on
-/// top of it (slice 02). The `ever_painted_inline` arm means `gutter vim` — straight
-/// into the alt screen and back out, never showing inline content, exit 0 — leaves no
-/// stray status line below an empty band (the positive signal that replaced ADR-012's
-/// `ever_entered_alt` latch). The `exit_code != 0` arm preserves the slice-02 contract
-/// that a failure surfaces its status even with no inline output (`gutter false`): the
-/// hand-back still lands the status line at the anchor row. A child that exits *in*
-/// alt is caught by the first branch, so a TUI crashing on the alt screen stays
-/// silent regardless of code.
+/// top of it (slice 02). Gating on the positive `ever_painted_inline` signal (which
+/// replaced ADR-012's `ever_entered_alt` latch) means the status line surfaces only
+/// when inline content actually reached the primary screen: `gutter vim` — straight
+/// into the alt screen and back out, never showing inline content — leaves nothing,
+/// and crucially so does a TUI that drops back to the primary screen (`?1049l`) with
+/// no inline content and then exits non-zero, which an `exit_code != 0` arm would
+/// have stamped a stray status line onto. The exit code is consulted only *inside*
+/// the hand-back, so the status is shown exactly when a non-zero exit followed real
+/// inline output. A child that exits *in* alt is caught by the first branch, so a
+/// TUI crashing on the alt screen stays silent regardless of code.
 fn run_teardown<T: OuterTerminal>(
     renderer: &Renderer,
     term: &mut T,
@@ -951,7 +989,7 @@ fn run_teardown<T: OuterTerminal>(
 ) -> std::io::Result<()> {
     if renderer.outer_alt_active {
         term.leave_alt_screen()?;
-    } else if renderer.ever_painted_inline || exit_code != 0 {
+    } else if renderer.ever_painted_inline {
         hand_back_inline(renderer, term, exit_code)?;
     }
     term.pop_keyboard_flags()?;
@@ -1607,15 +1645,16 @@ mod tests {
             "alt-then-primary clean exit: no inline paint, so the hand-back is suppressed, got {teardown_writes:?}"
         );
 
-        // --- No inline output, non-zero exit: the failure STILL surfaces. ---
+        // --- No inline output, non-zero exit: silent (the hand-back gate is the
+        // positive `ever_painted_inline`, never the exit code). A command that
+        // printed nothing (`gutter false`) has no band to caption, so the status
+        // line is suppressed — the status is shown only when a non-zero exit
+        // followed real inline output. ---
         let (_f, term, _p, _r, _c) = run_with(
             vec![(0u64, Msg::ChildExited(ExitStatus::with_exit_code(3)))],
             20,
             5,
         );
-        // Nothing was ever painted inline, but the slice-02 contract is that a
-        // failure surfaces its status (`gutter false`): the `exit_code != 0` arm of
-        // the gate lands the dim status line at the anchor row even with no output.
         let teardown_writes: Vec<&[u8]> = term
             .calls
             .iter()
@@ -1625,8 +1664,37 @@ mod tests {
             })
             .collect();
         assert!(
-            teardown_writes.contains(&b"\r\n\x1b[2mExited with: 3\x1b[0m".as_slice()),
-            "no-output non-zero exit must still surface the status line, got {teardown_writes:?}"
+            !teardown_writes.iter().any(|w| w.starts_with(b"\r\n\x1b[2mExited with:")),
+            "no inline output: the hand-back is suppressed regardless of exit code, got {teardown_writes:?}"
+        );
+    }
+
+    /// **alt → primary → non-zero exit stays silent (BUG[1] regression).** A
+    /// full-screen TUI that paints only on the alt screen, drops back to the
+    /// primary screen (`?1049l`) without ever painting inline content, then exits
+    /// non-zero, must hand nothing back: `ever_painted_inline` is the sole gate, so
+    /// no dim status line is stamped onto the restored shell. The old
+    /// `ever_entered_alt` latch held this line; the `|| exit_code != 0` arm that
+    /// briefly replaced it did not.
+    #[test]
+    fn alt_then_primary_nonzero_exit_stays_silent() {
+        let (_f, term, _p, _r, _c) = run_with(
+            vec![
+                (0u64, Msg::Pty(b"\x1b[?1049h\x1b[1;1Htui".to_vec())),
+                (20, Msg::Pty(b"\x1b[?1049l".to_vec())),
+                (20, Msg::ChildExited(ExitStatus::with_exit_code(3))),
+            ],
+            20,
+            5,
+        );
+        let writes: Vec<&[u8]> = term
+            .calls
+            .iter()
+            .filter_map(|c| if let Call::WriteRow(b) = c { Some(b.as_slice()) } else { None })
+            .collect();
+        assert!(
+            !writes.iter().any(|w| w.starts_with(b"\r\n\x1b[2mExited with:")),
+            "alt→primary→exit 3 with no inline paint must not stamp a status line, got {writes:?}"
         );
     }
 
@@ -2234,6 +2302,26 @@ line two\r\n\
 /// `vt100` grid (what the child believes it painted) AND on the **physical
 /// outer cells** at column `margin + W` via a [`RecordingGrid`] (where a real
 /// bleed would live — the assertion `COLUMNS == W` can never make).
+/// Shared test helper: build a renderer at `width × rows` with margin `margin`,
+/// feed `bytes` straight into the parser (no clock, no threads — the pure unit
+/// path), and paint one frame through the **primary** `rows_diff` path into a fresh
+/// [`RecordingGrid`] sized to the physical outer terminal (`phys_cols`). Returns
+/// the renderer (for child-grid assertions) and the painted physical grid.
+#[cfg(test)]
+fn render_primary(
+    bytes: &[u8],
+    width: u16,
+    rows: u16,
+    margin: u16,
+    phys_cols: u16,
+) -> (Renderer, crate::terminal::mock::RecordingGrid) {
+    let mut renderer = Renderer::at_margin(width, rows, margin);
+    renderer.parser.process(bytes);
+    let mut grid = crate::terminal::mock::RecordingGrid::new(phys_cols, rows);
+    render_once(&mut renderer, &mut grid).unwrap();
+    (renderer, grid)
+}
+
 #[cfg(test)]
 mod cjk {
     use super::*;
@@ -2242,24 +2330,6 @@ mod cjk {
     /// U+4E00 (一), the canonical double-width CJK ideograph. Two grid cells: a
     /// lead cell holding "一" and a continuation cell (byte-length zero).
     const HAN: &str = "\u{4e00}";
-
-    /// Build a renderer at `width × rows` with margin `margin`, feed it `bytes`
-    /// straight into the parser (no clock, no threads — the pure unit path), and
-    /// paint one frame through the **primary** `rows_diff` path into a fresh
-    /// [`RecordingGrid`] sized to the physical outer terminal (`phys_cols`).
-    fn render_primary(
-        bytes: &[u8],
-        width: u16,
-        rows: u16,
-        margin: u16,
-        phys_cols: u16,
-    ) -> (Renderer, RecordingGrid) {
-        let mut renderer = Renderer::at_margin(width, rows, margin);
-        renderer.parser.process(bytes);
-        let mut grid = RecordingGrid::new(phys_cols, rows);
-        render_once(&mut renderer, &mut grid).unwrap();
-        (renderer, grid)
-    }
 
     /// As [`render_primary`], but paint through the cell-walking **fallback**.
     fn render_fallback(
@@ -2559,24 +2629,6 @@ mod cjk {
 #[cfg(test)]
 mod rowclip_paint {
     use super::*;
-    use crate::terminal::mock::RecordingGrid;
-
-    /// Build a renderer at `width × rows` with margin `margin`, feed it `bytes`
-    /// straight into the parser, and paint one frame through the **primary**
-    /// `rows_diff` path into a fresh physical-sized [`RecordingGrid`].
-    fn render_primary(
-        bytes: &[u8],
-        width: u16,
-        rows: u16,
-        margin: u16,
-        phys_cols: u16,
-    ) -> RecordingGrid {
-        let mut renderer = Renderer::at_margin(width, rows, margin);
-        renderer.parser.process(bytes);
-        let mut grid = RecordingGrid::new(phys_cols, rows);
-        render_once(&mut renderer, &mut grid).unwrap();
-        grid
-    }
 
     /// **Band-edge blank (the Bug B gate).** A full-width reverse-video row (the
     /// nvim statusline: `ESC[7m` then a row-final `ESC[K`, attributed-but-empty)
@@ -2587,7 +2639,7 @@ mod rowclip_paint {
     #[test]
     fn reverse_video_row_highlight_stops_at_band_edge() {
         let (w, rows, margin, phys) = (8u16, 3u16, 6u16, 20u16);
-        let grid = render_primary(b"\x1b[7m\x1b[K", w, rows, margin, phys);
+        let (_, grid) = render_primary(b"\x1b[7m\x1b[K", w, rows, margin, phys);
 
         // The highlight reaches the last in-band column.
         assert!(
@@ -2625,7 +2677,7 @@ mod rowclip_paint {
         // Row 0: reverse "BAR" filled to the edge. Row 1: an explicit reset then
         // default "hello" — so the child grid's row 1 is genuinely default-attr.
         let bytes = b"\x1b[1;1H\x1b[7mBAR\x1b[K\x1b[2;1H\x1b[mhello";
-        let grid = render_primary(bytes, w, rows, margin, phys);
+        let (_, grid) = render_primary(bytes, w, rows, margin, phys);
 
         // Row 0 is reverse at its leading cell (the statusline).
         assert!(grid.cell_inverse(0, margin), "row 0 leading cell is the highlight");
@@ -3145,6 +3197,69 @@ mod inline_anchor {
             writes,
             vec![b"\r\n\x1b[2mExited with: 7\x1b[0m".as_slice()],
             "a non-zero exit hands back the dim status line below the band"
+        );
+    }
+
+    /// **A coalesced scroll-then-clear launched mid-screen preserves the history
+    /// above and lands at `base_row == 0` (BUG[0] regression).** In one frame
+    /// vt100's W-window fills and scrolls internally (so the scroll tracker holds
+    /// the departed lines), then a `clear` blanks the settled grid — so the
+    /// make-room overshoot reads near-zero and would leave `base_row` mid-screen
+    /// while the departed branch runs. `emit_scroll_stream` paints `[0, rows)`, so
+    /// running it at `base_row > 0` overwrites the pre-launch history above the
+    /// launch row. The departed signal proves the band reached full screen, so the
+    /// frame must drive `base_row` to 0, pushing that history into scrollback first.
+    #[test]
+    fn coalesced_scroll_then_clear_preserves_history_at_base_row_zero() {
+        let (w, rows, phys) = (20u16, 6u16, 20u16);
+        let mut grid = RecordingGrid::with_scrollback(phys, rows, 1000);
+        // Three history rows ABOVE a band launched at row 3.
+        for (rr, line) in ["H0", "H1", "H2"].iter().enumerate() {
+            grid.move_to(0, rr as u16).unwrap();
+            grid.write_row(line.as_bytes()).unwrap();
+        }
+
+        let mut r = renderer_at(w, rows, 3);
+        // One coalesced burst: ten lines overflow the 6-row W-window (the tracker
+        // captures the departed lines), then clear+home blanks the settled grid.
+        let mut burst = String::new();
+        for i in 0..10 {
+            burst.push_str(&format!("L{i}\r\n"));
+        }
+        burst.push_str("\x1b[2J\x1b[H");
+        feed(&mut r, burst.as_bytes());
+        render_once(&mut r, &mut grid).unwrap();
+
+        assert_eq!(r.base_row, 0, "departed proves full screen — base_row must reach 0");
+        let history = grid.scrollback_top_rows(w);
+        for tag in ["H0", "H1", "H2"] {
+            assert!(
+                history.iter().any(|h| h.contains(tag)),
+                "pre-launch history {tag} must survive in scrollback, got {history:?}"
+            );
+        }
+    }
+
+    /// **An attribute-only row counts as live for make-room (BUG[2] regression).** A
+    /// full-width reverse-video status bar erased under a background SGR carries no
+    /// glyphs, so a row-text read calls it blank and make-room under-scrolls,
+    /// clipping the bar off the bottom. Launch on the bottom row, paint the bar on
+    /// the deepest grid row, and move the cursor home so it does not itself mark the
+    /// row: make-room must still scroll the bar fully on-screen (`base_row` → 0).
+    #[test]
+    fn attribute_only_row_counts_as_live_for_make_room() {
+        let (w, rows, phys) = (8u16, 6u16, 12u16);
+        let mut grid = RecordingGrid::new(phys, rows);
+        let mut r = renderer_at(w, rows, 5); // launched on the bottom row
+        // Reverse-video erase across the bottom grid row (attribute-only, no
+        // glyphs), then reset and move the cursor home.
+        feed(&mut r, b"\x1b[6;1H\x1b[7m\x1b[K\x1b[m\x1b[1;1H");
+        render_once(&mut r, &mut grid).unwrap();
+
+        assert_eq!(r.base_row, 0, "the attribute-only bar drives make-room to the top");
+        assert!(
+            grid.cell_inverse(rows - 1, 0),
+            "the reverse-video bar lands fully on-screen at the bottom row"
         );
     }
 }
