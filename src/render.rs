@@ -245,6 +245,16 @@ where
     match msg {
         Msg::Pty(bytes) => {
             renderer.parser.process(&bytes);
+            // Answer the child's device queries (slice 11). `parser.process` just
+            // surfaced any `CSI c` / `CSI 5 n` / `CSI 6 n` / `CSI ? u` through
+            // `unhandled_csi`, which buffered a spec-correct reply; drain it to the
+            // PTY master with the same write+flush the key/mouse paths use below.
+            // Thread 2 owns the writer exclusively, so this adds no new sharing.
+            let replies = renderer.parser.callbacks_mut().drain_replies();
+            if !replies.is_empty() {
+                let _ = pty_writer.write_all(&replies);
+                let _ = pty_writer.flush();
+            }
             // Feed the same bytes to the scroll tracker (ADR-013) so vt100's
             // scroll machinery captures the lines that depart the top of the
             // W-window this frame — drained and reset in `render_once`. The live
@@ -1775,6 +1785,31 @@ mod tests {
             pty, b"\r\r",
             "both Enters degrade to the same legacy byte under the clamp"
         );
+    }
+
+    /// Device queries through the render-loop dispatch arm (slice 11): a
+    /// `Msg::Pty` carrying the child's query reaches the PTY writer as the
+    /// spec-correct reply. This pins the gutter→child wiring (drain → write_all
+    /// → flush in the `Msg::Pty` arm) deterministically — the offline
+    /// `callbacks.rs` suite stops at `drain_replies`, so without this the wiring
+    /// is proven only by the slow PTY integration tests.
+    #[test]
+    fn dispatch_answers_device_queries_on_the_pty() {
+        // CPR: position to (3,7) then query → reply in W-grid coords, no margin.
+        let script = vec![
+            (0u64, Msg::Pty(b"\x1b[3;7H\x1b[6n".to_vec())),
+            (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ];
+        let (_flushes, _term, pty, ..) = run_with(script, 40, 24);
+        assert_eq!(pty, b"\x1b[3;7R", "CSI 6 n → CPR at the child's W-grid (3;7)");
+
+        // DA1: the query that caused the exit stall → Primary Device Attributes.
+        let script = vec![
+            (0u64, Msg::Pty(b"\x1b[c".to_vec())),
+            (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ];
+        let (_flushes, _term, pty, ..) = run_with(script, 40, 24);
+        assert_eq!(pty, b"\x1b[?1;2c", "CSI c → DA1 reply");
     }
 
     // --- Mouse forwarding through the render-loop dispatch arm (slice 07) ---

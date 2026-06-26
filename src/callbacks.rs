@@ -23,7 +23,13 @@ use std::io::{self, Write};
 
 use crate::clipboard::forward_osc52;
 use crate::cursor::{is_decscusr, CursorShape};
-use crate::keyboard::{is_kitty_csi, KittyState};
+use crate::keyboard::{is_kitty_csi, KittyLevel, KittyState};
+
+/// The fixed Primary Device Attributes (DA1) identity gutter answers `CSI c` with
+/// (VT100 with Advanced Video Option). The exact identity does not matter — a
+/// child gating on a DA1 handshake only needs *an* answer to proceed — so a
+/// stable, conventional reply is used.
+const DA1_REPLY: &[u8] = b"\x1b[?1;2c";
 
 /// The single callbacks struct the parser owns.
 ///
@@ -47,6 +53,12 @@ pub struct GutterCallbacks {
     /// Write>` rather than a concrete `File` so the callback is testable without
     /// a real tty.
     clipboard_out: Box<dyn Write + Send>,
+    /// Replies buffered for the child's device queries (slice 11). gutter is the
+    /// child's emulator, so it answers `CSI c` / `CSI 5 n` / `CSI 6 n` / `CSI ? u`
+    /// itself rather than proxying them. `unhandled_csi` only *buffers* here — the
+    /// render loop drains this to the PTY master (the one writer it owns) right
+    /// after `parser.process()`, so no reply leaves callbacks.
+    replies: Vec<u8>,
 }
 
 impl GutterCallbacks {
@@ -70,7 +82,60 @@ impl GutterCallbacks {
             kitty_state: KittyState::new(outer_supports),
             cursor_shape: CursorShape::new(),
             clipboard_out,
+            replies: Vec::new(),
         }
+    }
+
+    /// Take the device-query replies buffered since the last drain (slice 11).
+    /// Called by the render loop in the `Msg::Pty` arm after `parser.process()`,
+    /// which writes them to the PTY master with the same `write_all` + `flush` the
+    /// key/mouse paths use. Empty when the child issued no query this frame.
+    pub fn drain_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.replies)
+    }
+
+    /// Buffer the kitty keyboard-protocol report for `CSI ? u`: `CSI ? <flags> u`
+    /// carrying the child's **live** progressive-enhancement level (the top of the
+    /// push/pop stack, `0` when legacy). Reading the live level here is why a
+    /// query issued after a push reflects the state the child actually set.
+    fn buffer_kitty_report(&mut self) {
+        let flags = match self.kitty_state.current() {
+            KittyLevel::Legacy => 0,
+            KittyLevel::Kitty(f) => f,
+        };
+        self.replies
+            .extend_from_slice(format!("\x1b[?{flags}u").as_bytes());
+    }
+}
+
+/// The reply for a non-private DSR / DA1 device query, or `None` when the final
+/// is not one gutter answers. Only the bare (`i1 == None`) forms are answered:
+/// the secondary/tertiary DA (`CSI > c` / `CSI = c`) and private DSR carry an
+/// intermediate and are out of scope. The cursor-position reply reads
+/// `screen.cursor_position()` — the child's **W-grid** coordinates — and reports
+/// them 1-based per the DSR spec; the band's left-margin offset lives in the
+/// render thread and never reaches here, so it cannot leak into the reply.
+fn device_query_reply(
+    i1: Option<u8>,
+    params: &[&[u16]],
+    c: char,
+    screen: &vt100::Screen,
+) -> Option<Vec<u8>> {
+    if i1.is_some() {
+        return None;
+    }
+    let ps = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+    match c {
+        // DA1: CSI c / CSI 0 c → fixed identity.
+        'c' if ps == 0 => Some(DA1_REPLY.to_vec()),
+        // DSR status: CSI 5 n → "terminal OK".
+        'n' if ps == 5 => Some(b"\x1b[0n".to_vec()),
+        // DSR cursor position: CSI 6 n → CSI row ; col R, W-grid coords, 1-based.
+        'n' if ps == 6 => {
+            let (row, col) = screen.cursor_position();
+            Some(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes())
+        }
+        _ => None,
     }
 }
 
@@ -93,20 +158,31 @@ impl vt100::Callbacks for GutterCallbacks {
     /// `copy_to_clipboard`, a sibling method, with no entanglement here.
     fn unhandled_csi(
         &mut self,
-        _: &mut vt100::Screen,
+        screen: &mut vt100::Screen,
         i1: Option<u8>,
         _i2: Option<u8>,
         params: &[&[u16]],
         c: char,
     ) {
         if is_kitty_csi(i1, c) {
-            self.kitty_state.apply_csi(i1, params, c);
+            // The query form `CSI ? u` asks for the live level — answer it; the
+            // enable/disable forms (`CSI > N u` / `CSI < u`) mutate the stack.
+            if i1 == Some(b'?') {
+                self.buffer_kitty_report();
+            } else {
+                self.kitty_state.apply_csi(i1, params, c);
+            }
         } else if is_decscusr(i1, c) {
             // DECSCUSR cursor-shape request (slice 08). vt100 doesn't implement
             // it, so it lands here with the SP intermediate in `i1`; record the
             // requested shape for the render loop to mirror. Touches only
             // `cursor_shape` — sibling to the kitty and clipboard concerns.
             self.cursor_shape.apply_csi(params);
+        } else if let Some(reply) = device_query_reply(i1, params, c, screen) {
+            // A DA1 / DSR device query (slice 11). gutter is the child's emulator,
+            // so it buffers a spec-correct reply here; the render loop drains it to
+            // the PTY master. Touches only `replies`.
+            self.replies.extend_from_slice(&reply);
         }
     }
 
@@ -184,6 +260,80 @@ mod tests {
             None,
             "a kitty CSI must not register as a cursor-shape change"
         );
+    }
+
+    /// DA1 (`CSI c` / `CSI 0 c`) is answered with the fixed identity through the
+    /// real callback path. The secondary DA (`CSI > c`) carries an intermediate
+    /// and must stay unanswered (it is not DA1).
+    #[test]
+    fn da1_query_buffers_fixed_identity() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(true));
+
+        parser.process(b"\x1b[c");
+        assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[?1;2c");
+
+        // The explicit `CSI 0 c` form is equivalent.
+        parser.process(b"\x1b[0c");
+        assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[?1;2c");
+
+        // Secondary DA (CSI > c) is NOT DA1 — nothing buffered.
+        parser.process(b"\x1b[>c");
+        assert!(parser.callbacks_mut().drain_replies().is_empty());
+    }
+
+    /// DSR status (`CSI 5 n`) is answered "terminal OK" (`CSI 0 n`).
+    #[test]
+    fn dsr_status_buffers_ok() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(true));
+        parser.process(b"\x1b[5n");
+        assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[0n");
+    }
+
+    /// **The reply most worth pinning (PRD §5).** DSR cursor-position (`CSI 6 n`)
+    /// is answered `CSI row ; col R` in the child's **W-grid** coordinates, 1-based.
+    /// The callbacks only ever see the parser's own grid — the band's left-margin
+    /// offset lives in the render thread and never reaches here — so the reply is
+    /// the child's true position, never shifted by the gutter. Position the cursor
+    /// with `CSI 3 ; 7 H` and assert the reply echoes `3 ; 7`, not a margin-shifted
+    /// column.
+    #[test]
+    fn cursor_position_reply_uses_w_grid_coords() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(true));
+
+        // Move the cursor to row 3, col 7 (1-based), then query.
+        parser.process(b"\x1b[3;7H\x1b[6n");
+        assert_eq!(
+            parser.callbacks_mut().drain_replies(),
+            b"\x1b[3;7R",
+            "cursor-position reply must report the W-grid position 1-based, \
+             with no left-margin offset leaked in"
+        );
+
+        // Home the cursor and re-query: the reply tracks the live position.
+        parser.process(b"\x1b[H\x1b[6n");
+        assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[1;1R");
+    }
+
+    /// The kitty query (`CSI ? u`) is answered with the child's **live** level —
+    /// the top of the push/pop stack — so a query after a push reflects the state
+    /// the child actually set, and the query itself never mutates the stack.
+    #[test]
+    fn kitty_query_reports_live_level() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(true));
+
+        // Legacy floor: no level pushed → flags 0.
+        parser.process(b"\x1b[?u");
+        assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[?0u");
+
+        // Push a level, then query: the reply reflects the live top of stack.
+        parser.process(b"\x1b[>5u\x1b[?u");
+        assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[?5u");
+        // The query did not mutate the stack — the live level is unchanged.
+        assert_eq!(parser.callbacks().kitty_state.current(), KittyLevel::Kitty(5));
     }
 
     /// With the outer terminal unable to source kitty, the child's enable is
