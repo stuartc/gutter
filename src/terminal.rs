@@ -437,6 +437,20 @@ pub mod mock {
                 .unwrap_or_default()
         }
 
+        /// Whether physical cell `(row, col)` carries reverse-video. A
+        /// background-only flood (`ESC[K` under reverse video) erases the cell, so
+        /// its `contents()` stays `""` while its background bleeds — invisible to
+        /// [`cell_contents`]. The slice-09 band-edge assertion reads this to catch
+        /// the statusline highlight spilling past the band, the corruption a
+        /// content-only readback structurally cannot see.
+        pub fn cell_inverse(&self, row: u16, col: u16) -> bool {
+            self.parser
+                .screen()
+                .cell(row, col)
+                .map(|c| c.inverse())
+                .unwrap_or(false)
+        }
+
         /// The visible band rows `[0, rows)`, each trimmed to the band columns
         /// `[margin, margin + width)`. Used to assert what stayed on screen.
         pub fn visible_band(&self, margin: u16, width: u16, rows: u16) -> Vec<String> {

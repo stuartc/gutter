@@ -128,6 +128,68 @@ fn assert_cols_blank(screen: &vt100::Screen, from: u16, to: u16, rows: u16) {
     }
 }
 
+/// **Reverse-video statusline highlight stops at the band edge (slice 09, the
+/// Bug B end-to-end gate).** A child paints a full-width reverse-video row — the
+/// nvim/Claude statusline: `ESC[7m` then a row-final `ESC[K` (attributed-but-
+/// empty, the single unbounded sequence vt100 emits) — across the band, then
+/// idles. Through the real gutter binary at a centred band, the highlight must
+/// stay inside `[margin, margin + W)`: no gutter cell may carry reverse video.
+///
+/// The assertion reads `cell.inverse()`, not the cell contents: `ESC[K` under
+/// reverse video **erases** the gutter cells (their `contents()` stays empty)
+/// while flooding their background, so a content-only check is structurally blind
+/// to exactly this corruption.
+#[test]
+fn reverse_video_statusline_highlight_stops_at_band_edge() {
+    // A 60-wide centred band in an 80-col terminal → margin (80-60)/2 = 10, so the
+    // gutters are columns [0,10) and [70,80). Enter the alt screen so the live
+    // frame is captured cleanly, paint a full-width reverse-video row, then idle.
+    let child =
+        "/bin/sh -c 'printf \"\\033[?1049h\\033[?25l\\033[1;1H\\033[7m\\033[K\"; sleep 4'";
+    let script = format!(
+        "stty cols 80 rows 24; exec env GUTTER_FORCE_KITTY=0 {} --width 60 --center {child}",
+        gutter_bin()
+    );
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c").arg(script);
+    let mut session = OsSession::spawn(cmd).expect("spawn gutter under PTY");
+
+    let bytes = drain_window(&mut session, Duration::from_millis(900));
+    assert!(!bytes.is_empty(), "gutter must paint the statusline frame");
+
+    let parser = outer_grid(&bytes, 80, 24);
+    let screen = parser.screen();
+
+    // No gutter cell — left [0,10) or right [70,80) — may carry the highlight.
+    for r in 0..24u16 {
+        for c in (0..10u16).chain(70..80u16) {
+            if let Some(cell) = screen.cell(r, c) {
+                assert!(
+                    !cell.inverse(),
+                    "the statusline highlight flooded the gutter at ({r},{c}) — \
+                     reverse video must stop at the band edge"
+                );
+            }
+        }
+    }
+
+    // And the highlight is actually present in-band (the row really was painted,
+    // so the test isn't vacuously passing on an empty frame): the last in-band
+    // column carries reverse video on the statusline row.
+    let in_band_highlight = (0..24u16).any(|r| {
+        screen
+            .cell(r, 69)
+            .map(|cell| cell.inverse())
+            .unwrap_or(false)
+    });
+    assert!(
+        in_band_highlight,
+        "the reverse-video highlight must reach the last in-band column (69)"
+    );
+
+    drop(session);
+}
+
 /// **End-to-end resize-stress against the live-target fixture (slice 05's
 /// guarantee re-run on real content), now with wide-line content equivalence
 /// (slice 06, A2).** Replay the **wide-edge** fixture — CJK glyphs and an emoji

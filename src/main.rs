@@ -44,6 +44,7 @@ mod mouse;
 mod msg;
 mod pty;
 mod render;
+mod rowclip;
 mod terminal;
 mod waiter;
 

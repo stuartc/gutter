@@ -37,6 +37,7 @@ use crate::keyboard;
 use crate::mouse::{MouseDecision, MouseGate};
 use crate::msg::Msg;
 use crate::pty::PtyResizer;
+use crate::rowclip::clip_row_to_width;
 use crate::terminal::OuterTerminal;
 
 /// The 60fps frame budget. One render per `FRAME` of wall (or virtual) time.
@@ -448,7 +449,7 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
             }
             let row = row as u16;
             term.move_to(renderer.left_margin, row)?;
-            term.write_row(&line)?;
+            term.write_row(&prepare_row(&line, renderer.width))?;
         }
     } else {
         // A scroll happened: stream the departed lines followed by the current band
@@ -488,6 +489,20 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
     // a single in-memory grid replay, not per-frame allocation churn at scale.
     renderer.sync_prev();
     Ok(())
+}
+
+/// Make a vt100 row run **self-contained within its `W`-wide, margin-offset
+/// rectangle** before it is painted (slice 09, ADR-014). Two transforms, in
+/// order: prepend `ESC[m` so the run no longer inherits whatever attribute the
+/// previous row left live across the bare `move_to` (the vertical bleed), and
+/// clip the row-final `ESC[K` to column `W` so its erase-to-right-edge cannot
+/// flood the gutter (the horizontal overflow). vt100 stays the single source of
+/// serialisation truth — this only bounds the one unbounded sequence it emits.
+fn prepare_row(line: &[u8], width: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(line.len() + 3);
+    out.extend_from_slice(b"\x1b[m");
+    out.extend(clip_row_to_width(line, width));
+    out
 }
 
 /// Paint a scrolling frame: stream the `departed` lines followed by the current
@@ -540,7 +555,7 @@ fn emit_scroll_stream<T: OuterTerminal>(
             term.newline()?;
             term.move_to(renderer.left_margin, bottom)?;
         }
-        term.write_row(line)?;
+        term.write_row(&prepare_row(line, renderer.width))?;
     }
     Ok(())
 }
@@ -867,7 +882,7 @@ fn replay_band_to_primary<T: OuterTerminal>(
             continue;
         }
         term.move_to(renderer.left_margin, row as u16)?;
-        term.write_row(&line)?;
+        term.write_row(&prepare_row(&line, renderer.width))?;
     }
     write_exit_status(term, exit_code)
     // No explicit flush: the queued replay bytes are drained by the `show_cursor`
@@ -2374,6 +2389,98 @@ mod cjk {
             .parser
             .process(format!("\x1b[1;{w}H{HAN}").as_bytes());
         assert_eq!(renderer.parser.screen().size(), (rows, w));
+    }
+}
+
+/// Row-run self-containment at the offset (slice 09 / ADR-014). The pure column
+/// maths lives in `rowclip`; these prove the *offset* behaviour on a physical-
+/// sized [`RecordingGrid`] — the seam where the bug actually lives. A
+/// background-only flood erases the gutter cell (empty `contents()`) while its
+/// reverse-video background bleeds, so the assertions read `cell_inverse`, the
+/// only readback that can witness the corruption.
+#[cfg(test)]
+mod rowclip_paint {
+    use super::*;
+    use crate::terminal::mock::RecordingGrid;
+
+    /// Build a renderer at `width × rows` with margin `margin`, feed it `bytes`
+    /// straight into the parser, and paint one frame through the **primary**
+    /// `rows_diff` path into a fresh physical-sized [`RecordingGrid`].
+    fn render_primary(
+        bytes: &[u8],
+        width: u16,
+        rows: u16,
+        margin: u16,
+        phys_cols: u16,
+    ) -> RecordingGrid {
+        let mut renderer = Renderer::at_margin(width, rows, margin);
+        renderer.parser.process(bytes);
+        let mut grid = RecordingGrid::new(phys_cols, rows);
+        render_once(&mut renderer, &mut grid).unwrap();
+        grid
+    }
+
+    /// **Band-edge blank (the Bug B gate).** A full-width reverse-video row (the
+    /// nvim statusline: `ESC[7m` then a row-final `ESC[K`, attributed-but-empty)
+    /// painted at a centred offset. The clip rewrites the unbounded erase into a
+    /// `W`-bounded fill, so the highlight reaches the band edge (`margin + W - 1`
+    /// is inverse) but the first gutter column (`margin + W`) is **not** inverse —
+    /// the corruption a content-only readback is blind to.
+    #[test]
+    fn reverse_video_row_highlight_stops_at_band_edge() {
+        let (w, rows, margin, phys) = (8u16, 3u16, 6u16, 20u16);
+        let grid = render_primary(b"\x1b[7m\x1b[K", w, rows, margin, phys);
+
+        // The highlight reaches the last in-band column.
+        assert!(
+            grid.cell_inverse(0, margin + w - 1),
+            "the reverse-video highlight must reach the band edge (col margin+W-1)"
+        );
+        // …and stops there: the first gutter column is untouched.
+        assert!(
+            !grid.cell_inverse(0, margin + w),
+            "the highlight must NOT flood the gutter (col margin+W must not be inverse)"
+        );
+        // The gutter cell carries no content either.
+        let edge = grid.cell_contents(0, margin + w);
+        assert!(
+            edge.is_empty() || edge == " ",
+            "the band-edge gutter cell must be blank, found {edge:?}"
+        );
+        // Every gutter column past the edge is clean of the highlight.
+        for c in (margin + w)..phys {
+            assert!(
+                !grid.cell_inverse(0, c),
+                "gutter col {c} must not carry the statusline highlight"
+            );
+        }
+    }
+
+    /// **No cross-row bleed (the Bug A gate).** A reverse-video row painted above a
+    /// default-attribute row. The reverse row leaves inverse active in the outer
+    /// terminal across the bare `move_to`; the per-row `ESC[m` reset must contain
+    /// it, so the lower row's leading cells render **default**, not inverse.
+    /// Without the reset the second row inherits the stale highlight.
+    #[test]
+    fn no_attribute_bleed_across_rows() {
+        let (w, rows, margin, phys) = (12u16, 3u16, 5u16, 24u16);
+        // Row 0: reverse "BAR" filled to the edge. Row 1: an explicit reset then
+        // default "hello" — so the child grid's row 1 is genuinely default-attr.
+        let bytes = b"\x1b[1;1H\x1b[7mBAR\x1b[K\x1b[2;1H\x1b[mhello";
+        let grid = render_primary(bytes, w, rows, margin, phys);
+
+        // Row 0 is reverse at its leading cell (the statusline).
+        assert!(grid.cell_inverse(0, margin), "row 0 leading cell is the highlight");
+        // Row 1's leading cells are default — the reset contained the bleed.
+        assert_eq!(grid.cell_contents(1, margin), "h", "row 1 paints its own content");
+        assert!(
+            !grid.cell_inverse(1, margin),
+            "row 1 leading cell must be default, not the stale reverse from row 0"
+        );
+        assert!(
+            !grid.cell_inverse(1, margin + 1),
+            "the bleed must not reach the second cell of row 1 either"
+        );
     }
 }
 

@@ -709,6 +709,7 @@ dependencies = [
  "proptest",
  "signal-hook 0.4.4",
  "tattoy-wezterm-term",
+ "unicode-width",
  "vt100",
 ]
 

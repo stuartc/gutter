@@ -9,6 +9,9 @@ portable-pty = "0.9.0"
 vt100 = "0.16.2"
 crossterm = "0.29.0"
 signal-hook = "0.4.4"
+# The same width model vt100 itself uses (its own `unicode-width` dependency), so
+# the row-clip column tracker agrees with vt100 cell-for-cell on wide glyphs.
+unicode-width = "0.2"
 
 # The wezterm-term comparison oracle (ADR-001) is an OPTIONAL dependency,
 # enabled only by the `oracle` feature below. With the feature off (the default)
