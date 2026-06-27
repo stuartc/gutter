@@ -26,9 +26,22 @@
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
 use std::io::Write;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use expectrl::session::OsSession;
+
+/// Serialize every PTY test in this binary. Each one drives a real `gutter`
+/// process in its own PTY; run in parallel they flake under PTY/process
+/// contention — a *different* test fails each run, deterministically green when
+/// serialized. Holding this lock for the whole test (take it on the first line)
+/// keeps just this binary single-file while the lib tests and other suites stay
+/// parallel — no `--test-threads=1` on the whole suite, no CI-only config. The
+/// poison recovery keeps one panicking test from cascading into the rest.
+fn pty_guard() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Path to the freshly-built `gutter` binary (cargo sets this for the test).
 fn gutter_bin() -> String {
@@ -123,6 +136,7 @@ fn assert_gutters_empty(screen: &vt100::Screen, band: u16, outer_cols: u16, rows
 /// the outer terminal size.
 #[test]
 fn child_sees_band_width() {
+    let _guard = pty_guard();
     let cmd = gutter_in_terminal(120, 40, "--width 100 /bin/sh -c 'stty size; sleep 3'");
     let mut session = spawn(cmd);
     let bytes = drain_window(&mut session, Duration::from_millis(700));
@@ -140,6 +154,7 @@ fn child_sees_band_width() {
 /// gutter columns to the right (>= 100) hold no stale cells.
 #[test]
 fn content_in_band_gutters_empty() {
+    let _guard = pty_guard();
     let child = "/bin/sh -c 'printf HELLO_FROM_THE_BAND; sleep 3'";
     let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
     let mut session = spawn(cmd);
@@ -161,6 +176,7 @@ fn content_in_band_gutters_empty() {
 /// slice, so physical col == child col).
 #[test]
 fn cursor_tracks_child_inside_band() {
+    let _guard = pty_guard();
     // Move to row 3, col 10 (1-based CSI), then idle alive.
     let child = "/bin/sh -c 'printf \"\\033[3;10H\"; sleep 3'";
     let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
@@ -181,6 +197,7 @@ fn cursor_tracks_child_inside_band() {
 /// must mirror that on the outer terminal (the outer vt100 reports hidden).
 #[test]
 fn cursor_visibility_mirrored_on_outer() {
+    let _guard = pty_guard();
     let child = "/bin/sh -c 'printf \"\\033[?25lX\"; sleep 3'";
     let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
     let mut session = spawn(cmd);
@@ -199,6 +216,7 @@ fn cursor_visibility_mirrored_on_outer() {
 /// positioning, SGR) works through gutter, not just `echo`.
 #[test]
 fn vim_renders_inside_band() {
+    let _guard = pty_guard();
     let child = "/usr/bin/vim -u NONE -N -i NONE";
     let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
     let mut session = spawn(cmd);
@@ -240,6 +258,7 @@ fn vim_renders_inside_band() {
 /// the cursor with NO keypress, and propagate the child's exit code.
 #[test]
 fn child_exit_restores_terminal_and_propagates_code() {
+    let _guard = pty_guard();
     let child = "/bin/sh -c 'printf \"\\033[?1049h\"; exit 7'";
     let cmd = gutter_in_terminal(80, 24, &format!("--width 60 {child}"));
     let mut session = spawn(cmd);
@@ -271,6 +290,7 @@ fn child_exit_restores_terminal_and_propagates_code() {
 /// the three lines are present AND `?1049h`/`?1049l` are NEVER emitted.
 #[test]
 fn plain_command_output_survives_to_primary_screen() {
+    let _guard = pty_guard();
     // No trailing newline, no alt-screen negotiation — a pure primary-screen
     // command. It exits immediately; we read the post-exit stream.
     let child = "/bin/sh -c \"printf 'line1\\nline2\\nline3'; exit 0\"";
@@ -304,6 +324,7 @@ fn plain_command_output_survives_to_primary_screen() {
 /// lines — not at startup, and restore cleanly (leave the alt screen) on exit.
 #[test]
 fn mode_switch_mid_run_enters_alt_after_primary_lines() {
+    let _guard = pty_guard();
     // Print a primary marker, then enter the alt screen and paint, then exit in
     // alt. The `?1049h` must appear in the stream AFTER the primary marker.
     let child = "/bin/sh -c \"printf 'primline'; sleep 0.3; printf '\\033[?1049h\\033[1;1Halt-frame'; sleep 0.3; exit 0\"";
@@ -361,6 +382,7 @@ fn wait_status(session: OsSession) -> Option<i32> {
 /// sanity check that the coalescing loop neither hangs nor tears.
 #[test]
 fn multi_mb_scroll_stays_bounded() {
+    let _guard = pty_guard();
     // A burst of scrolling output, then a long idle so the child stays alive
     // PAST our capture window — we want the live alt-screen frame, not the
     // post-exit primary screen (leaving the alt screen discards its content).
@@ -408,6 +430,7 @@ fn multi_mb_scroll_stays_bounded() {
 /// regardless of coalescing (a single frame never swallows a whole screenful).
 #[test]
 fn scroll_off_lines_reach_real_terminal_scrollback() {
+    let _guard = pty_guard();
     // 40 lines, each `SCROLLTAG-NN`, paced so the band scrolls steadily. No alt
     // screen — a pure primary-screen command. Exits 0; we read the full stream
     // (the scrolled-off lines were emitted into scrollback as they departed).
@@ -487,6 +510,7 @@ fn scroll_off_lines_reach_real_terminal_scrollback() {
 /// single-frame advance >= the band height, the exact gap the verifier flagged.
 #[test]
 fn scroll_off_burst_reaches_scrollback_without_pacing() {
+    let _guard = pty_guard();
     // 120 lines, printed as fast as possible (no sleep): a single 16 ms frame
     // swallows dozens at once on a 24-row terminal. Each line is uniquely tagged.
     let child = "/bin/sh -c 'i=0; while [ $i -lt 120 ]; do printf \"BURSTTAG-%03d\\n\" $i; i=$((i+1)); done; exit 0'";
@@ -562,6 +586,7 @@ fn scroll_off_burst_reaches_scrollback_without_pacing() {
 /// emits `?1049h`/`?1049l` for this plain command.
 #[test]
 fn non_zero_exit_shows_dim_status_line() {
+    let _guard = pty_guard();
     let child = "/bin/sh -c 'printf boom; exit 3'";
     let cmd = gutter_in_terminal(80, 24, &format!("--width 60 {child}"));
     let mut session = spawn(cmd);
@@ -595,6 +620,7 @@ fn non_zero_exit_shows_dim_status_line() {
 /// and exits non-zero (indistinguishable here by live state) can never be captioned.
 #[test]
 fn no_output_nonzero_exit_is_silent() {
+    let _guard = pty_guard();
     let child = "/bin/sh -c 'exit 3'";
     let cmd = gutter_in_terminal(80, 24, &format!("--width 60 {child}"));
     let mut session = spawn(cmd);
@@ -619,6 +645,7 @@ fn no_output_nonzero_exit_is_silent() {
 /// for a plain command. Asserted on the raw teardown bytes.
 #[test]
 fn zero_exit_shows_no_status_line() {
+    let _guard = pty_guard();
     let child = "/bin/sh -c 'exit 0'";
     let cmd = gutter_in_terminal(80, 24, &format!("--width 60 {child}"));
     let mut session = spawn(cmd);
