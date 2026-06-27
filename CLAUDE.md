@@ -84,7 +84,7 @@ These are load-bearing and easy to break:
 - **Keyboard is always re-encoded.** crossterm yields a decoded `KeyEvent` only, so there is no verbatim passthrough; re-encode at the child's negotiated level. Two independent kitty states: the outer terminal's capability (probed once, clamps the child) and the child's live level (a stack driven by the `unhandled_csi` watcher).
 - **Mouse: eager capture.** One enable at startup, one disable at teardown (kills the dropped-first-click race). Each frame, a poll-diff gate reads the child's live `(mode, encoding)`, translates coordinates (subtract margin, drop the gutter), down-filters motion, and re-encodes SGR-1006.
 - **Width.** `--width N` is absolute (fixed for the session); `--width Npct`/`N%` is proportional (recomputed on every resize). The child is *always* told it has `W` columns, never the real terminal width.
-- **Outer screen mirrors the child.** Read `screen.alternate_screen()` each frame and toggle the outer alt-screen on its edges. Plain commands stay on the primary screen so their output survives exit; an `ever_entered_alt` latch guards the on-exit replay.
+- **Outer screen mirrors the child.** Read `screen.alternate_screen()` each frame and toggle the outer alt-screen on its edges. Plain commands stay on the primary screen so their output survives exit. The band is anchored at `base_row` (the launch cursor row) and flows inline from there, settling into the scroll-emit engine once it fills the screen. Teardown chooses on the live `outer_alt_active`: a child still in alt takes the leave-alt path; a child that exited inline hands back on a fresh line below the band, gated by an `ever_painted_inline` signal (so a straight-to-alt TUI leaves no stray status line).
 
 ## Equivalence gate & fixtures
 
