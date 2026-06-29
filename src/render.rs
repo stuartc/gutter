@@ -1,31 +1,14 @@
 //! Thread 2 — the render loop, the vt100 grid, and the offset repaint.
 //!
-//! The single highest-risk module. It owns the `vt100::Parser` exclusively (no
-//! mutex, no shared parser state — ADR-009) and the outer-terminal handle, and
-//! is the only thread that writes the PTY master. It runs the fixed-deadline
+//! Owns the `vt100::Parser` exclusively (ADR-009) and the outer-terminal handle,
+//! and is the only thread that writes the PTY master. Runs the fixed-deadline
 //! 60fps coalescing loop (ADR-007), generic over an injectable [`Clock`] so the
-//! cap, starvation, idle-park and input-liveness tests are deterministic.
+//! timing tests run on virtual time.
 //!
-//! Per frame:
-//! 1. **Phase A** — blocking `clock.recv()` for the first message (zero idle
-//!    CPU), dispatch it, capture `deadline = now + 16ms` **once**.
-//! 2. **Phase B** — drain to the deadline: the **mandatory** explicit
-//!    `now >= deadline` burst-exit check, else `recv_until(deadline)`; `Msg` →
-//!    dispatch (deadline UNCHANGED), `Timeout` → idle-gap exit, `Disconnected`
-//!    → shutdown.
-//! 3. Greedy `try_iter`-style swallow is folded into Phase B's drain (the
-//!    virtual clock has no separate non-blocking channel; under the real clock
-//!    the deadline drain already swallows everything queued before the cap).
-//! 4. Exactly one `render_once`.
-//!
-//! Dispatch: `Pty(b)` → `parser.process(b)`; `Input(Key)` → re-encode at the
-//! child's current kitty level (ADR-002/003) → PTY writer; `Input(Mouse)` → the
-//! poll-diff forwarding gate (ADR-005): refresh the cached `(mode, encoding)` from
-//! the live screen, then translate + down-filter + re-encode SGR → PTY writer (or
-//! swallow / fail loud on a non-SGR encoding); `Input(Resize)` → `handle_resize`
-//! (the ADR-008 ordering + ADR-011 proportional recompute, on this thread, the
-//! parser's only owner); `ChildExited(s)` → set shutdown with status, break.
-//! Other input (focus/paste) is swallowed.
+//! Each message is dispatched by [`dispatch`]: PTY bytes feed the parser, keys
+//! re-encode at the child's kitty level (ADR-002/003), mouse events route through
+//! the forwarding gate (ADR-005), and resize runs the ordered handler
+//! (ADR-008/011).
 
 use std::io::Write;
 use std::time::Duration;
@@ -43,43 +26,32 @@ use crate::terminal::OuterTerminal;
 /// The 60fps frame budget. One render per `FRAME` of wall (or virtual) time.
 pub const FRAME: Duration = Duration::from_millis(16);
 
-/// The upper bound on how long the shutdown path waits for the PTY forwarder's
-/// `Msg::PtyEof` after the child exits (the teardown-race drain, ADR-013). In the
-/// normal case the sentinel arrives at once and the drain returns immediately, so
-/// this cap is only hit when a grandchild keeps the PTY slave open and the master
-/// never EOFs — without it teardown would hang waiting for a sentinel that never comes.
+/// Upper bound on how long the shutdown path waits for the PTY forwarder's
+/// `Msg::PtyEof` after the child exits (ADR-013). Normally the sentinel arrives at
+/// once and the drain returns immediately; the cap is only hit when a grandchild
+/// keeps the PTY slave open and the master never EOFs, so teardown would otherwise
+/// hang waiting for a sentinel that never comes.
 pub const TEARDOWN_DRAIN_GRACE: Duration = Duration::from_millis(100);
 
-/// The scroll-tracker's bounded scrollback (ADR-013). It only ever needs to hold
-/// one frame's worth of scrolled-off lines (the tracker is reset to the live grid
-/// at the end of every `render_once`), so this caps a single coalesced frame's
-/// advance — a multi-MB burst still settles only a bounded number of lines in one
-/// 16 ms frame. Sized well above any realistic per-frame line count; if an
-/// extreme frame exceeds it, the oldest lines fall off the tracker's bound (the
-/// same backpressure ceiling the real terminal's own scrollback has), never the
-/// live parser's memory.
+/// The scroll-tracker's bounded scrollback (ADR-013). The tracker is reset to the
+/// live grid each `render_once`, so this only caps a single coalesced frame's
+/// advance — sized well above any realistic per-frame line count.
+/// If an extreme frame exceeds it, the oldest lines fall off the tracker's bound,
+/// never the live parser's memory.
 const SCROLL_TRACKER_SCROLLBACK: usize = 4096;
 
-/// The render thread's state: the parser, the cached previous screen for the
-/// `rows_diff`, the band width, the left margin, and the last cursor-visibility
-/// we mirrored to the outer terminal.
+/// The render thread's state: the parsers, the diff baseline, and the band geometry.
 pub struct Renderer {
     parser: vt100::Parser<GutterCallbacks>,
     /// The previous-frame screen the `rows_diff` is computed against.
     prev: vt100::Parser<GutterCallbacks>,
-    /// The scroll-off tracker (ADR-013, the primary-screen scrollback emit). A
-    /// second grid kept at the band's size, fed the **same** PTY bytes as the live
-    /// `parser` but with a small bounded scrollback, so vt100's own scroll
-    /// machinery records exactly which lines departed the top of the W-window and
-    /// in what order — the count-based delta the live `parser` (`scrollback=0`)
-    /// cannot reconstruct once a burst advances past a screenful in one frame.
-    ///
-    /// It is drained and reset to the live grid every `render_once`
+    /// Scroll-off tracker (ADR-013): a second grid at the band's size, fed the same
+    /// PTY bytes as `parser` but with bounded scrollback, so vt100's scroll machinery
+    /// records which lines left the top of the W-window each frame — the count the
+    /// live `parser` (scrollback 0) can't reconstruct once a burst scrolls past a
+    /// screenful in one frame. Reset to the live grid every `render_once`
     /// ([`Renderer::drain_scrolled_off`]), so it never holds more than one frame's
-    /// advance: the live `parser` stays `scrollback=0` and the ADR-007 burst
-    /// memory profile is unchanged (ADR-013 keeps vt100 itself scrollback-free —
-    /// this is a per-frame detection device, the twin of the `prev` baseline, not
-    /// vt100 scrollback on the painted grid).
+    /// advance.
     scroll_tracker: vt100::Parser<GutterCallbacks>,
     /// The current band width `W`. Constant for an absolute `--width`; recomputed
     /// on each resize for a proportional `--width Npct` (ADR-011).
@@ -99,61 +71,41 @@ pub struct Renderer {
     /// The cursor visibility last mirrored to the outer terminal, so we only
     /// emit a show/hide when it actually changes.
     cursor_visible: bool,
-    /// Whether the OUTER terminal is currently in the alternate screen, mirroring
-    /// the child's `alternate_screen()` (ADR-012). The edge-triggered de-dupe
-    /// twin of `cursor_visible`: we only emit an enter/leave when the child's alt
-    /// state actually changes. Never forced — gutter enters the outer alt screen
-    /// only when the child does.
+    /// Whether the OUTER terminal is in the alternate screen, mirroring the child's
+    /// `alternate_screen()` (ADR-012). Edge-triggered like `cursor_visible`: we emit
+    /// an enter/leave only on a real change. Never forced — gutter enters the alt
+    /// screen only when the child does.
     outer_alt_active: bool,
-    /// The physical terminal row where grid row 0 currently sits on the PRIMARY
-    /// screen (ADR-013, the inline anchor). Initialised to the launch cursor row
-    /// (the CPR query in `main`, or `real_rows - 1` on a terminal that doesn't
-    /// answer) and driven **monotonically toward 0** by the per-frame make-room
-    /// scroll as the band grows. While `base_row > 0` the band is growing inline
-    /// from the launch point; the moment it reaches 0 the band fills the screen and
-    /// slice 04's scroll-emit engine owns the scroll. Frozen while the child is in
-    /// the alt screen — the alt paint is always at offset 0, regardless of this.
+    /// Physical terminal row where grid row 0 sits on the PRIMARY screen (ADR-013).
+    /// Initialised to the launch cursor row and driven monotonically toward 0 by the
+    /// per-frame make-room scroll as the band grows; once it reaches 0 the band fills
+    /// the screen and the scroll-emit engine takes over. Frozen while the child is in
+    /// the alt screen, where the band always paints at offset 0.
     base_row: u16,
-    /// Whether gutter has EVER painted inline (primary-screen) content this run.
-    /// A positive signal replacing ADR-012's `ever_entered_alt` latch: it gates the
-    /// teardown hand-back, so a TUI that went straight to the alt screen and back
-    /// (`gutter vim`) — never showing inline content — leaves no stray status line
-    /// below an empty band. Set true the first time a non-empty primary paint runs.
+    /// Whether gutter has ever painted inline (primary-screen) content this run.
+    /// Gates the teardown hand-back (ADR-013): a TUI that went straight to the alt
+    /// screen and back, never showing inline content, leaves no stray status line.
     ever_painted_inline: bool,
-    /// Whether the PTY forwarder's `Msg::PtyEof` sentinel has been seen (the child
-    /// closed the PTY master, so all its output has been delivered). Set when
-    /// `PtyEof` is dispatched at any time. The shutdown drain reads it to know the
-    /// final frame has already landed and skip the bounded wait (ADR-013). Purely a
-    /// drain hint — it never triggers shutdown; the waiter stays authoritative.
+    /// Whether the PTY forwarder's `Msg::PtyEof` sentinel has been seen. The shutdown
+    /// drain reads it to skip the bounded wait (ADR-013). A drain hint only — it never
+    /// triggers shutdown; the waiter stays authoritative.
     pty_eof_seen: bool,
-    /// The mouse forwarding gate (ADR-005): the button-held flag the
-    /// `ButtonMotion` down-filter needs. The child's `(mode, encoding)` is read
-    /// live from the screen each `Event::Mouse` dispatch, not cached here.
+    /// The mouse forwarding gate (ADR-005), holding the button-held flag the motion
+    /// down-filter needs. The child's `(mode, encoding)` is read live from the screen
+    /// each `Event::Mouse` dispatch, not cached here.
     mouse_gate: MouseGate,
 }
 
 impl Renderer {
     /// Build a renderer for a `width × rows` virtual grid in a `real_cols`-wide
-    /// outer terminal, with the given band alignment and requested width.
+    /// outer terminal.
     ///
-    /// `width` is the resolved initial `W` (the caller resolves it once via
-    /// [`geometry::resolve_width`]); `width_config` is kept so resize can
-    /// recompute it for the proportional path. The left margin is derived here
-    /// from `layout`, `real_cols` and `width` — the same `geometry::margin`
-    /// function the resize handler calls.
-    ///
-    /// `outer_supports_kitty` is the startup `supports_keyboard_enhancement()`
-    /// probe — it clamps the child's kitty negotiation (ADR-003). The live
-    /// `parser` carries it; `prev` is a diff-baseline that only replays formatted
-    /// content and never tracks kitty, so its clamp is irrelevant (`false`).
-    ///
-    /// `clipboard_out` is the OSC-52 sink injected into the live parser's
-    /// callbacks (ADR-004) — production passes the real `/dev/tty` handle, tests
-    /// pass a captured buffer. Only the live `parser` carries it; `prev` (a
-    /// diff-only baseline) never runs the clipboard path, so it gets `io::sink()`.
-    ///
-    /// `base_row` is the launch cursor row (ADR-013) — the physical row grid row 0
-    /// anchors to on the primary screen, captured once by the CPR query in `main`.
+    /// `width` is the resolved initial `W`; `width_config` is kept so resize can
+    /// recompute it for the proportional path (ADR-011). `outer_supports_kitty`
+    /// clamps the child's kitty negotiation (ADR-003); `clipboard_out` is the OSC-52
+    /// sink (ADR-004). Both ride only the live `parser` — `prev` is a diff-only
+    /// baseline that runs neither the kitty nor the clipboard path. `base_row` is the
+    /// launch cursor row (ADR-013).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         width: u16,
@@ -178,10 +130,8 @@ impl Renderer {
                 0,
                 GutterCallbacks::new(false),
             ),
-            // The scroll tracker mirrors the band's geometry but carries a small
-            // bounded scrollback so vt100 records the lines that scroll off the
-            // top (ADR-013). Diff-only like `prev`, so it never runs the clipboard
-            // or kitty paths (`GutterCallbacks::new(false)`).
+            // Mirrors the band's geometry with a bounded scrollback so vt100 records
+            // the lines that scroll off the top (ADR-013). Diff-only like `prev`.
             scroll_tracker: vt100::Parser::new_with_callbacks(
                 rows,
                 width,
@@ -195,11 +145,9 @@ impl Renderer {
             left_margin: geometry::margin(layout, real_cols, width),
             // vt100 starts with the cursor visible; mirror that initial state.
             cursor_visible: true,
-            // gutter starts on the primary screen and never forces the alt screen
-            // (ADR-012) — the flag starts false, mirroring `cursor_visible`.
+            // gutter never forces the alt screen (ADR-012); start false.
             outer_alt_active: false,
-            // The inline anchor (ADR-013): grid row 0 sits at the launch cursor
-            // row, clamped into the grid so a stale/odd value can't strand it.
+            // The inline anchor (ADR-013), clamped into the grid.
             base_row: base_row.min(rows.saturating_sub(1)),
             ever_painted_inline: false,
             pty_eof_seen: false,
@@ -208,16 +156,15 @@ impl Renderer {
     }
 
     /// Read-only view of the virtual screen — for the insta snapshot and the
-    /// slice-08 equivalence gate (no production caller in this slice).
+    /// equivalence gate.
     #[allow(dead_code)]
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
     }
 
-    /// Test-only constructor at an explicit `left_margin` — the cell-walking /
-    /// CJK edge-of-band tests pin a margin directly to inspect physical columns,
-    /// without routing through a [`Layout`]/`real_cols` pair. Production builds
-    /// the margin from `geometry::margin` in [`Renderer::new`].
+    /// Test-only constructor at an explicit `left_margin`, so the cell-walk / CJK
+    /// edge-of-band tests can pin a margin directly and inspect physical columns
+    /// without routing through a [`Layout`]/`real_cols` pair.
     #[cfg(test)]
     fn at_margin(width: u16, rows: u16, left_margin: u16) -> Self {
         let mut r = Self::new(
@@ -259,30 +206,24 @@ where
     match msg {
         Msg::Pty(bytes) => {
             renderer.parser.process(&bytes);
-            // Answer the child's device queries (slice 11). `parser.process` just
-            // surfaced any `CSI c` / `CSI 5 n` / `CSI 6 n` / `CSI ? u` through
-            // `unhandled_csi`, which buffered a spec-correct reply; drain it to the
-            // PTY master with the same write+flush the key/mouse paths use below.
-            // Thread 2 owns the writer exclusively, so this adds no new sharing.
+            // Answer the child's device queries: parser.process surfaced any
+            // CSI c / CSI 5 n / CSI 6 n / CSI ? u through unhandled_csi, which
+            // buffered a spec-correct reply; drain it to the PTY master.
             let replies = renderer.parser.callbacks_mut().drain_replies();
             if !replies.is_empty() {
                 let _ = pty_writer.write_all(&replies);
                 let _ = pty_writer.flush();
             }
-            // Feed the same bytes to the scroll tracker (ADR-013) so vt100's
-            // scroll machinery captures the lines that depart the top of the
-            // W-window this frame — drained and reset in `render_once`. The live
-            // `parser` stays `scrollback=0`; the tracker is the count-based delta's
-            // source of truth, robust to a burst that turns the screen over
-            // entirely in one coalesced frame (where a grid-vs-grid diff sees no
-            // surviving overlap and would wrongly report zero).
+            // Feed the same bytes to the scroll tracker (ADR-013) so vt100's scroll
+            // machinery captures the lines that leave the top of the W-window this
+            // frame. Robust to a burst that turns the screen over in one frame, where
+            // a grid-vs-grid diff sees no surviving overlap and would report zero.
             renderer.scroll_tracker.process(&bytes);
             None
         }
         Msg::Input(crossterm::event::Event::Key(key)) => {
-            // Re-encode at the child's CURRENT kitty level (ADR-002/003). The
-            // level lives on the parser's callbacks — read lock-free because the
-            // parser and the encoder both run on this thread.
+            // Re-encode at the child's current kitty level (ADR-002/003). The level
+            // lives on the parser's callbacks — read lock-free, same thread.
             let level: keyboard::KittyLevel = renderer.parser.callbacks().kitty_state.current();
             let bytes = keyboard::encode_key(&key, level);
             if !bytes.is_empty() {
@@ -292,20 +233,16 @@ where
             None
         }
         Msg::Input(crossterm::event::Event::Resize(cols, rows)) => {
-            // The resize keystone (ADR-008 / ADR-011) — runs on THIS thread, the
-            // only owner of the parser. Param order is the trap: `(cols, rows)`
-            // here, `set_size(rows, cols)` inside.
+            // The resize handler (ADR-008/011) runs on THIS thread, the only parser
+            // owner. Param-order trap: (cols, rows) here, set_size(rows, cols) inside.
             handle_resize(renderer, resizer, term, cols, rows);
             None
         }
         Msg::Input(crossterm::event::Event::Mouse(ev)) => {
-            // The mouse forwarding gate (ADR-005). Read the child's
-            // `(mode, encoding)` from the live screen poll FIRST — this runs after
-            // every `Msg::Pty` dispatched earlier in the frame's drain applied its
-            // bytes, so a DECSET the child just sent is already visible (the poll IS
-            // the mirror point; there is no change event). The gate then translates
-            // the coordinate (live `left_margin`/`width`), down-filters motion and
-            // re-encodes SGR; only `Forward` reaches the PTY master.
+            // The mouse forwarding gate (ADR-005). Read the child's (mode, encoding)
+            // from the live screen FIRST: this runs after the frame's Msg::Pty bytes
+            // applied, so a DECSET the child just sent is already visible. The gate
+            // translates the coordinate, down-filters motion, and re-encodes SGR.
             let screen = renderer.parser.screen();
             let mode = screen.mouse_protocol_mode();
             let encoding = screen.mouse_protocol_encoding();
@@ -319,9 +256,9 @@ where
                 }
                 MouseDecision::Swallow => {}
                 MouseDecision::BailNonSgr => {
-                    // A reporting mode with a non-Sgr encoding is out of v1 scope.
-                    // Fail loud rather than feed the child a malformed SGR event
-                    // that would desync its mouse parser (ADR-005).
+                    // A reporting mode with a non-SGR encoding is out of v1 scope.
+                    // Fail loud rather than feed the child a malformed SGR event that
+                    // would desync its mouse parser (ADR-005).
                     panic!(
                         "gutter: child negotiated an unsupported non-SGR mouse \
                          encoding; SGR 1006 is the only supported encoding (v1)"
@@ -333,9 +270,8 @@ where
         // Other input events (focus/paste) are swallowed here.
         Msg::Input(_) => None,
         Msg::ChildExited(status) => Some(status.exit_code() as i32),
-        // The PTY path reached EOF — record it so the shutdown drain knows the
-        // child's final bytes have all landed (ADR-013). Carries no bytes and
-        // never triggers shutdown; the waiter stays the authoritative trigger.
+        // PTY path reached EOF — record it so the shutdown drain knows the child's
+        // final bytes have all landed (ADR-013). Never triggers shutdown.
         Msg::PtyEof => {
             renderer.pty_eof_seen = true;
             None
@@ -344,30 +280,14 @@ where
 }
 
 /// The resize handler — the ADR-008 ordering plus the ADR-011 proportional-width
-/// recompute, in one render-thread turn, in this exact sequence:
+/// recompute, in one render-thread turn. Recompute `W` → resize the PTY → resize the
+/// parser (`set_size(rows, W)` — param order is the trap) → recompute the margin →
+/// reset the diff baseline, clearing the gutter on the alt screen only.
 ///
-/// 0. **Recompute `W`** via [`geometry::resolve_width`] from the new `real_cols`.
-///    For an absolute `--width` this is the identity (a no-op); for a proportional
-///    `--width Npct` it tracks the terminal. Everything below uses the new `W`.
-/// 1. **`resizer.resize(W, rows)` FIRST** — `TIOCSWINSZ` → kernel SIGWINCH to the
-///    child. `cols` is the band width `W`, **never** `real_cols`.
-/// 2. **`parser.screen_mut().set_size(rows, W)` IMMEDIATELY** — same turn, param
-///    order `(rows, cols)`. No old-width drain (ADR-008): feeding still-in-flight
-///    old-width bytes into the resized grid is verified-safe (row-resize, wrap-flag
-///    reset, cursor/scroll/saved-pos clamp, `col_clamp`).
-/// 3. **Recompute `left_margin`** from the new `real_cols` and `W` via the shared
-///    [`geometry::margin`].
-/// 4. **Gutter clear + full repaint — primary-aware (ADR-012/013).** Both modes
-///    force a full `rows_diff` repaint by resetting the `prev` baseline to a blank
-///    grid of the new size, so the next `render_once` repaints the live band into
-///    the freshly-resized region. The two modes differ only in the **absolute**
-///    `[0, rows)` gutter clear: in the alt screen gutter owns the whole viewport,
-///    so it blanks the physical columns outside the band (a shrink can strand
-///    cells there). On the **primary** screen that absolute clear is **skipped** —
-///    gutter doesn't own the whole primary screen, so blanking outside the band
-///    would erase real shell history. The primary path narrows *what* is cleared
-///    (the band region repaints, the gutter/history is untouched); it does not
-///    reorder the ADR-008 `master.resize()` → `set_size` sequence above.
+/// The gutter clear is alt-screen only (ADR-012/013): there gutter owns the whole
+/// viewport, so it can blank cells a shrink stranded outside the band. On the primary
+/// screen that absolute clear would erase real shell history, so it is skipped — only
+/// the band region repaints.
 fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     renderer: &mut Renderer,
     resizer: &R,
@@ -390,137 +310,74 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     // Step 3 — recompute the left margin from the new real_cols and W.
     renderer.left_margin = geometry::margin(renderer.layout, cols, w);
 
-    // Clamp the inline anchor (ADR-013): a width-only drag keeps `base_row` (it is
-    // already within the grid, so the `min` is a no-op); a height shrink could
-    // otherwise strand grid row 0 below the new bottom, so clamp it back on-screen.
-    // A mid-run CPR re-query is impossible (the input thread owns the reply), so
-    // this is the best-effort clamp; the next frame's make-room scroll finishes
-    // pushing any overshooting content up. The clamp narrows *what* the resize
-    // recomputes — it does not touch the ADR-008 `master.resize()` → `set_size`
-    // order above.
+    // Clamp the inline anchor (ADR-013): a height shrink could strand grid row 0
+    // below the new bottom, so clamp it back on-screen. The next frame's make-room
+    // scroll finishes pushing any overshoot up.
     renderer.base_row = renderer.base_row.min(rows.saturating_sub(1));
 
-    // Step 4 — primary-aware gutter clear + full repaint (ADR-012/013). The
-    // absolute `[0, rows)` gutter clear is alt-screen only: there gutter owns the
-    // whole viewport, so blanking the stranded gutter cells is safe. On the
-    // primary screen it would reach rows outside the band that hold real shell
-    // history, so it is skipped.
+    // Step 4 — gutter clear is alt-screen only (ADR-012/013); on the primary screen
+    // it would reach rows holding real shell history.
     if renderer.outer_alt_active {
-        // Step 4a — clear the physical gutter columns (cells stranded by a shrink).
         let _ = term.clear_gutter(renderer.left_margin, w, cols, rows);
     }
 
-    // Step 4b — force a full repaint next frame in BOTH modes: reset the diff
-    // baseline to a blank grid of the new size so `rows_diff` repaints every row
-    // into the freshly-resized band. On the primary screen this repaints only the
-    // live band region (`[margin, margin + W)` over rows `[0, rows)`) — it never
-    // blanks the gutter, so real shell history is untouched. (The render_once that
-    // follows this turn does the actual paint.)
+    // Force a full repaint next frame: reset the diff baseline to a blank grid of the
+    // new size so rows_diff re-emits every row into the resized band.
     renderer.reset_prev_baseline();
 }
 
 /// Paint the current virtual grid to the outer terminal at the band's offset
-/// (ADR-006), mirroring the child's screen mode onto the outer terminal first
-/// (ADR-012). The ONLY place `rows_diff` and `move_to`/`place_cursor` are
-/// called — cursor repositioning does NOT live in the channel code.
+/// (ADR-006), mirroring the child's screen mode first (ADR-012). The only place
+/// `rows_diff` and the cursor moves are emitted.
 ///
-/// **Mode mirror (ADR-012).** Before painting, read the child's
-/// `alternate_screen()` and edge-trigger the outer alt screen against it (the
-/// `cursor_visible` de-dupe pattern): enter/leave the outer alt screen only on a
-/// real edge, and on an alt→primary edge drop the diff baseline so the primary
-/// screen is repainted whole rather than diffed against the stale alt frame.
-///
-/// **Inline anchor + make-room (ADR-013).** On the primary screen the band is
-/// painted at `base_row + grid_row`, so it grows downward from the launch row
-/// rather than overpainting the scrollback above it. Before the paint, if the
-/// band's deepest live row would run past the bottom of the screen, the real
-/// terminal is scrolled up by the overshoot (a `newline()` per line, pushing
-/// history into the terminal's own scrollback) and `base_row` drops by the same
-/// amount, floored at 0. By the time the grid is full `base_row` is exactly 0 and
-/// the scroll-emit branch below takes over, unchanged. The alt paint is always at
-/// offset 0 — `base_row` is frozen across an alt excursion.
-///
-/// **Scroll emit (ADR-013, the primary screen only).** On the primary screen,
-/// drain the lines that scrolled off the top of the W-window this frame from the
-/// scroll tracker ([`Renderer::drain_scrolled_off`]). If any departed, paint the
-/// frame as a scrolling stream ([`emit_scroll_stream`]): `departed ++ band` printed
-/// top-down the band column, so the terminal's own scrolling carries exactly the
-/// departed lines into its **own** scrollback and leaves the current band visible.
-/// The count is the single correctness obligation the idempotent alt frame never
-/// had: under ADR-007 coalescing many lines advance in one frame, so emitting one
-/// line per frame would silently drop scrollback. The tracker carries the count via
-/// vt100's own scroll machinery, so a burst that turns the whole screen over in one
-/// frame — leaving no surviving overlap row a grid-diff could witness — still lands
-/// every departed line. When nothing departed, the ordinary per-row `rows_diff`
-/// paint runs instead. The alt screen never scrolls the outer terminal, so the
-/// scroll path is gated on the primary branch.
-///
-/// **Paint (the non-scroll path).** For each visible row, emit our own
-/// `move_to(left_margin, row)` then that row's `rows_diff` byte run (which carries
-/// its own intra-row SGR and relative cursor moves, scoped to `[0, W)`, so it
-/// paints into physical columns `[margin, margin + W)` and never past `margin + W`
-/// — vt100's margin rule guarantees the grid is exactly `W` columns). Empty diffs
-/// (unchanged rows) are skipped. This is the path for both an alt frame (a fixed
-/// `[0, rows)` viewport that never scrolls the outer terminal) and a primary frame
-/// that did not scroll; a primary frame that scrolled paints via the scroll stream
-/// above instead, which also lands the band at physical rows `[0, rows)`.
-///
-/// After the repaint, mirror the child's cursor visibility and reposition the
-/// real cursor at `base_row + grid_cursor_row` (offset 0 in the alt screen).
+/// Mirror the child's alt-screen state (edge-triggered). On the primary screen, paint
+/// at `base_row + grid_row` so the band grows downward from the launch row, scrolling
+/// the real terminal up to make room as it fills (ADR-013). Lines that left the top of
+/// the W-window this frame are streamed into the terminal's own scrollback via
+/// [`emit_scroll_stream`]; otherwise each changed row repaints in place. Finally mirror
+/// the cursor visibility/shape and reposition the real cursor inside the band.
 fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
-    // Mode mirror (ADR-012): edge-trigger the outer alt screen against the
-    // child's. Read the flag before the long immutable borrow of `screen` below.
+    // Mirror the child's alt-screen state (ADR-012), edge-triggered. Read the flag
+    // before the long immutable borrow of `screen` below.
     let child_alt = renderer.parser.screen().alternate_screen();
     if child_alt != renderer.outer_alt_active {
         if child_alt {
             term.enter_alt_screen()?;
         } else {
             term.leave_alt_screen()?;
-            // An alt→primary edge lands us on a fresh primary screen; the cached
-            // alt frame is not a valid diff baseline, so force a full repaint.
+            // An alt→primary edge lands on a fresh primary screen; the cached alt
+            // frame is not a valid diff baseline, so force a full repaint.
             renderer.reset_prev_baseline();
         }
         renderer.outer_alt_active = child_alt;
     }
 
-    // Scroll emit (ADR-013): on the primary screen, advance each line that
-    // scrolled off the top of the W-window this frame into the real terminal's
-    // own scrollback. The departed lines (with their real content, in order) come
-    // from the scroll tracker — robust to a coalesced burst that turned the whole
-    // screen over in one frame, where the lines that left were never on a painted
-    // grid. The alt screen never scrolls the outer terminal, so this is gated on
-    // the primary branch.
+    // Scroll emit (ADR-013): on the primary screen, advance each line that left the
+    // top of the W-window this frame into the terminal's own scrollback. The alt
+    // screen never scrolls the outer terminal, so this is gated on the primary branch.
     let departed = if renderer.outer_alt_active {
-        // Reset the tracker (keep it tracking the live grid) without emitting — an
-        // alt frame must drop any scroll the tracker saw, never advance the outer
-        // terminal.
+        // Reset the tracker without emitting — an alt frame must drop any scroll the
+        // tracker saw, never advance the outer terminal.
         renderer.drain_scrolled_off();
         Vec::new()
     } else {
         renderer.drain_scrolled_off()
     };
 
-    // Make room as the band grows inline (ADR-013, the primary screen only). If
-    // the deepest live grid row would run past the bottom of the screen, scroll
-    // the real terminal up by the overshoot — a `newline()` per line, so the
-    // history above the band enters the terminal's own scrollback — and drop
-    // `base_row` by the same delta (it can never exceed `base_row`, since the
-    // deepest row is at most `real_rows - 1`). Scrolling the terminal up by `delta`
-    // shifts every already-painted band row up by the same `delta`, so the
-    // diff-skipped (unchanged) rows are already at their correct new physical
-    // position and only the changed rows repaint below. When the grid is full this
-    // has driven `base_row` to exactly 0 and the scroll-emit branch owns the rest.
+    // Make room as the band grows inline (ADR-013, primary only). If the deepest live
+    // row would run past the bottom, scroll the real terminal up by the overshoot (a
+    // newline per line, pushing history into the terminal's own scrollback) and drop
+    // base_row by the same delta. Scrolling up by delta shifts every already-painted
+    // row up too, so the diff-skipped rows are already in place and only changed rows
+    // repaint. When the grid is full this has driven base_row to 0.
     if !renderer.outer_alt_active && renderer.base_row > 0 {
         let real_rows = renderer.parser.screen().size().0;
-        // A non-empty `departed` proves vt100's W-window filled and scrolled
-        // internally this frame, which can only happen once the band spans the
-        // whole screen — so `base_row` MUST reach 0 before the scroll-emit branch
-        // paints `[0, rows)`, or that paint overwrites the pre-launch history above
-        // the launch row instead of leaving it in scrollback. The settled grid can
-        // read near-blank here (a coalesced `seq … ; clear` in one frame), so the
-        // deepest-live-row overshoot would under-scroll; the departed signal is the
-        // authority. Scrolling the full remaining `base_row` pushes exactly that
-        // history into scrollback and drives `base_row` to 0.
+        // A non-empty `departed` proves vt100's W-window filled and scrolled this
+        // frame, which only happens once the band spans the whole screen — so base_row
+        // MUST reach 0 before the scroll-emit branch paints [0, rows), or it overwrites
+        // the pre-launch history. The settled grid can read near-blank (a coalesced
+        // seq … clear in one frame), so the overshoot would under-scroll; the departed
+        // signal is the authority, and scrolling the full base_row drives it to 0.
         let delta = if departed.is_empty() {
             let bottom = renderer.deepest_live_row();
             renderer
@@ -543,9 +400,8 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
     let offset = if renderer.outer_alt_active { 0 } else { renderer.base_row };
 
     if departed.is_empty() {
-        // No scroll: the ordinary per-row diff paint (in-place edits, a filling
-        // screen, an alt frame, an unchanged screen). Only the rows that changed
-        // since the last frame are re-emitted, at `offset + row`.
+        // No scroll: the ordinary per-row diff paint. Only rows changed since the last
+        // frame are re-emitted, at offset + row.
         let mut painted = false;
         let screen = renderer.parser.screen();
         let prev_screen = renderer.prev.screen();
@@ -558,19 +414,16 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
             term.write_row(&prepare_row(&line, renderer.width))?;
             painted = true;
         }
-        // Record that inline content reached the primary screen, so teardown knows
-        // to hand back below the band (and a straight-to-alt TUI does not).
+        // Record that inline content reached the primary screen, so teardown hands
+        // back below the band (ADR-013).
         if painted && !renderer.outer_alt_active {
             renderer.ever_painted_inline = true;
         }
     } else {
-        // A scroll happened (provably at `base_row == 0`): stream the departed
-        // lines followed by the current band down the band, letting the terminal's
-        // own scrolling carry exactly the `departed` lines into its scrollback
-        // (count-based, robust to a full-screen turnover) and leave the current band
-        // visible. `sync_prev` below then baselines `prev` to the painted band. This
-        // replaces the diff paint for this frame: the stream already painted every
-        // visible row, and the band reaches the primary screen so the hand-back runs.
+        // A scroll happened (provably at base_row == 0): stream the departed lines
+        // then the current band down the band column, letting the terminal's own
+        // scrolling carry the departed lines into scrollback. Replaces the diff paint
+        // this frame.
         emit_scroll_stream(renderer, term, &departed)?;
         renderer.ever_painted_inline = true;
     }
@@ -586,9 +439,8 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
         renderer.cursor_visible = visible;
     }
 
-    // Mirror DECSCUSR cursor shape (slice 08): the watcher on the shared
-    // callbacks recorded any `CSI Ps SP q` the child emitted; emit the matching
-    // sequence to the outer terminal only on a real change (the watcher de-dupes).
+    // Mirror DECSCUSR cursor shape: the callbacks watcher recorded any CSI Ps SP q the
+    // child emitted; emit it to the outer terminal, de-duped by the watcher.
     if let Some(shape) = renderer.parser.callbacks_mut().cursor_shape.take_pending() {
         term.set_cursor_shape(&shape)?;
     }
@@ -601,20 +453,16 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
 
     term.flush()?;
 
-    // The current screen becomes the baseline for the next frame's diff. vt100
-    // has no clone, so re-process the formatted state into `prev`. Cheap: it is
-    // a single in-memory grid replay, not per-frame allocation churn at scale.
+    // The current screen becomes the next frame's diff baseline. vt100 has no clone,
+    // so re-process the formatted state into prev — a cheap in-memory replay.
     renderer.sync_prev();
     Ok(())
 }
 
-/// Make a vt100 row run **self-contained within its `W`-wide, margin-offset
-/// rectangle** before it is painted (slice 09, ADR-014). Two transforms, in
-/// order: prepend `ESC[m` so the run no longer inherits whatever attribute the
-/// previous row left live across the bare `move_to` (the vertical bleed), and
-/// clip the row-final `ESC[K` to column `W` so its erase-to-right-edge cannot
-/// flood the gutter (the horizontal overflow). vt100 stays the single source of
-/// serialisation truth — this only bounds the one unbounded sequence it emits.
+/// Make a vt100 row run self-contained within its `W`-wide, margin-offset rectangle
+/// before painting (ADR-014): prepend `ESC[m` so it doesn't inherit the previous row's
+/// trailing attribute across the bare `move_to`, and clip the row-final `ESC[K` to
+/// column `W` so its erase can't flood the gutter.
 fn prepare_row(line: &[u8], width: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(line.len() + 3);
     out.extend_from_slice(b"\x1b[m");
@@ -622,31 +470,17 @@ fn prepare_row(line: &[u8], width: u16) -> Vec<u8> {
     out
 }
 
-/// Paint a scrolling frame: stream the `departed` lines followed by the current
-/// band down the band column, so the terminal's own scrolling carries exactly the
-/// departed lines into its scrollback and leaves the current band visible
-/// (ADR-013, the primary screen only). `departed` is the count-based,
-/// content-bearing run from the scroll tracker (oldest first) — robust to a
-/// coalesced burst that turned the whole screen over in one frame, where the lines
-/// that left were never on any painted grid (a grid-overlap delta would see no
-/// surviving rows and report 0, dropping the burst).
+/// Paint a scrolling frame: stream the `departed` lines then the current band down the
+/// band column, so the terminal's own scrolling carries the departed lines into its
+/// scrollback and leaves the band visible (ADR-013, primary only). `departed` is the
+/// count-bearing run from the scroll tracker, oldest first — robust to a coalesced
+/// burst that turned the whole screen over in one frame.
 ///
-/// The stream is `departed ++ band` (`delta + rows` lines). It is painted as a
-/// genuine top-down print: the first `rows` lines fill rows `[0, rows)` in place
-/// (overwriting whatever the previous frame left, so pre-existing screen content
-/// never leaks into scrollback), and each line beyond the bottom is preceded by a
-/// `newline()` that scrolls one row off the top into the terminal's own scrollback
-/// before writing the new line at the bottom. After the whole stream, the last
-/// `rows` lines (the band) are visible and exactly the first `delta` lines (the
-/// departed run) have entered scrollback, in order — the count-based obligation
-/// (ADR-007/013) a one-per-frame or witnessed-overlap delta could not meet, and
-/// without the per-frame band re-streaming that would bury early lines deep in
-/// scrollback.
-///
-/// Only the band columns `[margin, margin + W)` are written (each line is
-/// re-positioned to the margin); each `\r\n` scrolls the whole physical row, so any
-/// real shell history in the gutter scrolls up naturally — gutter never blanks or
-/// rewrites the gutter columns.
+/// The stream is `departed ++ band`. The first `rows` lines fill rows `[0, rows)` in
+/// place (so nothing pre-existing leaks into scrollback); each line beyond the bottom
+/// is preceded by a `newline()` that scrolls one row off the top before the new line is
+/// written at the bottom. Only the band columns are written; each `\r\n` scrolls the
+/// whole physical row, so any shell history in the gutter scrolls up with it.
 fn emit_scroll_stream<T: OuterTerminal>(
     renderer: &Renderer,
     term: &mut T,
@@ -663,12 +497,10 @@ fn emit_scroll_stream<T: OuterTerminal>(
     for (i, line) in departed.iter().chain(band.iter()).enumerate() {
         let i = i as u16;
         if i <= bottom {
-            // Still filling the initial screen top-down — overwrite row `i` in
-            // place, no scroll yet (so nothing pre-existing leaks into scrollback).
+            // Still filling the screen top-down — overwrite row i in place, no scroll.
             term.move_to(renderer.left_margin, i)?;
         } else {
-            // Past the bottom: scroll one row into the terminal's own scrollback,
-            // then write the new line at the bottom.
+            // Past the bottom: scroll one row into scrollback, then write at the bottom.
             term.newline()?;
             term.move_to(renderer.left_margin, bottom)?;
         }
@@ -677,50 +509,19 @@ fn emit_scroll_stream<T: OuterTerminal>(
     Ok(())
 }
 
-/// The cell-walking **fallback** repaint (ADR-006). Taken when an app emits
-/// absolute-column positioning the per-row `rows_diff` can't safely represent;
-/// here gutter walks the grid cell-by-cell and paints each cell at its physical
-/// column `left_margin + col` rather than trusting a relative byte run.
+/// The cell-walking **fallback** repaint (ADR-006), dormant by decision: gutter renders
+/// via the `rows_diff` path only, and there is no production caller. Walks the grid
+/// cell-by-cell and paints each cell at its physical column `left_margin + col`. Kept
+/// correct and exercised by the cell-walk edge-of-band tests as insurance against a
+/// corrupting cell the design believes the margin rule prevents.
 ///
-/// This is the **only** place in the whole binary that calls
-/// [`vt100::Cell::is_wide_continuation`]. A double-width glyph occupies two grid
-/// cells: a lead cell (`is_wide()`, holding the glyph in `contents()`) and a
-/// continuation cell (`is_wide_continuation()`, byte-length zero so
-/// `contents()` is `""`). We `continue` past the continuation cell **before**
-/// any `move_to`/emit — verified safe in `cell.rs` (skipping the empty cell
-/// loses nothing), and important: a spurious `move_to` to the continuation
-/// column would itself be a defect even with no byte after it.
-///
-/// No double-advance: the lead cell's glyph already spans two physical columns,
-/// so we read the display width from the lead cell and let the loop's natural
-/// `col += 1` over the continuation cell (which we skip) account for the second
-/// column — we never advance the physical cursor twice for one glyph, and we
-/// never paint the lead glyph's right half into `left_margin + W`.
-///
-/// **Dormant by decision (A1, iteration-02).** gutter renders via the primary
-/// `rows_diff` path *only*; right-edge safety rests on vt100's margin rule, not
-/// on this walk (ADR-006: `text()` wraps a wide glyph rather than placing its
-/// lead at `W-1`, so nothing ever paints past `margin + W`). This function is
-/// tested-but-dormant insurance against a corrupting cell the design believes
-/// cannot occur on the live path — so it has no production caller, and no branch
-/// chooser is wired (no `if`/`match` at the `render_once` call site, no config
-/// toggle, no per-frame heuristic). The reason it stays dormant rather than live
-/// is that there is **no runtime signal** to feed a chooser: `rows_diff` returns
-/// relative byte runs and never flags an unsafe frame, the `Renderer` carries no
-/// such flag, and vt100 exposes no "`rows_diff` is unsafe here" predicate. A
-/// chooser today would have no honest input.
-///
-/// What would make it live: a corrupting cell actually observed on the live
-/// `rows_diff` path — most plausibly surfaced by the A2 wide-edge equivalence
-/// fixture (slice 06), the CJK/emoji-at-band-edge `.cast` designed to put real
-/// pressure on vt100's margin rule. If that fixture ever produces a corrupting
-/// cell, A1 reopens with a concrete reason and a known trigger, and only the
-/// chooser/refactor remains: wiring it live would mean factoring the
-/// cursor-mirroring/baseline-sync tail out of `render_once` to share it (this
-/// function takes `(screen, left_margin, width, term)` directly and neither
-/// mirrors the cursor nor updates the diff baseline) and inventing the decision
-/// input that does not exist today. Until then, the fallback is kept correct and
-/// ready, exercised by the cell-walking edge-of-band tests.
+/// The only place in the binary that calls [`vt100::Cell::is_wide_continuation`]. A
+/// double-width glyph occupies a lead cell (holding the glyph) and a continuation cell
+/// (byte-length zero). We skip the continuation cell BEFORE any move/emit: skipping the
+/// empty cell loses nothing, and a `move_to` to its column would itself be a defect. The
+/// lead cell owns the glyph's full width, so the loop's natural `col += 1` over the
+/// skipped continuation accounts for the second column — we never advance twice for one
+/// glyph, and never paint a lead glyph's right half into `left_margin + W`.
 #[allow(dead_code)]
 fn render_cell_walk<T: OuterTerminal>(
     screen: &vt100::Screen,
@@ -735,25 +536,17 @@ fn render_cell_walk<T: OuterTerminal>(
                 continue;
             };
             // The continuation half of a wide glyph: skip BEFORE any move/emit.
-            // Its `contents()` is "" (byte-length zero), so skipping loses
-            // nothing, and a `move_to` to its column would be a spurious defect.
             if cell.is_wide_continuation() {
                 continue;
             }
-            // Blank cells need no paint — the grid started clear and the gutter
-            // clear (slice 05) owns the empties; emitting here would be churn.
+            // Blank cells need no paint — the grid started clear and the gutter clear
+            // owns the empties.
             let contents = cell.contents();
             if contents.is_empty() {
                 continue;
             }
-            // Paint the (possibly wide) cell at its physical column. The lead
-            // cell carries the whole glyph; its display width is owned by the
-            // lead cell, so the following continuation cell — skipped above —
-            // is never separately advanced. The glyph's right half lands at
-            // `left_margin + col + 1`, which for a lead cell at the last in-band
-            // column (`col == W - 1`) vt100 never produces — a wide glyph that
-            // wouldn't fit is wrapped to the next row, so the lead cell is at
-            // most `col == W - 2` and `left_margin + W` is never painted.
+            // Paint the (possibly wide) cell at its physical column. vt100 never places
+            // a wide lead at W-1, so the glyph's right half never lands at left_margin+W.
             term.move_to(geometry::physical_col(left_margin, col), row)?;
             term.write_row(contents.as_bytes())?;
         }
@@ -769,51 +562,35 @@ impl Renderer {
     /// a full state replay that leaves `prev` cell-identical to `parser`.
     fn sync_prev(&mut self) {
         let formatted = self.parser.screen().contents_formatted();
-        // Reset prev to a blank grid of the same size, then replay, so stale
-        // cells from a shrunk region don't linger. `set_size` is cheap and
-        // clears wrap flags; the formatted replay repaints the live content.
+        // Reset prev to a blank grid of the same size before replaying, so stale cells
+        // from a shrunk region don't linger.
         let (rows, cols) = self.parser.screen().size();
         self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::new(false));
         self.prev.process(&formatted);
     }
 
-    /// Drop the diff baseline to a blank grid of the live size, so the next
-    /// `rows_diff` differs on every non-empty row and forces a full repaint.
-    /// Used on resize (ADR-008 step 4): after `set_size` the band geometry
-    /// changed, so the cached previous frame is no longer a valid diff baseline.
-    ///
-    /// The scroll tracker is re-seeded to the live grid at the new size too, so it
-    /// keeps mirroring the live content and its scrollback detection stays sound
-    /// across the resize / the alt→primary edge that triggers this.
+    /// Drop the diff baseline to a blank grid of the live size, so the next rows_diff
+    /// differs on every non-empty row and forces a full repaint (resize, ADR-008 step 5;
+    /// the alt→primary edge). Re-seeds the scroll tracker to the live grid too, so its
+    /// scroll detection stays sound across the change.
     fn reset_prev_baseline(&mut self) {
         let (rows, cols) = self.parser.screen().size();
         self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::new(false));
         self.reset_scroll_tracker();
     }
 
-    /// Drain the lines that scrolled off the top of the W-window this frame from
-    /// the scroll tracker (ADR-013), then reset the tracker to the live grid so
-    /// it starts the next frame with an empty scrollback (bounded memory).
+    /// Drain the lines that left the top of the W-window this frame from the scroll
+    /// tracker (ADR-013), then reset the tracker to the live grid so it starts the next
+    /// frame with empty scrollback. Returns them formatted, oldest first.
     ///
-    /// The tracker carries the **same** content as the live grid but with a small
-    /// bounded scrollback, so vt100's own scroll machinery has captured exactly
-    /// the departed lines — even across a coalesced burst that turned the screen
-    /// over entirely (the live `parser`, `scrollback=0`, dropped them; a grid-vs-
-    /// grid overlap heuristic would see no surviving rows and wrongly report
-    /// nothing). The lines are returned formatted, oldest first, ready for the
-    /// scrolling-band emit.
-    ///
-    /// Reading walks the tracker's scrollback offsets from deepest to one: at
-    /// offset `k` the row that is `k` lines above the current top sits at grid
-    /// row 0, so the top row at offsets `n..=1` yields the `n` departed lines in
-    /// order. The reset re-seeds the tracker from the live grid's formatted
-    /// contents, which leaves its scrollback empty — the same recreate-from-grid
-    /// pattern `sync_prev` uses for the diff baseline.
+    /// vt100 exposes no scrollback-length accessor, so probe it by clamping the offset
+    /// to its max. At offset `k` the row `k` lines above the current top sits at grid
+    /// row 0, so reading the top row at offsets `n..=1` yields the `n` departed lines in
+    /// order.
     fn drain_scrolled_off(&mut self) -> Vec<Vec<u8>> {
         let width = self.width;
-        // The tracker started this frame with an empty scrollback, so its current
-        // scrollback length is exactly the lines that departed this frame. vt100
-        // has no length accessor; probe by clamping the offset to its maximum.
+        // The tracker started this frame with empty scrollback, so its current length is
+        // exactly the lines that departed. No length accessor — clamp to probe it.
         self.scroll_tracker.screen_mut().set_scrollback(usize::MAX);
         let n = self.scroll_tracker.screen().scrollback();
 
@@ -827,9 +604,7 @@ impl Renderer {
         }
         self.scroll_tracker.screen_mut().set_scrollback(0);
 
-        // Reset the tracker to the live grid: re-seed from the current formatted
-        // contents so its scrollback is empty again for the next frame. Keeps the
-        // bounded scrollback so the next frame's scroll is captured the same way.
+        // Reset the tracker to the live grid: empty scrollback again for the next frame.
         self.reset_scroll_tracker();
         departed
     }
@@ -849,15 +624,13 @@ impl Renderer {
         self.scroll_tracker.process(&formatted);
     }
 
-    /// The deepest grid row holding live content this frame: whichever reaches
-    /// further down, the cursor row or the last non-blank row. Drives the make-room overshoot
-    /// (ADR-013) and the teardown hand-back — both need to know how far down the
-    /// band actually reaches, not just where the cursor sits.
+    /// The deepest grid row holding live content this frame — whichever reaches further
+    /// down, the cursor row or the last non-blank row. Drives the make-room overshoot
+    /// (ADR-013) and the teardown hand-back.
     ///
-    /// "Live" is a **cell** property, not a text one: a full-width reverse-video
-    /// status bar erased under a background SGR carries no glyphs (its row text is
-    /// blank), so a text-only scan would miss it and under-scroll. Scan the rows
-    /// from the bottom up and stop at the first that holds any live cell.
+    /// "Live" is a cell property, not a text one: a reverse-video status bar erased under
+    /// a background SGR carries no glyphs, so a text-only scan would miss it and
+    /// under-scroll. Scan from the bottom up to the first row holding any live cell.
     fn deepest_live_row(&self) -> u16 {
         let screen = self.parser.screen();
         let (crow, _) = screen.cursor_position();
@@ -873,10 +646,10 @@ impl Renderer {
     }
 }
 
-/// Whether a vt100 cell carries anything the band must keep on-screen: a glyph
-/// (any non-space content) or a non-default visual attribute. The attribute arm
-/// is what catches an erased reverse-video status bar — a coloured background with
-/// no glyphs, which a content-only read calls blank.
+/// Whether a vt100 cell carries anything the band must keep on-screen: a glyph or a
+/// non-default visual attribute. The attribute arm catches an erased reverse-video
+/// status bar — a coloured background with no glyphs, which a content-only read would
+/// call blank.
 fn cell_is_live(cell: &vt100::Cell) -> bool {
     let c = cell.contents();
     (!c.is_empty() && c != " ")
@@ -935,10 +708,9 @@ where
         // --- Phase B: drain to the deadline ---
         if !shutdown {
             loop {
-                // MANDATORY explicit burst-exit check (ADR-007). NOT redundant
-                // with the Timeout arm: under a saturating burst `recv_until`
-                // returns `Msg` forever and never `Timeout`, so without this
-                // the render is deferred for the whole burst.
+                // MANDATORY explicit burst-exit check (ADR-007): NOT redundant with the
+                // Timeout arm. Under a saturating burst recv_until returns Msg forever
+                // and never Timeout, so without this the render is deferred all burst.
                 if clock.now() >= deadline {
                     break;
                 }
@@ -968,37 +740,27 @@ where
         }
     }
 
-    // Explicit ordered restore BEFORE process::exit (ADR-010). `process::exit`
-    // runs no destructors, so this cannot be a Drop guard. The exit code is
-    // threaded in so the dim status line draws from the same value `run` returns
-    // to `main` — `None` (channel disconnected without a `ChildExited`) maps to a
-    // clean exit, so it suppresses the status line just like a zero exit. The
-    // renderer is passed so teardown can read the outer alt state (conditional
-    // leave) and the inline anchor (the hand-back below the band) — ADR-012/013.
+    // Explicit ordered restore BEFORE process::exit (ADR-010): process::exit runs no
+    // destructors, so this can't be a Drop guard. The exit code feeds the dim status
+    // line; None (channel disconnected without a ChildExited) maps to a clean exit. The
+    // renderer is read for the alt state and the inline anchor (ADR-012/013).
     let _ = run_teardown(renderer, term, exit_code.unwrap_or(0));
     exit_code
 }
 
-/// On a child-exit shutdown, give the PTY path a bounded chance to deliver its
-/// final bytes before teardown reads `outer_alt_active` (ADR-013, the teardown race).
+/// On a child-exit shutdown, give the PTY path a bounded chance to deliver its final
+/// bytes before teardown reads `outer_alt_active` (ADR-013, the teardown race).
 ///
-/// The waiter (Thread 4) and the PTY reader (Thread 1) race with no ordering
-/// guarantee, so the child's last frame — e.g. the `?1049h` of a TUI that exits the
-/// instant it enters the alt screen — can still be queued behind the `ChildExited`,
-/// or not yet read off the master, when shutdown fires. A plain "render the frame
-/// and tear down" would miss it: `outer_alt_active` would read `false` and teardown
-/// would take the inline hand-back instead of leaving the alt screen (no `?1049l`).
+/// The waiter and the PTY reader race with no ordering guarantee, so the child's last
+/// frame — e.g. the `?1049h` of a TUI that exits the instant it enters the alt screen —
+/// can still be queued behind the `ChildExited`. Without this drain `outer_alt_active`
+/// would read false and teardown would take the inline hand-back instead of leaving the
+/// alt screen.
 ///
-/// So dispatch every remaining `Msg` until the PTY forwarder's `Msg::PtyEof` sentinel
-/// arrives — the deterministic common case, guaranteed to follow every `Msg::Pty`
-/// by same-thread FIFO ordering — or the channel disconnects, or the grace cap
-/// elapses. If `PtyEof` was already seen earlier, there are no stragglers and this
-/// returns at once. The grace cap ([`TEARDOWN_DRAIN_GRACE`]) is the backstop for a
-/// grandchild holding the PTY slave open, so the master never EOFs and the sentinel
-/// never comes — without it the drain would block forever.
-///
-/// Any shutdown code a dispatched message returns is ignored here: we are already
-/// shutting down, and `PtyEof` (the only message that matters) returns `None`.
+/// So dispatch every remaining message until the `Msg::PtyEof` sentinel arrives (the
+/// common case, guaranteed to follow every `Msg::Pty` by same-thread FIFO), or the
+/// channel disconnects, or the grace cap elapses. The cap ([`TEARDOWN_DRAIN_GRACE`]) is
+/// the backstop for a grandchild holding the slave open so the master never EOFs.
 fn drain_pty_path<C, T, P, R>(
     clock: &mut C,
     renderer: &mut Renderer,
@@ -1029,32 +791,15 @@ fn drain_pty_path<C, T, P, R>(
     }
 }
 
-/// The explicit, ordered terminal restore (ADR-010), now mode-aware (ADR-012/013):
-/// **conditional** alt-leave / inline hand-back → pop kitty flags → disable mouse
-/// → show cursor → disable raw mode. Each step undoes only what was actually set up
-/// (conditional alt-leave, kitty pop, mouse disable).
+/// The explicit, ordered terminal restore (ADR-010), mode-aware (ADR-012/013):
+/// conditional alt-leave / inline hand-back → pop kitty flags → disable mouse → show
+/// cursor → disable raw mode. Each step undoes only what was actually set up.
 ///
-/// **Discriminator: the live `outer_alt_active` (ADR-013).** A child that exits
-/// **in** the alt screen keeps today's leave-alt path — the load-bearing ADR-010
-/// invariant (alt-leave before raw-disable) is preserved. A child that exits
-/// **inline** hands back below the band instead: its output is already on the
-/// primary screen, so teardown only drops the cursor to a fresh line below it.
-///
-/// **Inline hand-back, gated on `ever_painted_inline` alone.** A plain command's
-/// band is painted in place (at `base_row + grid_row`), so there is nothing to
-/// replay — the hand-back just moves the cursor to a fresh line below the band's
-/// last content and, on a non-zero exit, prints the dim `Exited with: N` status line
-/// there, so the parent shell's next prompt resumes below the output rather than on
-/// top of it (slice 02). Gating on the positive `ever_painted_inline` signal (which
-/// replaced ADR-012's `ever_entered_alt` latch) means the status line surfaces only
-/// when inline content actually reached the primary screen: `gutter vim` — straight
-/// into the alt screen and back out, never showing inline content — leaves nothing,
-/// and crucially so does a TUI that drops back to the primary screen (`?1049l`) with
-/// no inline content and then exits non-zero, which an `exit_code != 0` arm would
-/// have stamped a stray status line onto. The exit code is consulted only *inside*
-/// the hand-back, so the status is shown exactly when a non-zero exit followed real
-/// inline output. A child that exits *in* alt is caught by the first branch, so a
-/// TUI crashing on the alt screen stays silent regardless of code.
+/// The discriminator is the live `outer_alt_active`: a child that exits in the alt
+/// screen takes the leave-alt path; one that exits inline hands back below the band. The
+/// hand-back is gated on `ever_painted_inline` alone, so a TUI that dropped back to the
+/// primary screen without ever painting inline (even on a non-zero exit) leaves no stray
+/// status line. The exit code is consulted only inside the hand-back.
 fn run_teardown<T: OuterTerminal>(
     renderer: &Renderer,
     term: &mut T,
@@ -1072,19 +817,16 @@ fn run_teardown<T: OuterTerminal>(
     Ok(())
 }
 
-/// The inline hand-back (ADR-013): drop the cursor to a fresh line **below** the
-/// band's last content, then — on a **non-zero** exit only — print the dim
-/// `Exited with: N` status line there (slice 02). The band is already painted in
-/// place on the primary screen, so there is no replay; this only repositions the
-/// cursor so the parent shell's next prompt resumes below the output.
+/// The inline hand-back (ADR-013): drop the cursor to a fresh line below the band's last
+/// content, then — on a non-zero exit only — print the dim `Exited with: N` status line
+/// there. The band is already painted in place, so there is no replay; this only
+/// repositions the cursor so the shell's next prompt resumes below the output.
 ///
-/// The band's last content sits at physical row `base_row + deepest_live_row`
-/// (clamped to the bottom). A `newline()` from there lands the cursor on a fresh
-/// line below it, scrolling the terminal when the band already reaches the bottom
-/// (so the line is real, not an overwrite of the band). On a non-zero exit the dim
-/// status's own leading `\r\n` does that line break instead and writes the status
-/// below the band. No explicit flush: the queued bytes are drained by the
-/// `show_cursor` flush later in `run_teardown`, so teardown emits one terminal flush.
+/// The band's last content sits at physical row `base_row + deepest_live_row` (clamped
+/// to the bottom). A `newline()` from there lands a fresh line below it, scrolling the
+/// terminal when the band already reaches the bottom; on a non-zero exit the dim status's
+/// own leading `\r\n` does that line break instead. No explicit flush: the queued bytes
+/// are drained by the `show_cursor` flush later in `run_teardown`.
 fn hand_back_inline<T: OuterTerminal>(
     renderer: &Renderer,
     term: &mut T,
@@ -1104,13 +846,10 @@ fn hand_back_inline<T: OuterTerminal>(
     Ok(())
 }
 
-/// Emit the dim `Exited with: N` status line below the band, on a **non-zero**
-/// exit only — success is silent (a zero exit emits nothing). The leading `\r\n`
-/// drops the status onto a fresh line below the band's last content (scrolling the
-/// primary screen if it was at the bottom), as a normal command's trailing output
-/// would, rather than overwriting the last band row. The dim SGR (`\x1b[2m`) and
-/// reset (`\x1b[0m`) ride the existing `write_row` as plain bytes — no new trait
-/// method. Called only from the inline hand-back (ADR-013).
+/// Emit the dim `Exited with: N` status line below the band, on a non-zero exit only
+/// (success is silent). The leading `\r\n` drops it onto a fresh line below the band's
+/// last content, scrolling the primary screen if it was at the bottom. Called only from
+/// the inline hand-back (ADR-013).
 fn write_exit_status<T: OuterTerminal>(term: &mut T, exit_code: i32) -> std::io::Result<()> {
     if exit_code == 0 {
         return Ok(());
@@ -1125,9 +864,8 @@ mod tests {
     use crate::terminal::mock::{Call, MockTerminal};
     use portable_pty::ExitStatus;
 
-    /// A no-op resizer for the slice-02 tests that never drive a resize event.
-    /// (The recording resizer that asserts the ADR-008 ordering lives in the
-    /// `resize` test module.)
+    /// A no-op resizer for tests that never drive a resize event. (The recording
+    /// resizer that asserts the ADR-008 ordering lives in the `resize` module.)
     struct NoopResizer;
     impl PtyResizer for NoopResizer {
         fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
@@ -1204,8 +942,8 @@ mod tests {
         }
     }
 
-    /// Build a left-aligned, fixed-`width` renderer (margin 0) for the slice-02
-    /// tests — the absolute-width, left-aligned baseline.
+    /// Build a left-aligned, fixed-`width` renderer (margin 0) — the absolute-width,
+    /// left-aligned baseline.
     fn left_renderer(width: u16, rows: u16, outer_kitty: bool) -> Renderer {
         Renderer::new(
             width,
@@ -1215,7 +953,7 @@ mod tests {
             Width::Cols(width),
             outer_kitty,
             Box::new(std::io::sink()),
-            0, // base_row 0 → absolute paint, the slice-02..09 baseline
+            0, // base_row 0 → absolute paint, the baseline
         )
     }
 
@@ -1366,19 +1104,13 @@ mod tests {
         assert_eq!(code, Some(0));
     }
 
-    /// Child-exit-restore (ADR-010), now mode-aware (ADR-012/013): a plain command
-    /// that prints an inline line then exits non-zero (42), never entering the alt
-    /// screen. The restore side effects must fire in order, the loop must exit
-    /// rather than park, and the exit code must match `status.exit_code()`.
-    ///
-    /// Inline hand-back (ADR-013): the child exits inline (`outer_alt_active`
-    /// false) having painted inline content (`ever_painted_inline` true), so
-    /// `LeaveAltScreen` must **not** fire and the hand-back drops the cursor below
-    /// the band — for a **non-zero** exit (42) emitting the dim `Exited with: 42`
-    /// status line via `write_row`, slotted before the remaining restore steps.
-    ///
-    /// Non-kitty outer terminal (nothing pushed at startup): `PopKeyboardFlags`
-    /// must NOT fire — we only pop what we pushed (ADR-003).
+    /// Child-exit restore (ADR-010/012/013): a plain command that prints an inline line
+    /// then exits non-zero (42), never entering the alt screen. The restore side effects
+    /// fire in order, the loop exits, and the exit code matches `status.exit_code()`.
+    /// `LeaveAltScreen` must not fire; the hand-back drops the cursor below the band and
+    /// emits the dim `Exited with: 42` status line before the remaining restore steps.
+    /// On a non-kitty outer terminal `PopKeyboardFlags` must not fire — we only pop what
+    /// we pushed (ADR-003).
     #[test]
     fn child_exit_restores_in_order_no_kitty_pop_when_not_pushed() {
         use crate::terminal::OuterTerminal;
@@ -1446,15 +1178,12 @@ mod tests {
         );
     }
 
-    /// Child-exit-restore with a kitty-capable outer terminal, for a **TUI** that
-    /// is in the alt screen at exit (`?1049h` then exit): the startup kitty push
-    /// (modelled here by pushing flags on the mock before `run`) must be paired
-    /// with a `PopKeyboardFlags` in the correct restore slot — after the (now
-    /// conditional) leave-alt-screen, before disable-raw-mode (ADR-010/003/012).
-    ///
-    /// Because the child exits **in** the alt screen, `LeaveAltScreen` fires and the
-    /// inline hand-back is skipped (the `outer_alt_active` discriminator) — so a
-    /// TUI's teardown emits NO hand-back rows and NO status line, even on a zero exit.
+    /// Child-exit restore with a kitty-capable outer terminal, for a TUI in the alt
+    /// screen at exit (`?1049h` then exit): the startup kitty push must be paired with a
+    /// `PopKeyboardFlags` in the right slot — after the leave-alt-screen, before
+    /// disable-raw-mode (ADR-010/003/012). Because the child exits in the alt screen,
+    /// `LeaveAltScreen` fires and the inline hand-back is skipped, so teardown emits no
+    /// hand-back rows and no status line, even on a zero exit.
     #[test]
     fn child_exit_pops_kitty_flags_when_pushed_at_startup() {
         use crate::terminal::OuterTerminal;
@@ -1510,13 +1239,12 @@ mod tests {
         );
     }
 
-    /// The teardown-race regression guard (ADR-013). The adversarial ordering the
-    /// CI flake exposed: the waiter's `ChildExited` lands FIRST, with the child's
-    /// final `?1049h` queued behind it and the forwarder's `PtyEof` behind that. The
-    /// shutdown drain must process the queued alt-screen bytes before teardown reads
-    /// `outer_alt_active`, so restore leaves the alt screen (`?1049l`) rather than
-    /// taking the inline hand-back. Without the drain this dropped the final frame and
-    /// emitted no `LeaveAltScreen` — exactly the captured failure.
+    /// The teardown-race regression guard (ADR-013). The waiter's `ChildExited` lands
+    /// first, with the child's final `?1049h` queued behind it and the forwarder's
+    /// `PtyEof` behind that. The shutdown drain must process the queued alt-screen bytes
+    /// before teardown reads `outer_alt_active`, so restore leaves the alt screen rather
+    /// than taking the inline hand-back. Without the drain this dropped the final frame
+    /// and emitted no `LeaveAltScreen`.
     #[test]
     fn child_exit_before_final_alt_frame_still_leaves_alt() {
         use crate::terminal::OuterTerminal;
@@ -1549,12 +1277,11 @@ mod tests {
         );
     }
 
-    /// The grace cap (ADR-013) bounds the shutdown drain when no `PtyEof` ever
-    /// arrives — the grandchild-holds-the-fd case, where the master never EOFs. Here
-    /// a straggler `Pty` is scheduled FAR past [`TEARDOWN_DRAIN_GRACE`]; the drain must
-    /// NOT wait for it. It caps out at the grace deadline, the late `?1049h` is never
-    /// processed, and teardown still completes and returns the exit code — proving the
-    /// loop can't hang on a sentinel that never comes.
+    /// The grace cap (ADR-013) bounds the shutdown drain when no `PtyEof` ever arrives —
+    /// the grandchild-holds-the-fd case, where the master never EOFs. A straggler `Pty`
+    /// is scheduled far past [`TEARDOWN_DRAIN_GRACE`]; the drain must not wait for it. It
+    /// caps out at the grace deadline, the late `?1049h` is never processed, and teardown
+    /// still completes and returns the exit code.
     #[test]
     fn shutdown_drain_caps_at_grace_when_no_eof() {
         use crate::terminal::OuterTerminal;
@@ -1582,10 +1309,10 @@ mod tests {
         );
     }
 
-    /// `PtyEof` before `ChildExited` (ADR-013): the PTY path finished cleanly, so by
-    /// the time the waiter fires there are no stragglers. The shutdown drain reads the
-    /// already-set `pty_eof_seen` and short-circuits — no bounded wait — and teardown
-    /// still leaves the alt screen the (already processed) `?1049h` put us in.
+    /// `PtyEof` before `ChildExited` (ADR-013): the PTY path finished cleanly, so by the
+    /// time the waiter fires there are no stragglers. The shutdown drain reads the
+    /// already-set `pty_eof_seen` and short-circuits, and teardown still leaves the alt
+    /// screen the (already processed) `?1049h` put us in.
     #[test]
     fn pty_eof_before_child_exit_short_circuits_drain() {
         use crate::terminal::OuterTerminal;
@@ -1611,11 +1338,10 @@ mod tests {
     }
 
     /// The inline hand-back (ADR-013), driven directly through `run_teardown` on a
-    /// **primary-mode** renderer that painted inline content, so the contract is
-    /// pinned independently of the loop. `exit_code = 1`: the hand-back records a
-    /// `write_row` carrying the dim `Exited with: 1` bytes, with NO `LeaveAltScreen`
-    /// (nothing to leave), before the remaining restore steps. `exit_code = 0`: no
-    /// status-line `write_row` — just a `Newline` dropping the cursor below the band.
+    /// primary-mode renderer that painted inline content, so the contract is pinned
+    /// independently of the loop. `exit_code = 1`: a `write_row` carrying the dim
+    /// `Exited with: 1` bytes, no `LeaveAltScreen`, before the remaining restore steps.
+    /// `exit_code = 0`: no status-line `write_row`, just a `Newline` below the band.
     #[test]
     fn run_teardown_replays_dim_status_on_primary_only_on_nonzero() {
         // Non-zero on a primary (never-alt) renderer that painted inline: the dim
@@ -1679,12 +1405,11 @@ mod tests {
         );
     }
 
-    // --- Screen-mode mirror (slice 03, ADR-012/013) ---
+    // --- Screen-mode mirror (ADR-012/013) ---
 
-    /// **Edge-trigger de-dupe (ADR-012).** A child that enters the alt screen
-    /// (`?1049h`) and later leaves it (`?1049l`) must toggle the OUTER alt screen
-    /// exactly once each — one `EnterAltScreen` then one `LeaveAltScreen` — the
-    /// twin of the cursor-visibility de-dupe. Repaints between the edges must not
+    /// Edge-trigger de-dupe (ADR-012). A child that enters the alt screen (`?1049h`) and
+    /// later leaves it (`?1049l`) toggles the outer alt screen exactly once each — one
+    /// `EnterAltScreen` then one `LeaveAltScreen`. Repaints between the edges must not
     /// re-toggle.
     #[test]
     fn alt_screen_toggles_once_per_child_edge() {
@@ -1708,9 +1433,9 @@ mod tests {
         assert!(enter_pos < leave_pos, "enter precedes leave");
     }
 
-    /// **A plain stream never enters the outer alt screen (the E2 unit floor).**
-    /// A child that only prints to the primary screen emits ZERO `EnterAltScreen`
-    /// — gutter mirrors the child's mode and never forces the alt screen.
+    /// A plain stream never enters the outer alt screen. A child that only prints to the
+    /// primary screen emits zero `EnterAltScreen` — gutter mirrors the child's mode and
+    /// never forces the alt screen.
     #[test]
     fn plain_stream_never_enters_alt_screen() {
         let script = vec![
@@ -1726,16 +1451,13 @@ mod tests {
         );
     }
 
-    /// **Conditional teardown (ADR-012/013).** Three streams, one assertion each,
-    /// driven through the full loop + teardown:
-    /// - plain → no `LeaveAltScreen`; the band is painted inline (its `write_row`s)
-    ///   during the run, and the hand-back adds the dim status line on the non-zero
-    ///   exit;
-    /// - alt (still in the alt screen at exit) → `LeaveAltScreen` present, no
-    ///   hand-back;
-    /// - alt-then-`?1049l` (left the alt screen before exit, never painting inline)
-    ///   → `ever_painted_inline` stays false, so the hand-back is suppressed and no
-    ///   stray status line lands on the restored primary screen.
+    /// Conditional teardown (ADR-012/013). Three streams, driven through the full loop +
+    /// teardown:
+    /// - plain → no `LeaveAltScreen`; the band paints inline during the run, and the
+    ///   hand-back adds the dim status line on the non-zero exit;
+    /// - alt (still in the alt screen at exit) → `LeaveAltScreen`, no hand-back;
+    /// - alt-then-`?1049l` (left the alt screen before exit, never painting inline) →
+    ///   `ever_painted_inline` stays false, so the hand-back is suppressed.
     #[test]
     fn conditional_teardown_and_latch() {
         // --- Plain stream, non-zero exit: inline band + hand-back status, no leave. ---
@@ -1801,10 +1523,9 @@ mod tests {
             20,
             5,
         );
-        // The child left the alt screen before exit but never painted inline (its
-        // only content lived on the alt screen) and exited cleanly, so the
-        // `ever_painted_inline || exit_code != 0` gate is false — no stray status
-        // line on the primary (the genuine `gutter vim` clean-quit case).
+        // The child left the alt screen before exit but never painted inline, so the
+        // `ever_painted_inline` gate is false — no stray status line on the primary
+        // (the genuine `gutter vim` clean-quit case).
         let teardown_writes: Vec<&[u8]> = term
             .calls
             .iter()
@@ -1818,11 +1539,9 @@ mod tests {
             "alt-then-primary clean exit: no inline paint, so the hand-back is suppressed, got {teardown_writes:?}"
         );
 
-        // --- No inline output, non-zero exit: silent (the hand-back gate is the
-        // positive `ever_painted_inline`, never the exit code). A command that
-        // printed nothing (`gutter false`) has no band to caption, so the status
-        // line is suppressed — the status is shown only when a non-zero exit
-        // followed real inline output. ---
+        // --- No inline output, non-zero exit: silent. The gate is ever_painted_inline,
+        // never the exit code — a command that printed nothing (`gutter false`) has no
+        // band to caption, so the status is suppressed. ---
         let (_f, term, _p, _r, _c) = run_with(
             vec![(0u64, Msg::ChildExited(ExitStatus::with_exit_code(3)))],
             20,
@@ -1842,13 +1561,11 @@ mod tests {
         );
     }
 
-    /// **alt → primary → non-zero exit stays silent (BUG[1] regression).** A
-    /// full-screen TUI that paints only on the alt screen, drops back to the
-    /// primary screen (`?1049l`) without ever painting inline content, then exits
-    /// non-zero, must hand nothing back: `ever_painted_inline` is the sole gate, so
-    /// no dim status line is stamped onto the restored shell. The old
-    /// `ever_entered_alt` latch held this line; the `|| exit_code != 0` arm that
-    /// briefly replaced it did not.
+    /// alt → primary → non-zero exit stays silent (BUG[1] regression). A full-screen TUI
+    /// that paints only on the alt screen, drops back to the primary screen (`?1049l`)
+    /// without ever painting inline, then exits non-zero, must hand nothing back:
+    /// `ever_painted_inline` is the sole gate, so no dim status line is stamped onto the
+    /// restored shell.
     #[test]
     fn alt_then_primary_nonzero_exit_stays_silent() {
         let (_f, term, _p, _r, _c) = run_with(
@@ -1871,11 +1588,11 @@ mod tests {
         );
     }
 
-    /// **The primary-branch cursor tail targets the live physical row (ADR-012).**
-    /// A plain stream leaves the cursor at the child's cursor row; the recorded
-    /// `PlaceCursor` row must equal the grid cursor row, not an absolute row above
-    /// the band. (For the constrained one-screenful paint the live physical row IS
-    /// the grid cursor row; slice 04's scroll emit is what makes them diverge.)
+    /// The primary-branch cursor tail targets the live physical row (ADR-012). A plain
+    /// stream leaves the cursor at the child's cursor row; the recorded `PlaceCursor` row
+    /// must equal the grid cursor row, not an absolute row above the band. (For a
+    /// one-screenful paint the live physical row is the grid cursor row; the scroll emit
+    /// is what makes them diverge.)
     #[test]
     fn primary_cursor_targets_live_physical_row() {
         let script = vec![
@@ -1906,14 +1623,12 @@ mod tests {
         );
     }
 
-    /// **Primary-mode resize preserves history above the band (ADR-012/013).** A
-    /// plain (non-alt) stream resized mid-run must NOT emit the absolute
-    /// `clear_gutter` — that would erase the real shell's scrollback above the band
-    /// on the primary screen. (The band itself still repaints in full at the new
-    /// margin, in both modes — slice 04's `reset_prev_baseline`; this test pins the
-    /// suppressed *clear*, not the repaint.) Contrast: an alt stream resized the
-    /// same way still does the absolute `[0, rows)` clear (the v1 behaviour, correct
-    /// in the alt screen). Pins the `outer_alt_active` gate in `handle_resize`.
+    /// Primary-mode resize preserves history above the band (ADR-012/013). A plain
+    /// (non-alt) stream resized mid-run must not emit the absolute `clear_gutter` — that
+    /// would erase the real shell's scrollback above the band. (The band still repaints
+    /// in full at the new margin via `reset_prev_baseline`; this test pins the suppressed
+    /// clear, not the repaint.) An alt stream resized the same way still does the
+    /// absolute `[0, rows)` clear. Pins the `outer_alt_active` gate in `handle_resize`.
     #[test]
     fn primary_resize_preserves_history_alt_resize_clears() {
         use crossterm::event::Event;
@@ -1958,12 +1673,10 @@ mod tests {
         );
     }
 
-    /// End-to-end through the render loop's dispatch arm: once the child has
-    /// enabled kitty on its output (`CSI > 1 u` arrives as a `Msg::Pty`), a
-    /// subsequent Enter and Shift+Enter re-encode at the negotiated level and
-    /// reach the PTY writer as the DISTINCT kitty `CSI 13 u` / `CSI 13 ; 2 u`
-    /// byte sequences. This is the case-A contract proven through the real
-    /// dispatch path (not just the pure encoder), with a kitty-capable outer.
+    /// Through the render loop's dispatch arm: once the child has enabled kitty on its
+    /// output (`CSI > 1 u` arrives as a `Msg::Pty`), a subsequent Enter and Shift+Enter
+    /// re-encode at the negotiated level and reach the PTY writer as the distinct kitty
+    /// `CSI 13 u` / `CSI 13 ; 2 u` sequences, with a kitty-capable outer.
     #[test]
     fn dispatch_reencodes_at_child_kitty_level() {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -1995,10 +1708,9 @@ mod tests {
         );
     }
 
-    /// Case B through the dispatch path: with the outer terminal unable to source
-    /// kitty (`outer_supports_kitty = false`), the child's `CSI > 1 u` enable is
-    /// clamped to a no-op, so Enter and Shift+Enter both degrade to the SAME
-    /// legacy byte (`\r`). The tested degradation contract.
+    /// With the outer terminal unable to source kitty (`outer_supports_kitty = false`),
+    /// the child's `CSI > 1 u` enable is clamped to a no-op, so Enter and Shift+Enter both
+    /// degrade to the same legacy byte (`\r`).
     #[test]
     fn dispatch_clamps_to_legacy_when_outer_unsupported() {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -2028,12 +1740,11 @@ mod tests {
         );
     }
 
-    /// Device queries through the render-loop dispatch arm (slice 11): a
-    /// `Msg::Pty` carrying the child's query reaches the PTY writer as the
-    /// spec-correct reply. This pins the gutter→child wiring (drain → write_all
-    /// → flush in the `Msg::Pty` arm) deterministically — the offline
-    /// `callbacks.rs` suite stops at `drain_replies`, so without this the wiring
-    /// is proven only by the slow PTY integration tests.
+    /// Device queries through the render-loop dispatch arm: a `Msg::Pty` carrying the
+    /// child's query reaches the PTY writer as the spec-correct reply, pinning the
+    /// gutter→child wiring (drain → write_all → flush). The offline `callbacks.rs` suite
+    /// stops at `drain_replies`, so without this the wiring is proven only by the slow
+    /// PTY integration tests.
     #[test]
     fn dispatch_answers_device_queries_on_the_pty() {
         // CPR: position to (3,7) then query → reply in W-grid coords, no margin.
@@ -2053,14 +1764,12 @@ mod tests {
         assert_eq!(pty, b"\x1b[?1;2c", "CSI c → DA1 reply");
     }
 
-    // --- Mouse forwarding through the render-loop dispatch arm (slice 07) ---
+    // --- Mouse forwarding through the render-loop dispatch arm (ADR-005) ---
     //
-    // These exercise the full Thread-2 wiring: a `Msg::Pty` carrying the child's
-    // DECSET negotiation, the per-cycle poll that refreshes the gate from the live
-    // screen, then a `Msg::Input(Event::Mouse)` that the gate translates and
-    // re-encodes onto the PTY writer. They assert on the child-received bytes (the
-    // PTY-writer sink), never the grid — the same contract the expectrl oracle
-    // would assert, proven here without a PTY.
+    // These exercise the full Thread-2 wiring: a `Msg::Pty` carrying the child's DECSET
+    // negotiation, the per-cycle poll that refreshes the gate from the live screen, then
+    // a `Msg::Input(Event::Mouse)` the gate translates and re-encodes onto the PTY writer.
+    // They assert on the child-received bytes, never the grid — proven without a PTY.
 
     use crossterm::event::{
         Event as CtEvent, MouseButton, MouseEvent, MouseEventKind,
@@ -2089,12 +1798,10 @@ mod tests {
         pty
     }
 
-    /// First post-negotiation click is delivered AND the margin is subtracted:
-    /// the child enables SGR mouse (`CSI ?1000h ?1006h`), then a click at physical
-    /// col `margin + 5` row 3 arrives → the child receives `CSI < 0 ; 6 ; 4 M`
-    /// (child col 5 → SGR 6, row 3 → SGR 4). This is both the correct-cell and the
-    /// first-click-after-negotiation criterion (eager capture means click #1 is
-    /// the one asserted).
+    /// First post-negotiation click is delivered and the margin is subtracted: the child
+    /// enables SGR mouse (`CSI ?1000h ?1006h`), then a click at physical col `margin + 5`
+    /// row 3 → the child receives `CSI < 0 ; 6 ; 4 M` (child col 5 → SGR 6, row 3 → SGR
+    /// 4). Eager capture means click #1 is the one asserted.
     #[test]
     fn mouse_first_click_delivered_margin_subtracted() {
         let margin = 30;
@@ -2213,11 +1920,9 @@ mod tests {
         );
     }
 
-    /// Non-Sgr encoding: when the child negotiates a reporting mode but NOT SGR
-    /// (`CSI ?1000h` with no `?1006h` → Default encoding), a click must NOT produce
-    /// a malformed SGR event. gutter fails loud — the dispatch arm panics rather
-    /// than forwarding garbage (the v1 abort, the E2E counterpart of the unit
-    /// `BailNonSgr` test).
+    /// When the child negotiates a reporting mode but not SGR (`CSI ?1000h` with no
+    /// `?1006h` → Default encoding), a click must not produce a malformed SGR event.
+    /// gutter fails loud — the dispatch arm panics rather than forwarding garbage.
     #[test]
     #[should_panic(expected = "non-SGR mouse encoding")]
     fn mouse_non_sgr_encoding_panics_rather_than_forwarding_garbage() {
@@ -2249,9 +1954,9 @@ mod tests {
         );
     }
 
-    /// The offset repaint paints each row at the left margin and repositions the
-    /// real cursor inside the band. With `left_margin == 0` (this slice) content
-    /// starts at physical column 0 and the cursor lands at `(col, row)`.
+    /// The offset repaint paints each row at the left margin and repositions the real
+    /// cursor inside the band. With `left_margin == 0` content starts at physical column
+    /// 0 and the cursor lands at `(col, row)`.
     #[test]
     fn offset_repaint_paints_at_margin_and_tracks_cursor() {
         // Two lines, then the child exits.
@@ -2302,12 +2007,10 @@ mod tests {
         assert_eq!(place, Some((7 + 2, 0)), "cursor at margin + col");
     }
 
-    /// **Cursor visibility golden-master against the real-target fixture (slice
-    /// 08).** Replay the checked-in Claude Code fixture through the render loop
-    /// at a non-zero margin, sample the cursor state (position + visibility)
-    /// across the replay as an insta snapshot, AND assert directly that at settle
-    /// the outer cursor position equals `(left_margin + col, row)` from
-    /// `cursor_position()` and that the fixture's `CSI ?25l` hid the outer cursor.
+    /// Cursor-visibility golden-master against the Claude Code fixture. Replay the
+    /// checked-in fixture through the render loop at a non-zero margin, snapshot the
+    /// cursor state, and assert directly that at settle the outer cursor equals
+    /// `(left_margin + col, row)` and that the fixture's `CSI ?25l` hid the outer cursor.
     #[test]
     fn cursor_state_golden_master_over_fixture() {
         let fixture: &[u8] = include_bytes!("../tests/fixtures/claude-code-flow.cast");
@@ -2381,11 +2084,10 @@ line two\r\n\
         insta::assert_debug_snapshot!(grid);
     }
 
-    /// No bleed past the band: with content that fills the full width, every
-    /// painted row's bytes stay within `[0, W)` and nothing is emitted that
-    /// would carry the cursor to column `W` (vt100's margin rule, ADR-006). We
-    /// assert the recorded `MoveTo` columns and the cursor placement never reach
-    /// `margin + W`.
+    /// No bleed past the band: with content that fills the full width, every painted
+    /// row's bytes stay within `[0, W)` and nothing carries the cursor to column `W`
+    /// (vt100's margin rule, ADR-006). The recorded `MoveTo` columns and cursor placement
+    /// never reach `margin + W`.
     #[test]
     fn ascii_content_never_bleeds_past_band() {
         let width = 10u16;
@@ -2437,10 +2139,9 @@ line two\r\n\
         assert_eq!(vis, vec![false, true], "hide then show, mirrored once each");
     }
 
-    /// **Cursor-shape mirroring (slice 08), end-to-end through the dispatch
-    /// path.** A child-emitted `DECSCUSR` (`CSI 6 SP q`, steady bar) must reach
-    /// the outer terminal as the matching `CSI 6 SP q` — proving shape is IN
-    /// scope (not a documented gap) and mirrored exactly once on the change.
+    /// Cursor-shape mirroring through the dispatch path. A child-emitted `DECSCUSR`
+    /// (`CSI 6 SP q`, steady bar) reaches the outer terminal as the matching `CSI 6 SP q`,
+    /// mirrored exactly once on the change.
     #[test]
     fn cursor_shape_mirrored_on_outer() {
         let script = vec![
@@ -2470,16 +2171,13 @@ line two\r\n\
     }
 }
 
-/// Wide-char (CJK / emoji) edge-of-band correctness — the milestone-2 exit
-/// criterion (ADR-006). Every case asserts **two-sidedly**: on the child-side
-/// `vt100` grid (what the child believes it painted) AND on the **physical
-/// outer cells** at column `margin + W` via a [`RecordingGrid`] (where a real
-/// bleed would live — the assertion `COLUMNS == W` can never make).
-/// Shared test helper: build a renderer at `width × rows` with margin `margin`,
-/// feed `bytes` straight into the parser (no clock, no threads — the pure unit
-/// path), and paint one frame through the **primary** `rows_diff` path into a fresh
-/// [`RecordingGrid`] sized to the physical outer terminal (`phys_cols`). Returns
-/// the renderer (for child-grid assertions) and the painted physical grid.
+/// Shared test helper for wide-char (CJK / emoji) edge-of-band correctness (ADR-006).
+/// Build a renderer at `width × rows` with margin `margin`, feed `bytes` straight into
+/// the parser, and paint one frame through the primary `rows_diff` path into a fresh
+/// [`RecordingGrid`] sized to the physical outer terminal (`phys_cols`). Returns the
+/// renderer (for child-grid assertions) and the painted physical grid — the cases assert
+/// both on the child grid and on the physical outer cells at column `margin + W`, where a
+/// real bleed would live.
 #[cfg(test)]
 fn render_primary(
     bytes: &[u8],
@@ -2504,7 +2202,7 @@ mod cjk {
     /// lead cell holding "一" and a continuation cell (byte-length zero).
     const HAN: &str = "\u{4e00}";
 
-    /// As [`render_primary`], but paint through the cell-walking **fallback**.
+    /// As [`render_primary`], but paint through the cell-walking fallback.
     fn render_fallback(
         bytes: &[u8],
         width: u16,
@@ -2535,8 +2233,8 @@ mod cjk {
         None
     }
 
-    /// Every physical outer cell at column `margin + W` (the first gutter column)
-    /// must be blank on every row — the core "no bleed past the band" assertion.
+    /// Every physical outer cell at column `margin + W` (the first gutter column) must be
+    /// blank on every row — the "no bleed past the band" assertion.
     fn assert_band_edge_blank(grid: &RecordingGrid, margin: u16, width: u16, rows: u16) {
         let edge = margin + width;
         for row in 0..rows {
@@ -2549,11 +2247,11 @@ mod cjk {
         }
     }
 
-    /// **CJK case 1 — DECAWM ON, wide glyph at child col `W-1`.** Set autowrap,
-    /// position the cursor at the last in-band column, emit U+4E00. vt100's
-    /// margin rule wraps the glyph to the next row rather than placing it at
-    /// `W-1`. Assert two-sidedly: child grid shows the glyph wrapped (lead cell
-    /// at col 0 of a later row, NOT at `W-1`), and physical `margin + W` blank.
+    /// CJK case 1 — DECAWM on, wide glyph at child col `W-1`. Set autowrap, position the
+    /// cursor at the last in-band column, emit U+4E00. vt100's margin rule wraps the glyph
+    /// to the next row rather than placing it at `W-1`. The child grid shows the glyph
+    /// wrapped (lead cell at col 0 of a later row, not `W-1`), and physical `margin + W`
+    /// is blank.
     #[test]
     fn case1_decawm_on_wraps_inside_band() {
         let (w, rows, margin, phys) = (8u16, 4u16, 6u16, 20u16);
@@ -2574,11 +2272,10 @@ mod cjk {
         assert_band_edge_blank(&grid, margin, w, rows);
     }
 
-    /// **CJK case 2 — DECAWM OFF, wide glyph at child col `W-1`.** Clear
-    /// autowrap, same position, emit U+4E00. This is the distinct vt100 code
-    /// path. Whatever vt100 does with the glyph (clamp/drop/wrap), the slice's
-    /// invariant is the same: the glyph stays **inside** the `W`-column grid and
-    /// physical `margin + W` is blank.
+    /// CJK case 2 — DECAWM off, wide glyph at child col `W-1`. Clear autowrap, same
+    /// position, emit U+4E00 — a distinct vt100 code path. Whatever vt100 does with the
+    /// glyph (clamp/drop/wrap), the invariant holds: the glyph stays inside the `W`-column
+    /// grid and physical `margin + W` is blank.
     #[test]
     fn case2_decawm_off_stays_inside_band() {
         let (w, rows, margin, phys) = (8u16, 4u16, 6u16, 20u16);
@@ -2611,11 +2308,10 @@ mod cjk {
         assert_band_edge_blank(&grid, margin, w, rows);
     }
 
-    /// **CJK case 3 — exactly one in-band cell remaining.** Position so only the
-    /// final column is free, then attempt a wide glyph that needs two columns.
-    /// It cannot fit at `W-1` (its continuation would be column `W`), so vt100
-    /// wraps/drops it inside the band — no half-glyph spill. Physical
-    /// `margin + W` blank.
+    /// CJK case 3 — exactly one in-band cell remaining. Position so only the final column
+    /// is free, then attempt a wide glyph that needs two columns. It can't fit at `W-1`
+    /// (its continuation would be column `W`), so vt100 wraps/drops it inside the band —
+    /// no half-glyph spill. Physical `margin + W` is blank.
     #[test]
     fn case3_one_cell_remaining_no_half_glyph() {
         let (w, rows, margin, phys) = (6u16, 4u16, 8u16, 20u16);
@@ -2638,13 +2334,10 @@ mod cjk {
         assert_band_edge_blank(&grid, margin, w, rows);
     }
 
-    /// **CJK case 4 — cell-walking FALLBACK exercised.** Drive a wide glyph,
-    /// then repaint through `render_cell_walk` (the absolute-column fallback).
-    /// Assert: the continuation cell is **skipped** (no `move_to`/emit for it —
-    /// proven by the physical grid showing exactly one glyph, no double-glyph),
-    /// there is **no double-advance** (the glyph occupies two physical columns,
-    /// the cell after it is the continuation, blank), and physical `margin + W`
-    /// is blank. This is the one case that exercises gutter's own
+    /// CJK case 4 — cell-walking fallback exercised. Drive a wide glyph, then repaint
+    /// through `render_cell_walk`. The continuation cell is skipped (physical grid shows
+    /// exactly one glyph, no double-glyph), there is no double-advance, and physical
+    /// `margin + W` is blank. The one case that exercises gutter's own
     /// `is_wide_continuation` skip rather than vt100's margin rule.
     #[test]
     fn case4_fallback_skips_continuation_no_double_glyph() {
@@ -2694,10 +2387,9 @@ mod cjk {
         assert_band_edge_blank(&grid, margin, w, rows);
     }
 
-    /// The fallback's continuation-skip emits **no** `move_to` to a continuation
-    /// column. Proven against [`MockTerminal`]'s recorded call sequence: with
-    /// two wide glyphs the fallback issues exactly two `move_to`s (one per lead
-    /// cell), never one per cell.
+    /// The fallback's continuation-skip emits no `move_to` to a continuation column.
+    /// Against [`MockTerminal`]'s recorded calls: with two wide glyphs the fallback issues
+    /// exactly two `move_to`s (one per lead cell), never one per cell.
     #[test]
     fn case4_fallback_emits_no_move_for_continuation() {
         use crate::terminal::mock::{Call, MockTerminal};
@@ -2721,10 +2413,9 @@ mod cjk {
         );
     }
 
-    /// insta golden-master: a representative CJK line rendered through the
-    /// **primary** path, snapshotting the physical outer grid (the painted-column
-    /// map). Freezes correct in-band column alignment so any future wide-char
-    /// drift surfaces as a snapshot diff.
+    /// insta golden-master: a representative CJK line rendered through the primary path,
+    /// snapshotting the physical outer grid. Freezes the in-band column alignment so any
+    /// future wide-char drift surfaces as a snapshot diff.
     #[test]
     fn cjk_line_snapshot() {
         let (w, rows, margin, phys) = (20u16, 3u16, 5u16, 40u16);
@@ -2750,9 +2441,8 @@ mod cjk {
         assert_band_edge_blank(&grid, margin, w, rows);
     }
 
-    /// Primary-path purity (ADR-006 re-scope checkpoint, mechanised): the
-    /// production `render_once` source must contain no `is_wide_continuation`
-    /// call and no per-cell walk. Reading the source keeps the architectural
+    /// Primary-path purity (ADR-006): the production `render_once` source must contain no
+    /// `is_wide_continuation` call and no per-cell walk. Reading the source keeps the
     /// constraint from silently regressing.
     #[test]
     fn primary_path_does_not_walk_cells() {
@@ -2779,9 +2469,8 @@ mod cjk {
         );
     }
 
-    /// Slice-02 regression sentinel: U+4E00 at the band edge does not drift the
-    /// child grid's reported width — the child still believes it has exactly `W`
-    /// columns regardless of the wide glyph.
+    /// U+4E00 at the band edge does not drift the child grid's reported width — the child
+    /// still believes it has exactly `W` columns regardless of the wide glyph.
     #[test]
     fn wide_glyph_does_not_drift_band_width() {
         let (w, rows) = (10u16, 4u16);
@@ -2793,22 +2482,20 @@ mod cjk {
     }
 }
 
-/// Row-run self-containment at the offset (slice 09 / ADR-014). The pure column
-/// maths lives in `rowclip`; these prove the *offset* behaviour on a physical-
-/// sized [`RecordingGrid`] — the seam where the bug actually lives. A
-/// background-only flood erases the gutter cell (empty `contents()`) while its
-/// reverse-video background bleeds, so the assertions read `cell_inverse`, the
-/// only readback that can witness the corruption.
+/// Row-run self-containment at the offset (ADR-014). The pure column maths lives in
+/// `rowclip`; these prove the offset behaviour on a physical-sized [`RecordingGrid`].
+/// A background-only flood erases the gutter cell (empty `contents()`) while its
+/// reverse-video background bleeds, so the assertions read `cell_inverse`, the only
+/// readback that can witness the corruption.
 #[cfg(test)]
 mod rowclip_paint {
     use super::*;
 
-    /// **Band-edge blank (the Bug B gate).** A full-width reverse-video row (the
-    /// nvim statusline: `ESC[7m` then a row-final `ESC[K`, attributed-but-empty)
-    /// painted at a centred offset. The clip rewrites the unbounded erase into a
-    /// `W`-bounded fill, so the highlight reaches the band edge (`margin + W - 1`
-    /// is inverse) but the first gutter column (`margin + W`) is **not** inverse —
-    /// the corruption a content-only readback is blind to.
+    /// Band-edge blank (the Bug B gate). A full-width reverse-video row (the nvim
+    /// statusline: `ESC[7m` then a row-final `ESC[K`, attributed-but-empty) painted at a
+    /// centred offset. The clip rewrites the unbounded erase into a `W`-bounded fill, so
+    /// the highlight reaches the band edge (`margin + W - 1` is inverse) but the first
+    /// gutter column (`margin + W`) is not.
     #[test]
     fn reverse_video_row_highlight_stops_at_band_edge() {
         let (w, rows, margin, phys) = (8u16, 3u16, 6u16, 20u16);
@@ -2839,11 +2526,10 @@ mod rowclip_paint {
         }
     }
 
-    /// **No cross-row bleed (the Bug A gate).** A reverse-video row painted above a
-    /// default-attribute row. The reverse row leaves inverse active in the outer
-    /// terminal across the bare `move_to`; the per-row `ESC[m` reset must contain
-    /// it, so the lower row's leading cells render **default**, not inverse.
-    /// Without the reset the second row inherits the stale highlight.
+    /// No cross-row bleed (the Bug A gate). A reverse-video row painted above a
+    /// default-attribute row. The reverse row leaves inverse active across the bare
+    /// `move_to`; the per-row `ESC[m` reset must contain it, so the lower row's leading
+    /// cells render default. Without the reset the second row inherits the stale highlight.
     #[test]
     fn no_attribute_bleed_across_rows() {
         let (w, rows, margin, phys) = (12u16, 3u16, 5u16, 24u16);
@@ -2867,21 +2553,20 @@ mod rowclip_paint {
     }
 }
 
-/// Primary-screen scroll emit (slice 04 / ADR-013): the count-based scroll-delta
-/// (sourced from the scroll tracker, robust to a burst that turns the screen over
-/// in one frame) and the emit of each departed top line into the real terminal's
-/// scrollback as a scrolling stream. Drives `render_once` directly against a
-/// [`MockTerminal`] (to count the per-departed-line `Newline`) and a physical-
-/// sized [`RecordingGrid`] **with scrollback** (to read back the scrolled-off
-/// content), so the assertions land on the real emit, not the loop plumbing.
+/// Primary-screen scroll emit (ADR-013): the count-based scroll-delta (from the scroll
+/// tracker, robust to a burst that turns the screen over in one frame) and the emit of
+/// each departed top line into the real terminal's scrollback as a scrolling stream.
+/// Drives `render_once` directly against a [`MockTerminal`] (to count the per-departed
+/// `Newline`) and a physical-sized [`RecordingGrid`] with scrollback (to read back the
+/// scrolled-off content), so the assertions land on the real emit, not loop plumbing.
 #[cfg(test)]
 mod primary_scroll {
     use super::*;
     use crate::terminal::mock::{Call, MockTerminal, RecordingGrid};
 
-    /// Feed bytes to the renderer exactly as the render loop's `Msg::Pty` dispatch
-    /// does — the live parser AND the scroll tracker — so the tests exercise the
-    /// real per-frame scroll detection rather than a parser the tracker never saw.
+    /// Feed bytes to the renderer exactly as the render loop's `Msg::Pty` dispatch does —
+    /// the live parser and the scroll tracker — so the tests exercise the real per-frame
+    /// scroll detection rather than a parser the tracker never saw.
     fn feed(renderer: &mut Renderer, bytes: &[u8]) {
         renderer.parser.process(bytes);
         renderer.scroll_tracker.process(bytes);
@@ -2900,14 +2585,11 @@ mod primary_scroll {
         renderer
     }
 
-    /// **Count-based scroll-delta (the ADR-007/013 obligation).** Prime the grid
-    /// full, then advance it by THREE lines in a SINGLE frame (one `render_once`)
-    /// and assert ALL THREE departed lines (L0, L1, L2) reach the recorder's
-    /// scrollback, in order — the count is the number of lines advanced, NOT
-    /// one-per-frame. A one-per-frame regression would carry only ONE line into
-    /// scrollback under this coalesced burst and fail (L1 and L2 would be missing).
-    /// The two rows that stayed on screen (L3, L4) plus the fresh ones are the
-    /// visible band, not scrollback.
+    /// Count-based scroll-delta (the ADR-007/013 obligation). Prime the grid full, then
+    /// advance it by three lines in a single frame and assert all three departed lines
+    /// (L0, L1, L2) reach the recorder's scrollback, in order — the count is the number
+    /// of lines advanced, not one-per-frame. A one-per-frame regression would carry only
+    /// one line into scrollback and fail. L3/L4 plus the fresh lines are the visible band.
     #[test]
     fn scroll_delta_is_count_not_one_per_frame() {
         let (w, rows, phys) = (20u16, 5u16, 20u16);
@@ -2955,15 +2637,13 @@ mod primary_scroll {
         );
     }
 
-    /// **The whole-screen-turnover burst — the case a witnessed-overlap delta
-    /// drops.** Prime a 4-row band full, then advance it by EIGHT lines in a SINGLE
-    /// frame (twice the band height) so the new grid shares NO row with the old —
-    /// there is no surviving overlap to witness the scroll, the exact case the
-    /// previous grid-diff delta returned 0 for and silently lost. Replay the frame
-    /// into a real-terminal-shaped [`RecordingGrid`] **with scrollback** and assert
-    /// every one of the eight departed lines (including the ones that arrived and
-    /// left within the single frame, never on any painted grid) is recoverable from
-    /// the recorder's scrollback, in order, and the last screenful is visible.
+    /// The whole-screen-turnover burst — the case a witnessed-overlap delta drops. Prime
+    /// a 4-row band full, then advance it by eight lines in a single frame so the new grid
+    /// shares no row with the old — no surviving overlap to witness the scroll, the case a
+    /// grid-diff delta returned 0 for. Replay the frame into a [`RecordingGrid`] with
+    /// scrollback and assert every one of the eight departed lines (including ones that
+    /// arrived and left within the single frame) is recoverable, in order, and the last
+    /// screenful is visible.
     #[test]
     fn full_turnover_burst_reaches_scrollback() {
         let (w, rows, phys) = (20u16, 4u16, 20u16);
@@ -3013,8 +2693,8 @@ mod primary_scroll {
         );
     }
 
-    /// **A still screen emits nothing.** With no advance between frames the
-    /// scroll-delta is zero, so no Newline — the emit only fires on a real scroll.
+    /// A still screen emits nothing. With no advance between frames the scroll-delta is
+    /// zero, so no Newline — the emit only fires on a real scroll.
     #[test]
     fn no_scroll_emits_no_newline() {
         let (w, rows) = (20u16, 5u16);
@@ -3030,9 +2710,9 @@ mod primary_scroll {
         );
     }
 
-    /// **The first primary frame, filling the screen, pushes nothing into
-    /// scrollback.** A fresh renderer fed less than one screenful is still
-    /// filling — content grows downward, nothing departs — so no Newline.
+    /// The first primary frame, filling the screen, pushes nothing into scrollback. A
+    /// fresh renderer fed less than one screenful is still filling — content grows
+    /// downward, nothing departs — so no Newline.
     #[test]
     fn first_frame_filling_emits_nothing() {
         let (w, rows) = (20u16, 5u16);
@@ -3047,10 +2727,9 @@ mod primary_scroll {
         );
     }
 
-    /// **The alt screen never scrolls the outer terminal.** Even when the child's
-    /// alt-screen content changes between frames, no Newline is emitted — the
-    /// scroll emit is primary-only (an alt screen owns a fixed viewport), and the
-    /// tracker is drained-and-dropped without advancing the terminal.
+    /// The alt screen never scrolls the outer terminal. Even when the child's alt-screen
+    /// content changes between frames, no Newline is emitted — the scroll emit is
+    /// primary-only, and the tracker is drained-and-dropped without advancing the terminal.
     #[test]
     fn alt_screen_emits_no_newline() {
         let (w, rows) = (20u16, 5u16);
@@ -3075,12 +2754,11 @@ mod primary_scroll {
         );
     }
 
-    /// **Scrolled-off lines are emitted, frame after frame, and the band stays the
-    /// last screenful.** Drive more lines than fit the band, one line per frame,
-    /// across the whole run into a real-terminal-shaped [`RecordingGrid`] **with
-    /// scrollback**: the early lines that scroll off the top must each be
-    /// recoverable from the recorder's scrollback (the count is what carries them
-    /// in), and the recorder must end with the last screenful visible.
+    /// Scrolled-off lines are emitted frame after frame, and the band stays the last
+    /// screenful. Drive more lines than fit the band, one per frame, into a
+    /// [`RecordingGrid`] with scrollback: the early lines that scroll off the top must
+    /// each be recoverable from the recorder's scrollback, and the recorder ends with the
+    /// last screenful visible.
     #[test]
     fn scrolled_off_lines_are_emitted_into_the_terminal() {
         let (w, rows, phys) = (20u16, 4u16, 30u16);
@@ -3128,12 +2806,10 @@ mod primary_scroll {
         );
     }
 
-    /// **The tracker's bounded scrollback does not accumulate across frames.** The
-    /// tracker is reset to the live grid every `render_once`, so after many
-    /// scrolling frames its scrollback length is back to zero between frames — the
-    /// ADR-013 backpressure guarantee that this detection device stays bounded and
-    /// never grows like vt100 `set_scrollback` would. We probe the tracker length
-    /// directly after a render.
+    /// The tracker's bounded scrollback does not accumulate across frames. The tracker is
+    /// reset to the live grid every `render_once`, so after many scrolling frames its
+    /// scrollback length is back to zero between frames (ADR-013). Probes the tracker
+    /// length directly after a render.
     #[test]
     fn tracker_scrollback_is_reset_each_frame() {
         let (w, rows) = (20u16, 4u16);
@@ -3155,19 +2831,18 @@ mod primary_scroll {
     }
 }
 
-/// Inline primary-screen anchor (slice 10 / ADR-013): the `base_row` offset paint,
-/// the per-frame make-room scroll that drives `base_row` to 0 as the band fills,
-/// the seamless hand-off to slice 04's scroll-emit engine, the alt-offset-0
-/// invariant, and the teardown hand-back below the band. Drives `render_once` /
-/// `run_teardown` directly against a [`MockTerminal`] (for the offset / `Newline`
-/// counts) and a physical-sized [`RecordingGrid`] **with scrollback** (to read back
+/// Inline primary-screen anchor (ADR-013): the `base_row` offset paint, the per-frame
+/// make-room scroll that drives `base_row` to 0 as the band fills, the hand-off to the
+/// scroll-emit engine, the alt-offset-0 invariant, and the teardown hand-back below the
+/// band. Drives `render_once` / `run_teardown` directly against a [`MockTerminal`] (for
+/// the offset / `Newline` counts) and a [`RecordingGrid`] with scrollback (to read back
 /// the history the make-room scroll pushed off the top).
 #[cfg(test)]
 mod inline_anchor {
     use super::*;
     use crate::terminal::mock::{Call, MockTerminal, RecordingGrid};
 
-    /// Feed bytes to the live parser AND the scroll tracker, exactly as the loop's
+    /// Feed bytes to the live parser and the scroll tracker, exactly as the loop's
     /// `Msg::Pty` dispatch does, so the per-frame scroll detection is exercised.
     fn feed(renderer: &mut Renderer, bytes: &[u8]) {
         renderer.parser.process(bytes);
@@ -3197,10 +2872,9 @@ mod inline_anchor {
             .expect("a frame placed the cursor")
     }
 
-    /// **The offset paint targets `base_row + grid_row` (the keystone).** A band
-    /// launched at row 10 paints its rows at 10, 11, 12 — never at absolute row 0,
-    /// which would overpaint the scrollback above it — and the cursor tail follows
-    /// to `base_row + grid_cursor_row`.
+    /// The offset paint targets `base_row + grid_row`. A band launched at row 10 paints
+    /// its rows at 10, 11, 12 — never at absolute row 0, which would overpaint the
+    /// scrollback above it — and the cursor tail follows to `base_row + grid_cursor_row`.
     #[test]
     fn primary_paint_offsets_rows_by_base_row() {
         let (w, rows) = (20u16, 24u16);
@@ -3221,10 +2895,10 @@ mod inline_anchor {
         assert_eq!(last_placed_row(&term), 12, "cursor tail at base_row + grid cursor row");
     }
 
-    /// **Make-room scrolls the overshoot and decrements `base_row` by the same
-    /// delta.** A band launched on the bottom row fits its first line with no
-    /// scroll; the second line would sit one row past the bottom, so exactly one
-    /// `Newline` scrolls the real terminal up and `base_row` drops by one.
+    /// Make-room scrolls the overshoot and decrements `base_row` by the same delta. A band
+    /// launched on the bottom row fits its first line with no scroll; the second line
+    /// would sit one row past the bottom, so exactly one `Newline` scrolls the real
+    /// terminal up and `base_row` drops by one.
     #[test]
     fn make_room_scrolls_and_decrements_base_row() {
         let (w, rows) = (20u16, 6u16);
@@ -3249,10 +2923,10 @@ mod inline_anchor {
         assert!(rows_painted.contains(&5), "L1 lands on the bottom row, got {rows_painted:?}");
     }
 
-    /// **The make-room scroll pushes the history above the band into the real
-    /// terminal's own scrollback.** Seed five history rows above a band launched at
-    /// the bottom, then grow the band a screenful: every seeded row reaches the
-    /// recorder's scrollback and `base_row` is driven to 0.
+    /// The make-room scroll pushes the history above the band into the real terminal's own
+    /// scrollback. Seed five history rows above a band launched at the bottom, then grow
+    /// the band a screenful: every seeded row reaches the recorder's scrollback and
+    /// `base_row` is driven to 0.
     #[test]
     fn make_room_pushes_history_into_scrollback() {
         let (w, rows, phys) = (20u16, 6u16, 20u16);
@@ -3279,10 +2953,10 @@ mod inline_anchor {
         }
     }
 
-    /// **The `base_row → 0` transition hands seamlessly to the scroll-emit engine.**
-    /// Filling the screen drives `base_row` to exactly 0 via make-room (no internal
-    /// vt100 scroll yet); the next line then scrolls the grid internally and the
-    /// slice 04 `emit_scroll_stream` branch runs — provably at `base_row == 0`.
+    /// The `base_row → 0` transition hands over to the scroll-emit engine. Filling the
+    /// screen drives `base_row` to exactly 0 via make-room (no internal vt100 scroll yet);
+    /// the next line then scrolls the grid internally and the `emit_scroll_stream` branch
+    /// runs — provably at `base_row == 0`.
     #[test]
     fn base_row_reaches_zero_then_scroll_emit_takes_over() {
         let (w, rows) = (20u16, 5u16);
@@ -3309,9 +2983,9 @@ mod inline_anchor {
         assert_eq!(r.base_row, 0, "base_row stays 0 once the band fills the screen");
     }
 
-    /// **The alt paint is always at offset 0, regardless of `base_row`.** A band
-    /// anchored mid-screen that enters the alt screen paints its frame at row 0, not
-    /// `base_row`, and `base_row` is frozen across the alt excursion (no make-room).
+    /// The alt paint is always at offset 0, regardless of `base_row`. A band anchored
+    /// mid-screen that enters the alt screen paints its frame at row 0, not `base_row`,
+    /// and `base_row` is frozen across the alt excursion (no make-room).
     #[test]
     fn alt_paint_ignores_base_row() {
         let (w, rows) = (20u16, 6u16);
@@ -3330,10 +3004,10 @@ mod inline_anchor {
         assert_eq!(last_placed_row(&term), 0, "alt cursor tail uses offset 0");
     }
 
-    /// **Teardown hands back below the inline band, status gated on the exit code.**
-    /// A band anchored at row 10 with two lines hands back at the band's last
-    /// physical row (11): a zero exit drops a `Newline` below it (no status); a
-    /// non-zero exit rides the dim status line there instead.
+    /// Teardown hands back below the inline band, status gated on the exit code. A band
+    /// anchored at row 10 with two lines hands back at the band's last physical row (11):
+    /// a zero exit drops a `Newline` below it (no status); a non-zero exit rides the dim
+    /// status line there instead.
     #[test]
     fn hand_back_drops_below_inline_band() {
         let (w, rows) = (20u16, 24u16);
@@ -3373,15 +3047,14 @@ mod inline_anchor {
         );
     }
 
-    /// **A coalesced scroll-then-clear launched mid-screen preserves the history
-    /// above and lands at `base_row == 0` (BUG[0] regression).** In one frame
-    /// vt100's W-window fills and scrolls internally (so the scroll tracker holds
-    /// the departed lines), then a `clear` blanks the settled grid — so the
-    /// make-room overshoot reads near-zero and would leave `base_row` mid-screen
-    /// while the departed branch runs. `emit_scroll_stream` paints `[0, rows)`, so
-    /// running it at `base_row > 0` overwrites the pre-launch history above the
-    /// launch row. The departed signal proves the band reached full screen, so the
-    /// frame must drive `base_row` to 0, pushing that history into scrollback first.
+    /// A coalesced scroll-then-clear launched mid-screen preserves the history above and
+    /// lands at `base_row == 0` (BUG[0] regression). In one frame vt100's W-window fills
+    /// and scrolls internally (so the scroll tracker holds the departed lines), then a
+    /// `clear` blanks the settled grid — so the make-room overshoot reads near-zero and
+    /// would leave `base_row` mid-screen while the departed branch runs. `emit_scroll_stream`
+    /// paints `[0, rows)`, so running it at `base_row > 0` overwrites the pre-launch
+    /// history. The departed signal proves the band reached full screen, so the frame must
+    /// drive `base_row` to 0, pushing that history into scrollback first.
     #[test]
     fn coalesced_scroll_then_clear_preserves_history_at_base_row_zero() {
         let (w, rows, phys) = (20u16, 6u16, 20u16);
@@ -3413,12 +3086,12 @@ mod inline_anchor {
         }
     }
 
-    /// **An attribute-only row counts as live for make-room (BUG[2] regression).** A
-    /// full-width reverse-video status bar erased under a background SGR carries no
-    /// glyphs, so a row-text read calls it blank and make-room under-scrolls,
-    /// clipping the bar off the bottom. Launch on the bottom row, paint the bar on
-    /// the deepest grid row, and move the cursor home so it does not itself mark the
-    /// row: make-room must still scroll the bar fully on-screen (`base_row` → 0).
+    /// An attribute-only row counts as live for make-room (BUG[2] regression). A
+    /// full-width reverse-video status bar erased under a background SGR carries no glyphs,
+    /// so a row-text read calls it blank and make-room under-scrolls, clipping the bar off
+    /// the bottom. Launch on the bottom row, paint the bar on the deepest grid row, and
+    /// move the cursor home so it does not itself mark the row: make-room must still scroll
+    /// the bar fully on-screen (`base_row` → 0).
     #[test]
     fn attribute_only_row_counts_as_live_for_make_room() {
         let (w, rows, phys) = (8u16, 6u16, 12u16);
@@ -3437,12 +3110,11 @@ mod inline_anchor {
     }
 }
 
-/// Resize (slice 05 / ADR-008 / ADR-011): the SIGWINCH ordering, the proportional
-/// `--width Npct` recompute, the centred-offset recompute, the gutter clear, and
-/// the stress / floor-cap criteria. Drives `handle_resize` directly (every
-/// dependency injected) so the intermediate-invariant assertions land in the
-/// window *before* the child's repaint — the assertion the settled-grid test
-/// structurally cannot make.
+/// Resize (ADR-008 / ADR-011): the SIGWINCH ordering, the proportional `--width Npct`
+/// recompute, the centred-offset recompute, the gutter clear, and the stress / floor-cap
+/// criteria. Drives `handle_resize` directly (every dependency injected) so the
+/// intermediate-invariant assertions land in the window before the child's repaint — the
+/// assertion the settled-grid test structurally cannot make.
 #[cfg(test)]
 mod resize {
     use super::*;
@@ -3450,8 +3122,8 @@ mod resize {
     use crate::terminal::mock::{Call, MockTerminal, RecordingGrid};
     use std::cell::RefCell;
 
-    /// A recording [`PtyResizer`] capturing each `master.resize(cols, rows)` in
-    /// order. The ADR-008 gate asserts `master.resize` *preceded* `set_size`.
+    /// A recording [`PtyResizer`] capturing each `master.resize(cols, rows)` in order.
+    /// The ADR-008 gate asserts `master.resize` preceded `set_size`.
     #[derive(Default)]
     struct RecResizer {
         calls: RefCell<Vec<(u16, u16)>>,
@@ -3484,11 +3156,9 @@ mod resize {
         )
     }
 
-    /// **Resize ordering (ADR-008 gate).** Drive one resize and assert the
-    /// `master.resize` call was recorded BEFORE `set_size` ran, both inside the
-    /// one `handle_resize` invocation, and that `set_size` left the parser at the
-    /// band width `W` — proving `master.resize` happened first against the same
-    /// `W`.
+    /// Resize ordering (ADR-008 gate). Drive one resize and assert `master.resize` was
+    /// recorded before `set_size` ran, both inside the one `handle_resize` invocation, and
+    /// that `set_size` left the parser at the band width `W`.
     #[test]
     fn ordering_master_resize_then_set_size() {
         let mut r = renderer(80, 24, 80, Layout::Center, Width::Cols(80));
@@ -3517,10 +3187,10 @@ mod resize {
         );
     }
 
-    /// **Mid-burst case A — intermediate invariant.** After `set_size`, BEFORE
-    /// any child repaint is fed in, the grid must be internally consistent:
-    /// `COLUMNS == W`, cursor column in `[0, W)`, every row length `== W`, no
-    /// panic. This is the degraded-but-consistent contract (ADR-008).
+    /// Mid-burst case A — intermediate invariant. After `set_size`, before any child
+    /// repaint is fed in, the grid must be internally consistent: `COLUMNS == W`, cursor
+    /// column in `[0, W)`, every row length `== W`, no panic — the degraded-but-consistent
+    /// contract (ADR-008).
     #[test]
     fn mid_burst_case_a_intermediate_invariant() {
         let (w, rows, real) = (80u16, 24u16, 200u16);
@@ -3550,12 +3220,11 @@ mod resize {
         }
     }
 
-    /// **Mid-burst case B — settled grid.** Feed `[old bytes at old W →
-    /// set_size(rows, W) → new bytes at new W]` and assert the settled grid equals
-    /// a reference parser fed only the post-resize stream at the new size, with
-    /// `COLUMNS == W` and no panic. (The child's clear+repaint after SIGWINCH
-    /// overwrites the transient grid wholesale — modelled here by the new bytes
-    /// starting with a clear.)
+    /// Mid-burst case B — settled grid. Feed `[old bytes at old W → set_size(rows, W) →
+    /// new bytes at new W]` and assert the settled grid equals a reference parser fed only
+    /// the post-resize stream at the new size, with `COLUMNS == W` and no panic. (The
+    /// child's clear+repaint after SIGWINCH overwrites the transient grid wholesale,
+    /// modelled by the new bytes starting with a clear.)
     #[test]
     fn mid_burst_case_b_settled_grid() {
         let (w, rows, real) = (60u16, 20u16, 100u16);
@@ -3591,12 +3260,12 @@ mod resize {
         assert_eq!(got, want, "settled grid must equal the reference");
     }
 
-    /// **Mid-burst case C — physical gutter has no stale cells.** Paint a wide
-    /// left-aligned frame in the **alt screen** (where the absolute gutter clear
-    /// is owned, ADR-012), then resize so the band shrinks and the margin moves;
-    /// after the gutter clear + repaint, every physical cell outside the band must
-    /// be blank. Proves the explicit gutter clear (ADR-008 step 4) — the
-    /// `rows_diff` repaint alone touches only `[margin, margin+W)`.
+    /// Mid-burst case C — physical gutter has no stale cells. Paint a wide left-aligned
+    /// frame in the alt screen (where the absolute gutter clear is owned, ADR-012), then
+    /// resize so the band shrinks and the margin moves; after the gutter clear + repaint,
+    /// every physical cell outside the band must be blank. Proves the explicit gutter
+    /// clear (ADR-008 step 4) — the `rows_diff` repaint alone touches only `[margin,
+    /// margin+W)`.
     #[test]
     fn mid_burst_case_c_physical_gutter_clear() {
         let (w0, rows, phys) = (100u16, 6u16, 120u16);
@@ -3632,10 +3301,10 @@ mod resize {
         }
     }
 
-    /// **Resize stress.** A scripted sequence of rapid resizes, including
-    /// shrinking `real_cols` below the band width so the centred margin clamps to
-    /// 0 (the `saturating_sub` path). Must never panic and always settle to a
-    /// consistent grid (`COLUMNS == W`, all rows length `W`).
+    /// Resize stress. A scripted sequence of rapid resizes, including shrinking
+    /// `real_cols` below the band width so the centred margin clamps to 0 (the
+    /// `saturating_sub` path). Must never panic and always settle to a consistent grid
+    /// (`COLUMNS == W`, all rows length `W`).
     #[test]
     fn resize_stress_never_panics_settles_consistent() {
         let (w, rows0) = (80u16, 24u16);
@@ -3687,11 +3356,11 @@ mod resize {
         }
     }
 
-    /// **Proportional resize (ADR-011).** With `Width::Percent(50)`, drive a
-    /// resize from `real_cols = 200` to `160`; assert `W` is recomputed (100 →
-    /// 80), and that BOTH `master.resize` and `set_size` used the new `W` (not
-    /// `real_cols`, not the old `W`). Then the SAME resize with `Width::Cols(100)`
-    /// asserts `W` stays 100 (step 0 is a no-op) — the absolute path is untouched.
+    /// Proportional resize (ADR-011). With `Width::Percent(50)`, drive a resize from
+    /// `real_cols = 200` to `160`; assert `W` is recomputed (100 → 80), and that both
+    /// `master.resize` and `set_size` used the new `W` (not `real_cols`, not the old `W`).
+    /// The same resize with `Width::Cols(100)` keeps `W` at 100 — the absolute path is
+    /// untouched.
     #[test]
     fn proportional_resize_tracks_width_absolute_unchanged() {
         // --- Proportional: 50% tracks the terminal. ---
@@ -3730,10 +3399,10 @@ mod resize {
         assert_eq!(r2.parser.screen().size(), (24, 100), "set_size used W=100");
     }
 
-    /// **Floor/cap on a proportional resize.** Shrinking the terminal below the
-    /// point where the percentage would yield less than `MIN_W` floors the band at
-    /// `MIN_W`; a terminal narrower than `MIN_W` caps the band at the terminal —
-    /// never `0`, never `> real_cols`, no panic.
+    /// Floor/cap on a proportional resize. Shrinking the terminal below the point where
+    /// the percentage would yield less than `MIN_W` floors the band at `MIN_W`; a terminal
+    /// narrower than `MIN_W` caps the band at the terminal — never `0`, never
+    /// `> real_cols`, no panic.
     #[test]
     fn proportional_resize_floors_and_caps() {
         let mut r = renderer(100, 24, 200, Layout::Center, Width::Percent(50));
@@ -3750,9 +3419,9 @@ mod resize {
         assert!(r.width > 0, "W never collapses to zero");
     }
 
-    /// The gutter clear is invoked with the live band geometry every resize — in
-    /// the **alt screen**, where gutter owns the whole viewport (ADR-012). Proven
-    /// on the `MockTerminal` call record.
+    /// The gutter clear is invoked with the live band geometry every resize — in the alt
+    /// screen, where gutter owns the whole viewport (ADR-012). Proven on the
+    /// `MockTerminal` call record.
     #[test]
     fn resize_clears_the_gutter() {
         let mut r = renderer(80, 24, 200, Layout::Center, Width::Cols(80));
@@ -3773,15 +3442,12 @@ mod resize {
         );
     }
 
-    /// **Primary-aware resize clears only the live band region (slice 04 /
-    /// ADR-013).** On the **primary** screen a resize must NOT emit the absolute
-    /// `[0, rows)` `clear_gutter` (that would blank rows holding real shell
-    /// history), but it must still force a full band repaint so the band tracks
-    /// the new margin/width. Driving `handle_resize` directly then one
-    /// `render_once`: no `ClearGutter`, yet the band content is repainted in full
-    /// at the new margin (the diff baseline was reset, so every populated row is
-    /// re-emitted) — the "narrow what is cleared, not whether the band repaints"
-    /// contract.
+    /// Primary-aware resize clears only the live band region (ADR-013). On the primary
+    /// screen a resize must not emit the absolute `[0, rows)` `clear_gutter` (that would
+    /// blank rows holding real shell history), but it must still force a full band repaint
+    /// so the band tracks the new margin/width. Driving `handle_resize` then one
+    /// `render_once`: no `ClearGutter`, yet the band content is repainted in full at the
+    /// new margin.
     #[test]
     fn primary_resize_repaints_band_without_absolute_clear() {
         // A primary-screen renderer (never entered the alt screen) with content.
@@ -3824,11 +3490,10 @@ mod resize {
         );
     }
 
-    /// **Resize width-keeps / height-clamps the inline anchor (slice 10 / ADR-013).**
-    /// A width-only drag (rows unchanged) leaves `base_row` exactly where it was — the
-    /// common case, clean either way. A height shrink could otherwise strand grid
-    /// row 0 below the new bottom, so `base_row` is clamped back onto the new screen
-    /// (`rows - 1`); the next frame's make-room then finishes pushing any overshoot up.
+    /// Resize width-keeps / height-clamps the inline anchor (ADR-013). A width-only drag
+    /// (rows unchanged) leaves `base_row` where it was. A height shrink could otherwise
+    /// strand grid row 0 below the new bottom, so `base_row` is clamped back onto the new
+    /// screen (`rows - 1`); the next frame's make-room finishes pushing any overshoot up.
     #[test]
     fn resize_keeps_base_row_on_width_clamps_on_height() {
         let mut r = renderer(40, 24, 100, Layout::Center, Width::Cols(40));

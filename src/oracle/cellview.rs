@@ -1,35 +1,26 @@
 //! The comparison surface for the equivalence gate (ADR-001).
 //!
-//! [`CellView`] is *exactly* the gate's contract — the character plus the seven
-//! SGR fields the PRD names (`contents`, `fgcolor`, `bgcolor`, `bold`, `italic`,
-//! `underline`, `inverse`) and nothing else. Both emulators' native cell types
-//! project onto it, so [`crate::oracle::gate`]'s diff code never branches on
-//! which emulator a cell came from.
-//!
-//! [`Grid`] is the uniform view `align`/`diff_cells` read through: a `cell(row,
-//! col) -> CellView` plus `dims()`. gutter's `vt100::Screen` and the
-//! wezterm-term [`crate::oracle::WeztermGrid`] both implement it, which is what
-//! lets the gate hold two *different* emulators behind one interface (story 2 —
-//! the two-emulator invariant the harness asserts at construction).
+//! [`CellView`] is the character plus the six SGR fields the gate compares.
+//! Both emulators' native cell types project onto it, so the diff code never
+//! branches on which emulator a cell came from. [`Grid`] is the uniform view
+//! `align`/`diff_cells` read through, which is what lets the gate hold two
+//! different emulators behind one interface.
 
-/// A normalised colour, the common denominator of vt100's `Color` and
-/// wezterm's `ColorAttribute`. The gate compares colour by this projection, so
-/// the two emulators' different native representations of the *same* colour
-/// (e.g. a default vs an explicit palette-0) line up — or, when they genuinely
-/// differ, surface as a divergence to classify.
+/// A normalised colour: the common denominator of vt100's `Color` and wezterm's
+/// `ColorAttribute`. The gate compares by this projection so the two emulators'
+/// different native encodings of the same colour line up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Color {
     /// The terminal default (no explicit colour).
     Default,
-    /// A palette index (0..=255), the 16-colour and 256-colour space.
+    /// A palette index (0..=255).
     Indexed(u8),
     /// A 24-bit true colour.
     Rgb(u8, u8, u8),
 }
 
-/// The gate's per-cell comparison surface: the character plus the seven SGR
-/// fields, normalised so the two emulators are diffable. Nothing else — the
-/// comparison surface IS the gate's contract.
+/// The gate's per-cell comparison surface: the character plus the six SGR
+/// fields, normalised so the two emulators diff cleanly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CellView {
     /// The cell's glyph(s). Empty for a blank cell and for a wide glyph's
@@ -45,10 +36,9 @@ pub struct CellView {
 
 /// Normalise a cell's raw contents so a blank reads the same on both emulators.
 ///
-/// vt100 reports an untouched cell as a single space `" "`; wezterm reports it
-/// as `""`. Both mean "blank", so they must not diverge. Collapsing `" "` to
-/// `""` on **both** sides aligns blanks; a genuine space still compares equal
-/// (both sides collapse it identically), so no real content is lost.
+/// vt100 reports an untouched cell as a single space; wezterm reports `""`. Both
+/// mean blank, so collapsing `" "` to `""` on both sides aligns them. A genuine
+/// space still compares equal, since both sides collapse it identically.
 #[must_use]
 pub fn normalise_blank(raw: &str) -> String {
     if raw == " " {
@@ -101,10 +91,9 @@ pub struct CellDivergence {
 /// The classification of a divergence (ADR-001).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// vt100 dropped or mangled what wezterm rendered — the `vt100` bet failed
-    /// for this cell. One or more of these fails the gate.
+    /// vt100 dropped or mangled what wezterm rendered. One or more fails the gate.
     Corrupting,
-    /// Both emulators represent the cell the same way; a benign convention
-    /// difference, tolerated only when allowlisted.
+    /// A benign convention difference between the emulators, tolerated only when
+    /// allowlisted.
     Benign,
 }

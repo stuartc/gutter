@@ -3,33 +3,22 @@
 //! `gutter [--width <N|Npct>] [--center|--left] <cmd> [args...]`. The first
 //! non-flag positional is the command, the rest are its arguments — a
 //! hand-rolled split of `std::env::args`, no clap.
-//!
-//! `--width` accepts two forms (ADR-011): a bare integer → [`Width::Cols`]
-//! (absolute, fixed for the session); an integer with a `pct` or `%` suffix →
-//! [`Width::Percent`] (proportional, recomputed on every resize). When `--width`
-//! is omitted, `W` defaults to the real terminal width at startup, so gutter
-//! behaves as a transparent passthrough.
-//!
-//! `--center` / `--left` select the band's alignment (a [`Layout`]); `--center`
-//! is the default. The alignment feeds the one `geometry::margin` function used
-//! by both startup and the resize handler — there is no per-flag config
-//! hierarchy (two small fields live flat on [`Config`]).
 
 use crate::geometry::{Layout, Width};
 
 /// The parsed invocation: the band width, the alignment, and the child command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// The requested band width, or `None` to default to the real terminal
-    /// width at startup. A [`Width::Percent`] tracks the terminal on resize.
+    /// `None` defaults to the real terminal width at startup, so gutter is a
+    /// transparent passthrough.
     pub width: Option<Width>,
-    /// The band alignment. Defaults to [`Layout::Center`].
+    /// Defaults to [`Layout::Center`].
     pub layout: Layout,
     pub cmd: String,
     pub args: Vec<String>,
 }
 
-/// Parse `gutter [--width <N|Npct>] [--center|--left] <cmd> [args...]` from an
+/// Parses `gutter [--width <N|Npct>] [--center|--left] <cmd> [args...]` from an
 /// argument iterator (excluding argv[0]).
 ///
 /// Flags are only recognised before the command; once the command is seen,
@@ -79,10 +68,10 @@ fn usage() -> String {
     "usage: gutter [--width <N|Npct>] [--center|--left] <cmd> [args...]".to_string()
 }
 
-/// Parse a `--width` value into a [`Width`]: a bare integer is absolute
+/// Parses a `--width` value into a [`Width`]: a bare integer is absolute
 /// ([`Width::Cols`]); an integer with a `pct` or `%` suffix is proportional
-/// ([`Width::Percent`]). The digits are parsed first, then the suffix is
-/// stripped — `pct` is the documented spelling, `%` an accepted alias.
+/// ([`Width::Percent`]). `pct` is the documented spelling, `%` an accepted
+/// alias. See ADR-011.
 fn parse_width(s: &str) -> Result<Width, String> {
     if let Some(digits) = s.strip_suffix("pct").or_else(|| s.strip_suffix('%')) {
         let p: u8 = digits

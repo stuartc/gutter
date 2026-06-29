@@ -1,31 +1,10 @@
-//! Mouse forwarding — eager outer capture + poll-diff forwarding gate (slice 07).
+//! Mouse forwarding gate: turn one decoded outer mouse event into the SGR bytes
+//! the child expects, or a decision to drop it. See ADR-005.
 //!
-//! The rough plan's "mirror on the child's `CSI ?1006h`" is impossible: those
-//! DECSET private modes are absorbed into vt100's `Screen` state and never reach
-//! `unhandled_csi`, the only callback we have (ADR-005). So gutter does not react
-//! to the child's negotiation at all on the outer terminal. Instead:
-//!
-//! 1. **Eager capture** — `EnableMouseCapture` once at startup (in `main`, after
-//!    raw mode), `DisableMouseCapture` once in teardown. The outer terminal is
-//!    already in SGR-any-motion reporting at the first click, so the
-//!    dropped-first-click race is gone by construction.
-//! 2. **Poll gate** — each render cycle, after `parser.process()` and before
-//!    `render_once()`, the render loop reads `screen.mouse_protocol_mode()` and
-//!    `mouse_protocol_encoding()` live and passes them into [`MouseGate::forward`].
-//!    The poll IS the mirror point — there is no change event.
-//! 3. **Forward only when** `mode != None && encoding == Sgr`; swallow on `None`;
-//!    `BailNonSgr` (a loud abort upstream) on a reporting mode with a non-Sgr
-//!    encoding (out of v1 scope — never emit malformed SGR).
-//! 4. **Down-filter** to the child's granularity (forced — the outer bundle
-//!    over-reports any-motion 1003): press/release modes drop motion;
-//!    `ButtonMotion` forwards motion only while a button is held (tracked from
-//!    the decoded press/release stream); `AnyMotion` forwards all.
-//! 5. **Coordinate translation** — subtract the live `left_margin`, discard
-//!    outside `[0, W)`, re-encode SGR as `CSI < b ; col+1 ; row+1 M|m`.
-//!
-//! This module is pure: no I/O, no terminal, no channel. The render loop turns a
-//! [`MouseDecision`] into a PTY-master write, nothing, or a panic. Everything here
-//! is unit/proptest-testable without a PTY — the test seams the PRD calls for.
+//! Pure — no I/O, no terminal, no channel. The render loop reads the child's live
+//! `(mode, encoding)` from the screen each frame and passes them in; that poll is
+//! the only mirror point, because the child's mode-set escapes are absorbed into
+//! vt100's screen state and never reach a callback we can hook.
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
@@ -70,21 +49,19 @@ struct Classified {
     press_transition: Option<bool>,
 }
 
-/// The forwarding gate. The only state it carries across events is the single
-/// button-held flag the `ButtonMotion` down-filter needs — the child's
-/// `(mode, encoding)` is read live from the screen and passed into [`forward`]
-/// each call, so there is nothing to cache (the render loop polls it the
-/// instant before forwarding; the poll IS the mirror point, ADR-005).
+/// The forwarding gate. Carries one piece of state across events: whether a
+/// button is held, which the `ButtonMotion` down-filter needs. The child's
+/// `(mode, encoding)` is read live and passed into [`forward`] each call (ADR-005),
+/// so there is nothing to cache.
 ///
-/// No per-button map — a single "any button held" flag is enough for the
-/// `ButtonMotion` filter, and no test forces finer tracking.
+/// A single "any button held" flag, not a per-button map — enough for the
+/// `ButtonMotion` filter.
 ///
 /// [`forward`]: MouseGate::forward
 #[derive(Debug, Clone, Default)]
 pub struct MouseGate {
-    /// Whether any mouse button is currently held, derived from the press/release
-    /// events gutter decodes from the outer SGR stream. Drives the `ButtonMotion`
-    /// motion filter.
+    /// Whether any mouse button is held, tracked from decoded press/release
+    /// events. Drives the `ButtonMotion` motion filter.
     button_held: bool,
 }
 
@@ -109,32 +86,29 @@ impl MouseGate {
     ) -> MouseDecision {
         let c = classify(event);
 
-        // Update the button-held tracker on every decoded press/release, before
-        // any swallow path — a press that lands while the child is in None still
-        // means the button is down when a later ButtonMotion frame arrives.
+        // Track button-held on every press/release before any swallow path: a
+        // press that lands while the child is in None still means the button is
+        // down when a later ButtonMotion frame arrives.
         if let Some(now_held) = c.press_transition {
             self.button_held = now_held;
         }
 
-        // Gate on the child's reporting mode.
         if mode == MouseProtocolMode::None {
             return MouseDecision::Swallow;
         }
         if encoding != MouseProtocolEncoding::Sgr {
-            // A reporting mode with a non-Sgr encoding is out of v1 scope. Refuse
-            // to forward — emitting a best-effort SGR event here would desync the
-            // child's mouse parser (ADR-005). Fail loud upstream.
+            // Non-Sgr encoding is out of v1 scope. Forwarding a best-effort SGR
+            // event would desync the child's mouse parser (ADR-005), so fail loud
+            // upstream instead.
             return MouseDecision::BailNonSgr;
         }
 
-        // Down-filter motion to the child's granularity.
         if c.is_motion && !should_forward_motion(mode, self.button_held) {
             return MouseDecision::Swallow;
         }
 
-        // Translate the coordinate; a click in the gutter or beyond the band is
-        // discarded (None). Rows pass through unchanged — the band spans the full
-        // height, only columns carry the margin.
+        // Rows pass through unchanged — the band spans the full height, only
+        // columns carry the margin. translate_col discards gutter / out-of-band.
         match translate_col(event.column, left_margin, w) {
             Some(col0) => MouseDecision::Forward(encode_sgr(c.button_byte, col0, event.row, c.kind)),
             None => MouseDecision::Swallow,
@@ -146,11 +120,10 @@ impl MouseGate {
 /// the click is in the gutter (`column < left_margin`) or beyond the band
 /// (`column - left_margin >= w`).
 ///
-/// **Saturating subtraction is load-bearing** (ADR-005): a click in the left
-/// gutter has `column < left_margin`; naive `u16` subtraction wraps to a huge
-/// number that then passes a `< w` check by accident. `checked_sub` returns
-/// `None` for that case — the proptest guards it. Returns the 0-based child
-/// column; the caller's `encode_sgr` adds the SGR 1-based `+1`.
+/// `checked_sub` is load-bearing (ADR-005): a click in the left gutter has
+/// `column < left_margin`, and naive `u16` subtraction would wrap to a huge value
+/// that then slips past the `< w` check. `None` rejects it; the proptest guards
+/// this. The caller's `encode_sgr` adds the SGR 1-based `+1`.
 fn translate_col(event_col: u16, left_margin: u16, w: u16) -> Option<u16> {
     let adjusted = event_col.checked_sub(left_margin)?;
     if adjusted < w {
@@ -165,7 +138,7 @@ fn translate_col(event_col: u16, left_margin: u16, w: u16) -> Option<u16> {
 ///
 /// - `None` — unreachable here (the gate swallows `None` before motion filtering),
 ///   but total: no motion.
-/// - `Press` / `PressRelease` (1000/X10/VT200) — drop all motion.
+/// - `Press` (X10, mode 9) / `PressRelease` (mode 1000) — drop all motion.
 /// - `ButtonMotion` (1002) — motion only while a button is held.
 /// - `AnyMotion` (1003) — forward all motion.
 fn should_forward_motion(mode: MouseProtocolMode, button_held: bool) -> bool {
@@ -181,7 +154,7 @@ fn should_forward_motion(mode: MouseProtocolMode, button_held: bool) -> bool {
 /// Map a crossterm `MouseEvent` to the SGR button byte and the facts the
 /// down-filter and button tracker need.
 ///
-/// The SGR button byte: low bits 0..=2 select the button (0 left, 1 middle,
+/// The SGR button byte: the low 2 bits select the button (0 left, 1 middle,
 /// 2 right); bit 5 (value 32) is the motion bit, set for `Drag`/`Moved`; bit 6
 /// (value 64) is the wheel bit, set for the scroll events (wheel-up 64, wheel-down
 /// 65, wheel-left 66, wheel-right 67). `Drag` carries the held button (motion +

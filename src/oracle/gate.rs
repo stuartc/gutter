@@ -1,38 +1,17 @@
-//! The recorded-target equivalence gate pipeline (ADR-001).
+//! The recorded-target equivalence gate: replay → align → diff → classify.
 //!
-//! The deep module of slice 08: it hides the messy two-emulator
-//! replay→align→diff→classify pipeline behind a small, stable, testable
-//! interface so the CI gate (and any future emulation-layer regression test)
-//! targets a durable seam rather than re-implementing the comparison inline.
-//!
-//! The pipeline, each step a named seam:
-//! - [`Replay`] — feed the same bytes to BOTH parsers at the same width and
-//!   settle. Its constructor asserts the two-emulator invariant (story 2): the
-//!   bare grid is wezterm-term, the wrapped grid is vt100 — different emulators,
-//!   so a sequence vt100 swallows cannot cancel itself out.
-//! - [`align`] — subtract the margin so the wrapped grid's column `margin` maps
-//!   to bare column 0.
-//! - [`diff_cells`] — cell-by-cell over the char + seven SGR fields; one
-//!   [`CellDivergence`] per mismatch.
-//! - [`classify`] — re-diff vt100-vs-wezterm for a diverging cell:
-//!   [`Verdict::Corrupting`] (vt100 dropped/mangled what wezterm rendered) vs
-//!   [`Verdict::Benign`] (both treat it the same).
-//! - [`Allowlist`] — the reviewed benign-divergence file as a typed, queryable
-//!   seam, not an ad-hoc list in the test.
-//! - [`gate`] — the top-level seam the CI test calls. Pass = zero corrupting
-//!   cells on the settled frame.
-//!
-//! wezterm is a divergence **classifier**, not pass/fail ground truth (ADR-001):
-//! the bar is zero *corrupting* cells, NOT zero divergence-vs-wezterm. Benign
-//! convention differences are expected and live in the reviewed [`Allowlist`].
+//! Replays one settled VT byte stream through two parsers at the same width,
+//! diffs the grids cell by cell, and classifies each divergence. wezterm is a
+//! classifier, not pass/fail ground truth: the bar is zero corrupting cells, not
+//! zero divergence-vs-wezterm. See ADR-001.
 
 use std::collections::HashSet;
 
 use super::cellview::{CellDivergence, CellView, Grid, Verdict};
 use super::WeztermGrid;
 
-/// A vt100 screen viewed through the shared [`Grid`] trait — the wrapped side of
-/// the gate (gutter's own emulator at margin 0).
+/// A vt100 screen viewed through the [`Grid`] trait — the wrapped side of the
+/// gate (gutter's own emulator at margin 0).
 pub struct Vt100Grid<'a> {
     screen: &'a vt100::Screen,
 }
@@ -65,8 +44,8 @@ impl Grid for Vt100Grid<'_> {
     }
 }
 
-/// Project vt100's `Color` onto the gate's normalised [`super::Color`] — the
-/// same three buckets the wezterm projection uses, so the two emulators line up.
+/// Projects vt100's `Color` onto the gate's normalised [`super::Color`], using
+/// the same three buckets as the wezterm projection so the two emulators line up.
 fn vt_color(c: vt100::Color) -> super::Color {
     match c {
         vt100::Color::Default => super::Color::Default,
@@ -75,37 +54,30 @@ fn vt_color(c: vt100::Color) -> super::Color {
     }
 }
 
-/// The settled two-emulator replay (story 2). Holds the bare wezterm grid and a
-/// freshly-settled vt100 parser; its constructor asserts the two sides are
-/// **different** emulator types so the same-parser footgun cannot silently
-/// regress.
+/// The settled two-emulator replay: the bare wezterm grid and a freshly-settled
+/// vt100 parser. The constructor asserts the two sides are different emulator
+/// types (ADR-001).
 pub struct Replay {
     bare: WeztermGrid,
-    /// The wrapped-side parser, kept owned so [`Replay::wrapped`] can hand out a
-    /// [`Vt100Grid`] borrowing its settled screen.
+    /// Kept owned so [`Replay::wrapped`] can hand out a [`Vt100Grid`] borrowing
+    /// its settled screen.
     wrapped_parser: vt100::Parser,
 }
 
 impl Replay {
-    /// Feed `stream` to both emulators at `width × rows` and settle. The wrapped
-    /// side is gutter's vt100 at margin 0 (the grid is exactly `width` columns,
-    /// so margin 0 means the wrapped column `c` already maps to bare column `c`).
+    /// Feeds `stream` to both emulators at `width × rows` and settles. The
+    /// wrapped side is gutter's vt100 at margin 0, so wrapped column `c` maps
+    /// straight to bare column `c`.
     ///
-    /// Asserts the two-emulator invariant at construction: the bare grid is
-    /// wezterm-term and the wrapped is vt100 — *different* parsers (ADR-001,
-    /// story 2). The assertion is a type-identity check on the two grid sources,
-    /// so it cannot regress to one shared parser without a compile-time change.
+    /// Asserts the two sides are different parser types (ADR-001). The check is
+    /// on the grid source type names, so collapsing to one shared parser would
+    /// need a compile-time change, not just a slip.
     #[must_use]
     pub fn new(stream: &[u8], width: u16, rows: u16) -> Self {
         let bare = WeztermGrid::replay(stream, width, rows);
         let mut wrapped_parser = vt100::Parser::new(rows, width, 0);
         wrapped_parser.process(stream);
 
-        // The two-emulator invariant (story 2), asserted in the harness
-        // construction, not just a comment: the bare and wrapped sides MUST be
-        // different emulator types. `WeztermGrid` wraps `tattoy-wezterm-term`;
-        // `Vt100Grid` wraps `vt100`. The type names being distinct is the
-        // mechanical proof a refactor can't collapse them to one parser.
         assert_ne!(
             std::any::type_name::<WeztermGrid>(),
             std::any::type_name::<Vt100Grid>(),
@@ -132,17 +104,17 @@ impl Replay {
     }
 }
 
-/// A margin-aligned view over a wrapped grid: column `c` of the aligned view is
-/// column `margin + c` of the underlying grid, so it lines up with the bare grid
-/// (which has no margin). For the gate the wrapped grid is at margin 0, so this
-/// is the identity — but the seam exists per the PRD so the comparison is
-/// margin-agnostic and the alignment is explicit, not assumed.
+/// A margin-aligned view over a wrapped grid: column `c` of the view is column
+/// `margin + c` of the underlying grid, lining it up with the bare grid (which
+/// has no margin). The gate runs at margin 0, so this is the identity there —
+/// the seam exists so the comparison is margin-agnostic and alignment is
+/// explicit, not assumed.
 pub struct Aligned<'a, G: Grid> {
     inner: &'a G,
     margin: u16,
 }
 
-/// Align a wrapped grid to the bare grid by subtracting the margin (PRD seam).
+/// Aligns a wrapped grid to the bare grid by subtracting the margin.
 #[must_use]
 pub fn align<G: Grid>(wrapped: &G, margin: usize) -> Aligned<'_, G> {
     Aligned {
@@ -162,10 +134,9 @@ impl<G: Grid> Grid for Aligned<'_, G> {
     }
 }
 
-/// Cell-by-cell diff over the char + the seven SGR fields. Returns one
-/// [`CellDivergence`] per mismatch, in row-major order. Compares over the
-/// overlapping `(rows, cols)` of the two grids (the settled frame is the same
-/// size on both sides, so this is the full grid).
+/// Diffs two grids cell by cell over the char and the six SGR fields, one
+/// [`CellDivergence`] per mismatch in row-major order. Compares the overlapping
+/// `(rows, cols)`; the settled frame is the same size on both sides.
 #[must_use]
 pub fn diff_cells<B: Grid, W: Grid>(bare: &B, wrapped: &W) -> Vec<CellDivergence> {
     let (brows, bcols) = bare.dims();
@@ -191,16 +162,13 @@ pub fn diff_cells<B: Grid, W: Grid>(bare: &B, wrapped: &W) -> Vec<CellDivergence
     out
 }
 
-/// Classify a divergence (ADR-001). Because [`diff_cells`] already established
-/// that the bare (wezterm) and wrapped (vt100) views differ, the only question
-/// is whether they differ in a way that means vt100 *lost* information.
+/// Classifies a divergence (ADR-001). [`diff_cells`] has already shown the two
+/// views differ; the question is whether vt100 lost information.
 ///
-/// The classifier is content-led: if the two emulators rendered **different
-/// characters** at the cell — vt100 dropped or mangled the glyph wezterm
-/// rendered — that is [`Verdict::Corrupting`]. If the characters match and only
-/// an SGR attribute differs, that is a benign convention difference between the
-/// two emulators ([`Verdict::Benign`]) — wezterm is a classifier, not ground
-/// truth, so an attribute-only disagreement is not on its own a vt100 defect.
+/// Different characters mean vt100 dropped or mangled the glyph wezterm rendered
+/// — [`Verdict::Corrupting`]. Same character, different SGR attribute is a benign
+/// convention difference ([`Verdict::Benign`]): wezterm is a classifier, not
+/// ground truth, so an attribute-only disagreement is not on its own a defect.
 #[must_use]
 pub fn classify(div: &CellDivergence) -> Verdict {
     if div.bare_cell.contents != div.wrapped_cell.contents {
@@ -210,22 +178,19 @@ pub fn classify(div: &CellDivergence) -> Verdict {
     }
 }
 
-/// The reviewed benign-divergence allowlist (story 3) as a typed, queryable
-/// seam. Each entry keys a tolerated benign divergence by its `(row, col)` and
-/// the two characters seen there — so an allowlist entry tolerates *only* the
-/// specific reviewed divergence, not any divergence at that cell.
+/// The reviewed benign-divergence allowlist. Each entry keys a tolerated
+/// divergence by `(row, col)` and the two characters seen there, so it tolerates
+/// only that specific reviewed divergence, not any divergence at the cell.
 #[derive(Debug, Default, Clone)]
 pub struct Allowlist {
-    /// `(row, col, bare_contents, wrapped_contents)` for each reviewed entry.
     entries: HashSet<(u16, u16, String, String)>,
 }
 
 impl Allowlist {
-    /// Parse the in-repo allowlist file. Each non-blank, non-`#` line is
-    /// `row col bare_contents wrapped_contents` (whitespace-separated; the two
-    /// contents fields are the literal cell text, `~` standing for an empty
-    /// cell so blanks are representable). A reviewed file is plain text so the
-    /// human sign-off is a readable diff.
+    /// Parses the in-repo allowlist file. Each non-blank, non-`#` line is
+    /// `row col bare_contents wrapped_contents`, whitespace-separated; the two
+    /// contents fields are the literal cell text, `~` standing for an empty cell.
+    /// Plain text so a reviewer's sign-off shows up as a readable diff.
     #[must_use]
     pub fn parse(text: &str) -> Self {
         let mut entries = HashSet::new();
@@ -248,16 +213,15 @@ impl Allowlist {
         Self { entries }
     }
 
-    /// An empty allowlist — nothing tolerated. Used by the test that proves a
-    /// benign divergence fails the gate once its allowlist entry is removed.
+    /// An empty allowlist — nothing tolerated.
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }
 
-    /// Does the allowlist permit this benign divergence? Keyed on the exact
-    /// reviewed `(row, col, bare, wrapped)` so it tolerates only what a human
-    /// signed off, not any future divergence at the same cell.
+    /// Does the allowlist permit this divergence? Keyed on the exact reviewed
+    /// `(row, col, bare, wrapped)`, so it tolerates only what was signed off, not
+    /// any future divergence at the same cell.
     #[must_use]
     pub fn permits(&self, div: &CellDivergence) -> bool {
         self.entries.contains(&(
@@ -268,7 +232,7 @@ impl Allowlist {
         ))
     }
 
-    /// Number of reviewed entries (for the fixture/coverage assertions).
+    /// Number of reviewed entries.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -280,8 +244,8 @@ impl Allowlist {
     }
 }
 
-/// `~` in the allowlist file stands for an empty cell (so a blank is
-/// representable as a whitespace-delimited token).
+/// `~` in the allowlist file stands for an empty cell, so a blank survives as a
+/// whitespace-delimited token.
 fn unescape(token: &str) -> String {
     if token == "~" {
         String::new()
@@ -290,38 +254,36 @@ fn unescape(token: &str) -> String {
     }
 }
 
-/// The gate's verdict: the corrupting cells (any → fail) and the benign
-/// divergences that were NOT in the allowlist (a reviewer must sign them off or
-/// they are treated as a regression).
+/// The gate's verdict.
 #[derive(Debug, Default)]
 pub struct GateResult {
-    /// Cells where vt100 dropped/mangled what wezterm rendered. **Non-empty →
-    /// the gate fails** and the swap to wezterm-term is the recommended action.
+    /// Cells where vt100 dropped or mangled what wezterm rendered. Non-empty
+    /// fails the gate.
     pub corrupting: Vec<CellDivergence>,
     /// Benign divergences not present in the allowlist — must be reviewed.
     pub unallowlisted_benign: Vec<CellDivergence>,
 }
 
 impl GateResult {
-    /// Pass = zero corrupting cells on the settled frame (ADR-001). Unallowlisted
-    /// benign divergences are surfaced separately for review but are not, on
-    /// their own, the corrupting-cell failure the swap decision rests on.
+    /// Passes on zero corrupting cells (ADR-001). Unallowlisted benign
+    /// divergences are surfaced for review but do not, on their own, fail the
+    /// gate.
     #[must_use]
     pub fn passes(&self) -> bool {
         self.corrupting.is_empty()
     }
 }
 
-/// The top-level gate seam (ADR-001): replay `stream` through both emulators at
-/// `width`, align the wrapped grid to the bare (margin 0 for the gate), diff
-/// cell + the seven SGR fields, classify each divergence, and filter out
-/// benign-and-allowlisted ones. Pass = `result.corrupting.is_empty()`.
+/// Runs the full gate (ADR-001): replay `stream` through both emulators at
+/// `width`, align the wrapped grid to the bare, diff and classify each
+/// divergence, and drop the benign-and-allowlisted ones. Pass =
+/// `result.corrupting.is_empty()`.
 #[must_use]
 pub fn gate(stream: &[u8], width: u16, rows: u16, allowlist: &Allowlist) -> GateResult {
     let replay = Replay::new(stream, width, rows);
     let wrapped = replay.wrapped();
-    // The gate runs the wrapped side at margin 0, so alignment is the identity —
-    // but go through the seam explicitly so the pipeline is margin-agnostic.
+    // Margin 0 makes alignment the identity here; go through the seam anyway so
+    // the pipeline stays margin-agnostic.
     let aligned = align(&wrapped, 0);
 
     let divergences = diff_cells(replay.bare(), &aligned);
@@ -345,8 +307,8 @@ mod tests {
     use super::*;
     use crate::oracle::cellview::Color;
 
-    /// A vt100-backed [`Grid`] built straight from bytes — the test helper for
-    /// the diff/classify/allowlist units (no wezterm needed for those).
+    /// A vt100 parser built straight from bytes — the diff/classify/allowlist
+    /// units don't need wezterm.
     fn vt(bytes: &[u8], width: u16, rows: u16) -> vt100::Parser {
         let mut p = vt100::Parser::new(rows, width, 0);
         p.process(bytes);
@@ -387,10 +349,9 @@ mod tests {
         assert_eq!(classify(&div), Verdict::Benign);
     }
 
-    /// The allowlist is load-bearing: a benign divergence is tolerated ONLY
-    /// because it is allowlisted — remove the entry and the same divergence is
-    /// reported as unallowlisted (story 3, the "allowlist is not decorative"
-    /// proof at the unit level; the gate-level version uses the real fixture).
+    /// The allowlist is load-bearing: a benign divergence is tolerated only
+    /// because it is allowlisted. Remove the entry and the same divergence is
+    /// reported as unallowlisted.
     #[test]
     fn allowlist_is_load_bearing() {
         let div = CellDivergence {
@@ -438,43 +399,33 @@ mod tests {
     }
 }
 
-/// The recorded-target equivalence gate against the checked-in Claude Code
-/// fixture (ADR-001) — the keystone CI test of slice 08. Offline and
-/// deterministic: it drives the two emulators directly (no PTY, no threads),
-/// exactly as the slice-06 OSC-52 dispatch test drives `parser.process()`.
+/// The equivalence gate against the checked-in Claude Code fixture (ADR-001).
+/// Offline and deterministic: drives the two emulators directly, no PTY or
+/// threads.
 #[cfg(test)]
 mod equivalence_gate {
     use super::*;
 
-    /// The checked-in real-target byte stream and its reviewed allowlist.
     const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/claude-code-flow.cast");
     const ALLOWLIST: &str = include_str!("../../tests/fixtures/claude-code-flow.allowlist");
-    /// The band width the keystone fixture was recorded at, and the gate replays
-    /// at. This pair is bound to `claude-code-flow.cast` and read by name in three
-    /// tests — a second fixture at any other width must carry its OWN dimensions
-    /// (the per-fixture width trap), so the wide-edge fixture uses `W_WIDE`/
-    /// `ROWS_WIDE` below rather than borrowing these.
+    /// The width and rows `claude-code-flow.cast` was recorded at; the gate must
+    /// replay at the same size or the cell diff misaligns. Each fixture carries
+    /// its own dimensions — the wide-edge fixture uses `W_WIDE`/`ROWS_WIDE` rather
+    /// than borrowing these, even though they happen to match.
     const W: u16 = 80;
     const ROWS: u16 = 24;
 
-    /// The CJK / wide-char-at-band-edge fixture (slice 06, A2) and its reviewed
-    /// allowlist. A separate raw, timing-less, settled alt-screen VT byte stream
-    /// from the keystone — laid out so a wide (2-cell) glyph's lead sits at the
-    /// last in-band column, putting real divergence pressure on vt100's margin
-    /// rule (ADR-006). It declares its OWN width/rows (`W_WIDE`/`ROWS_WIDE`) — it
-    /// happens to also be 80×24, but the consts are distinct names so the gate
-    /// never silently reuses the keystone's pair against a differently-sized
-    /// fixture (the per-fixture width trap the PRD names).
+    /// The CJK / wide-char-at-band-edge fixture and its allowlist. A settled
+    /// alt-screen stream laid out so a wide (2-cell) glyph's lead sits at the last
+    /// in-band column, putting pressure on vt100's margin rule (ADR-006).
     const FIXTURE_WIDE: &[u8] = include_bytes!("../../tests/fixtures/wide-edge.cast");
     const ALLOWLIST_WIDE: &str = include_str!("../../tests/fixtures/wide-edge.allowlist");
     const W_WIDE: u16 = 80;
     const ROWS_WIDE: u16 = 24;
 
-    /// **The gate (CI keystone).** Replay the fixture at width `W` through
-    /// `tattoy-wezterm-term` (bare) AND gutter's vt100 (wrapped, margin 0),
-    /// align, diff cell + the seven SGR fields, classify each divergence. **Pass
-    /// = zero CORRUPTING cells on the settled frame** (ADR-001). Any benign
-    /// divergence must be in the reviewed allowlist.
+    /// The gate: replay the fixture at width `W` through wezterm-term (bare) and
+    /// gutter's vt100 (wrapped), diff, and classify. Passes on zero corrupting
+    /// cells; any benign divergence must be in the reviewed allowlist (ADR-001).
     #[test]
     fn recorded_target_equivalence_gate_passes() {
         let allowlist = Allowlist::parse(ALLOWLIST);
@@ -509,16 +460,13 @@ mod equivalence_gate {
         assert!(result.passes(), "gate must pass on the settled frame");
     }
 
-    /// **The two-emulator invariant (story 2).** The bare and wrapped sides MUST
-    /// be different emulator types — a shared parser would hide any sequence
-    /// vt100 swallows. `Replay::new` asserts this at construction; this test
-    /// pins the two grid source types are mechanically distinct.
+    /// The bare and wrapped sides must be different emulator types — a shared
+    /// parser would hide any sequence vt100 swallows. `Replay::new` asserts this;
+    /// the test pins it independently too.
     #[test]
     fn gate_uses_two_different_emulators() {
-        // Constructing the replay runs the in-harness two-emulator assertion.
+        // Constructing the replay runs the in-harness assertion.
         let _replay = Replay::new(FIXTURE, W, ROWS);
-        // And pin it here too, so the invariant is asserted at the test level as
-        // well as in the harness body.
         assert_ne!(
             std::any::type_name::<WeztermGrid>(),
             std::any::type_name::<Vt100Grid>(),
@@ -526,23 +474,21 @@ mod equivalence_gate {
         );
     }
 
-    /// **Benign-divergence allowlist is load-bearing (story 3), at the gate
-    /// level.** Inject a synthetic benign divergence (same char, different SGR)
-    /// by diffing two slightly-different vt100 grids, confirm it classifies
-    /// benign, then prove an allowlist entry tolerates it and removing the entry
-    /// surfaces it as unallowlisted — the allowlist is consulted, not decorative.
+    /// The allowlist is load-bearing at the gate level. Diff two vt100 grids that
+    /// differ only on fg colour, confirm it classifies benign, then show an
+    /// allowlist entry tolerates it and the empty allowlist does not.
     #[test]
     fn allowlist_consulted_by_gate_pipeline() {
-        // A cell that is the same character on both sides but a different fg —
-        // the canonical benign convention difference.
+        // Same character on both sides, different fg — the canonical benign
+        // convention difference.
         let bare = {
             let mut p = vt100::Parser::new(1, 4, 0);
-            p.process(b"\x1b[31mok\x1b[0m"); // red "ok"
+            p.process(b"\x1b[31mok\x1b[0m"); // red
             p
         };
         let wrapped = {
             let mut p = vt100::Parser::new(1, 4, 0);
-            p.process(b"ok"); // default "ok"
+            p.process(b"ok"); // default colour
             p
         };
         let gb = Vt100Grid::new(bare.screen());
@@ -552,8 +498,6 @@ mod equivalence_gate {
         let div = &divs[0];
         assert_eq!(classify(div), Verdict::Benign, "same char, diff fg → benign");
 
-        // An allowlist entry keyed on the exact (row, col, bare, wrapped)
-        // tolerates it; the empty allowlist does not.
         let entry = format!(
             "{} {} {} {}",
             div.row,
@@ -571,10 +515,9 @@ mod equivalence_gate {
         );
     }
 
-    /// **Fixture coverage (assertion on the fixture).** The checked-in byte
-    /// stream must contain the five required phases, so it can't silently shrink
-    /// to thin ASCII and weaken the gate. Each phase is detected by a byte
-    /// marker characteristic of it.
+    /// The fixture must contain all five phases, so it can't silently shrink to
+    /// thin ASCII and weaken the gate. Each phase is detected by a characteristic
+    /// byte marker.
     #[test]
     fn fixture_contains_the_five_phases() {
         let f = FIXTURE;
@@ -601,8 +544,8 @@ mod equivalence_gate {
         assert!(contains(f, "\u{280b}".as_bytes()), "phase 5: spinner glyph");
         assert!(contains(f, b"Thinking..."), "phase 5: spinner label");
 
-        // And the fixture must be SGR-dense, not thin ASCII (ADR-001): a healthy
-        // count of SGR introducers proves it carries real attribute runs.
+        // SGR-dense, not thin ASCII (ADR-001): a healthy count of CSI introducers
+        // proves the fixture carries real attribute runs.
         let sgr_count = f.windows(2).filter(|w| w == b"\x1b[").count();
         assert!(
             sgr_count > 40,
@@ -615,9 +558,9 @@ mod equivalence_gate {
     #[test]
     fn allowlist_file_loads() {
         let allow = Allowlist::parse(ALLOWLIST);
-        // The fixture currently has zero benign divergences, so the reviewed
-        // allowlist is empty — but it must parse (comments/blanks skipped) and
-        // be the value the gate is handed.
+        // Zero benign divergences in the current fixture, so the reviewed
+        // allowlist is empty — but it must still parse and be the value the gate
+        // is handed.
         assert!(
             allow.is_empty(),
             "the reviewed allowlist is empty for the current fixture (no benign \
@@ -625,17 +568,14 @@ mod equivalence_gate {
         );
     }
 
-    /// **The wide-char-at-band-edge gate (slice 06, A2).** The same pipeline as
-    /// the keystone, run against `wide-edge.cast` at its OWN `W_WIDE`/`ROWS_WIDE`
-    /// — a settled alt-screen frame where wide (2-cell) CJK glyphs and an emoji sit
-    /// at the last in-band column (cols 79/80), plus a CJK run that overflows the
-    /// band by a full glyph so vt100's margin rule must wrap it. **Pass = zero
-    /// CORRUPTING cells** (ADR-001): both emulators must agree on every CHARACTER.
+    /// The wide-char-at-band-edge gate: the same pipeline, run against
+    /// `wide-edge.cast`, where wide (2-cell) CJK glyphs and an emoji sit at the
+    /// last in-band column and a CJK run overflows the band by a full glyph so
+    /// vt100's margin rule must wrap it. Passes on zero corrupting cells.
     ///
-    /// This is the test that would FAIL and demand `render_cell_walk` be wired
-    /// (A1, slice 05) if vt100's margin rule ever let a wide glyph's right half
-    /// bleed past column W where the wezterm-term oracle did not — a corrupting
-    /// cell here is the concrete, known trigger that reopens A1 (ADR-006).
+    /// A corrupting cell here is the concrete trigger that reopens ADR-006 and
+    /// demands `render_cell_walk` be wired: it means vt100's margin rule let a
+    /// wide glyph's right half bleed past column W where wezterm-term did not.
     #[test]
     fn wide_edge_equivalence_gate_passes() {
         let allowlist = Allowlist::parse(ALLOWLIST_WIDE);
@@ -671,11 +611,9 @@ mod equivalence_gate {
         assert!(result.passes(), "wide-edge gate must pass on the settled frame");
     }
 
-    /// **Wide-edge fixture coverage (assertion on the fixture).** The checked-in
-    /// `wide-edge.cast` must carry real wide content — CJK codepoints AND an emoji
-    /// — and stay SGR-dense, so it can't silently degrade to thin ASCII and stop
-    /// exercising vt100's margin rule (the analogue of
-    /// `fixture_contains_the_five_phases` for the keystone).
+    /// `wide-edge.cast` must carry real wide content — CJK codepoints and an
+    /// emoji — and stay SGR-dense, so it can't silently degrade to thin ASCII and
+    /// stop exercising vt100's margin rule.
     #[test]
     fn wide_edge_fixture_contains_wide_content() {
         let f = FIXTURE_WIDE;
@@ -686,8 +624,7 @@ mod equivalence_gate {
         // A settled alt-screen frame (the wide content is laid into a fixed band).
         assert!(contains(f, b"\x1b[?1049h"), "wide-edge: alt-screen enter (DECSET)");
 
-        // CJK codepoints (each 2 grid cells wide) — the UTF-8 bytes of the glyphs
-        // the fixture lays at the band edge.
+        // CJK codepoints (each 2 cells wide), laid at the band edge.
         assert!(contains(f, "漢".as_bytes()), "wide-edge: CJK glyph present");
         assert!(contains(f, "字".as_bytes()), "wide-edge: CJK glyph present");
         // An emoji (also 2 cells wide) at the edge — the non-CJK wide codepoint.
@@ -703,10 +640,8 @@ mod equivalence_gate {
         );
     }
 
-    /// The reviewed wide-edge allowlist file loads and is empty (the two emulators
-    /// agree on every cell of the settled wide-edge frame — zero corrupting AND
-    /// zero benign divergences). It exists, parses, and is the seam a reviewer adds
-    /// to only on a benign SGR-convention difference at a same-character cell.
+    /// The reviewed wide-edge allowlist loads and is empty: the two emulators
+    /// agree on every cell of the settled frame, so there's nothing to tolerate.
     #[test]
     fn wide_edge_allowlist_file_loads() {
         let allow = Allowlist::parse(ALLOWLIST_WIDE);

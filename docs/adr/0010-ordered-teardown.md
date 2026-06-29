@@ -1,0 +1,33 @@
+# ADR-010: Explicit ordered teardown
+
+Status: Accepted
+
+## Context
+
+We exit via `process::exit`, so no destructors run. Every terminal state we set up
+has to be torn down by hand, and some steps depend on order — leave the alt screen
+after disabling raw mode and the terminal is left corrupted.
+
+## Decision
+
+Restore explicitly, in order, before exiting: leave the alt screen (or hand back
+inline) → pop kitty flags → disable mouse → show cursor → disable raw mode. Each
+step is conditional on what was actually set up.
+
+## Consequences
+
+- All cleanup is in one teardown path; nothing relies on `Drop`.
+- The alt-leave only fires if the child exited in the alt screen. A plain command's
+  output is left on the primary screen.
+- The kitty pop only fires if we pushed a level.
+- Disabling mouse, showing the cursor, and disabling raw mode are always safe to
+  call unconditionally.
+
+## Code anchors
+
+- `src/render.rs` — the ordered teardown path
+- `src/terminal.rs` — the `OuterTerminal` restore methods and an order-asserting mock
+
+The inline hand-back is [ADR-013](0013-inline-anchor-scroll-paint.md); the
+screen-mode mirroring it depends on is
+[ADR-012](0012-screen-mode-mirroring.md).

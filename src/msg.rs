@@ -1,23 +1,21 @@
-//! The merged message enum carried by the single unbounded channel into the
-//! render thread. The PTY path is throttled upstream (bounded `sync_channel`),
-//! so the merged channel is unbounded and an input `send()` never blocks —
-//! a keystroke stays admissible under a multi-MB PTY flood.
+//! The merged message enum carried into the render thread on one unbounded
+//! channel. See ADR-009.
 
 use portable_pty::ExitStatus;
 
-/// Everything the render thread (Thread 2) selects over, merged onto one
-/// unbounded `std::sync::mpsc` channel.
+/// Everything the render thread selects over, merged onto one unbounded
+/// `std::sync::mpsc` channel.
 ///
-/// - `Pty` — a chunk of raw child output from Thread 1 (the dumb byte pump).
-/// - `Input` — a decoded crossterm event from Thread 3 (the input reader).
-/// - `ChildExited` — the authoritative child-death signal from Thread 4 (the
-///   waiter). This, **not** PTY EOF and **not** channel `Disconnected`, drives
-///   shutdown. See ADR-009 / ADR-010.
-/// - `PtyEof` — the PTY forwarder hit EOF and has sent every `Pty` chunk ahead
-///   of it (same-thread FIFO ordering). A **drain terminator only**: it lets the
-///   shutdown path know the child's final bytes have all landed, so teardown can
-///   read `outer_alt_active` without racing the last frame. It never triggers
-///   shutdown — the waiter stays authoritative (ADR-010, PTY EOF unreliable).
+/// - `Pty` — a chunk of raw child output from the PTY reader (Thread 1).
+/// - `Input` — a decoded crossterm event from the input reader (Thread 3).
+/// - `ChildExited` — the child-death signal from the waiter (Thread 4). The
+///   authoritative shutdown trigger: PTY EOF never drives it, and a channel
+///   `Disconnected` is only a backstop for when every sender drops without one.
+/// - `PtyEof` — the PTY reader hit EOF after sending its final `Pty` chunk
+///   (same-thread FIFO ordering). A drain terminator only: it tells the shutdown
+///   path the child's last bytes have landed, so teardown can read
+///   `outer_alt_active` without racing the final frame. It never triggers
+///   shutdown.
 #[derive(Debug)]
 pub enum Msg {
     Pty(Vec<u8>),

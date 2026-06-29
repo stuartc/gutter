@@ -1,17 +1,9 @@
-//! The `tattoy-wezterm-term` comparison oracle and the recorded-target
-//! equivalence gate (ADR-001), behind the `oracle` feature flag.
+//! The wezterm-term comparison oracle behind the `oracle` feature flag. The
+//! equivalence gate replays a settled byte stream through wezterm-term and diffs
+//! its grid against gutter's own vt100 grid. See ADR-001.
 //!
-//! Slice 02 wired the oracle in so it **compiles** and produces a grid
-//! comparable to gutter's own vt100 grid — making the day-1 gate a flag flip,
-//! not a fresh integration. Slice 08 builds the gate itself **on** that wiring:
-//! [`build_terminal`] is the single wezterm-term construction site that backs
-//! the gate's bare-side [`WeztermGrid`]. There is exactly one oracle, not two
-//! (the re-scope checkpoint's most-likely cruft, avoided).
-//!
-//! Using a **different** emulator from gutter's vt100 on the bare side is
-//! mandatory (ADR-001): a single shared parser would hide any sequence vt100
-//! silently swallows. The gate asserts this two-emulator invariant in its
-//! harness construction ([`gate::Replay`]), not just in a comment.
+//! The bare side uses a different emulator on purpose: a shared parser would
+//! hide any sequence vt100 silently swallows.
 
 use std::sync::Arc;
 
@@ -23,9 +15,9 @@ pub mod gate;
 
 use cellview::{CellView, Color, Grid};
 
-/// A minimal `TerminalConfiguration` for the oracle. Only `color_palette` has no
-/// default on the trait; everything else uses the trait defaults, which is all
-/// the grid comparison needs.
+/// Minimal `TerminalConfiguration` for the oracle. `color_palette` is the only
+/// trait method without a default; the trait defaults cover everything the grid
+/// comparison needs.
 #[derive(Debug)]
 struct OracleConfig;
 
@@ -35,9 +27,8 @@ impl TerminalConfiguration for OracleConfig {
     }
 }
 
-/// Build a wezterm-term [`Terminal`] of `width × rows` and replay `bytes`
-/// through it. The single wezterm construction site, so there is one oracle, not
-/// two (the re-scope checkpoint's most-likely cruft, avoided).
+/// Builds a wezterm-term [`Terminal`] of `width × rows` and replays `bytes`
+/// through it.
 #[must_use]
 fn build_terminal(bytes: &[u8], width: u16, rows: u16) -> Terminal {
     let size = TerminalSize {
@@ -58,20 +49,17 @@ fn build_terminal(bytes: &[u8], width: u16, rows: u16) -> Terminal {
     term
 }
 
-/// The bare-side grid for the equivalence gate: a wezterm-term screen read
-/// through the shared [`Grid`] trait so the gate's `align`/`diff_cells` see it
-/// uniformly with gutter's vt100 grid.
-///
-/// Built from the shared [`build_terminal`] — the gate reuses the oracle wiring
-/// rather than standing up a second copy.
+/// The bare-side grid for the equivalence gate: a wezterm-term screen exposed
+/// through the shared [`Grid`] trait, so the gate diffs it uniformly against
+/// gutter's vt100 grid.
 pub struct WeztermGrid {
-    /// One owned wezterm `Line` per visible row (read off the settled screen).
+    /// One owned wezterm `Line` per visible row, read off the settled screen.
     lines: Vec<tattoy_wezterm_term::Line>,
     cols: u16,
 }
 
 impl WeztermGrid {
-    /// Replay `bytes` through the oracle at `width × rows` and snapshot the
+    /// Replays `bytes` through the oracle at `width × rows` and snapshots the
     /// settled visible grid.
     #[must_use]
     pub fn replay(bytes: &[u8], width: u16, rows: u16) -> Self {
@@ -113,10 +101,10 @@ impl Grid for WeztermGrid {
     }
 }
 
-/// Project a wezterm `ColorAttribute` onto the gate's normalised [`Color`].
-/// True-colour-with-fallback collapses to its RGB; a bare palette index stays
-/// indexed; default stays default — the same three buckets vt100's `Color`
-/// uses, so the two emulators line up.
+/// Maps a wezterm `ColorAttribute` onto the gate's normalised [`Color`].
+/// True-colour-with-fallback collapses to its RGB; a palette index stays
+/// indexed; default stays default — the same three buckets vt100's `Color` uses,
+/// so the two emulators line up.
 fn wez_color(c: tattoy_wezterm_term::color::ColorAttribute) -> Color {
     use tattoy_wezterm_term::color::ColorAttribute as CA;
     match c {

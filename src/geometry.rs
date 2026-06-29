@@ -1,48 +1,30 @@
-//! Pure offset / coordinate / band-width maths — the single home for all the
-//! layout arithmetic the render path and the resize handler depend on.
+//! Pure layout maths: band width and left margin. No I/O, so it is
+//! property-testable directly. The render path and resize handler call in here
+//! rather than computing offsets themselves.
 //!
-//! Everything here is a free function or a small enum with no I/O, so it is
-//! property-testable directly. The render loop and the resize handler never
-//! compute a margin or resolve a width themselves — they call in here. The
-//! re-scope checkpoint for slice 05 insists on exactly one `margin()` and one
-//! `resolve_width()`, each called by both the startup path and the resize
-//! handler; this module is that one home.
-//!
-//! Two pieces of dynamic geometry land with resize (slice 05 / ADR-011):
-//! - **[`margin`]** — the band's physical left offset. Centred or left-aligned,
-//!   selected by the `--center`/`--left` flag (a [`Layout`]). Centred tracks
-//!   `real_cols`, so resize recomputes it.
-//! - **[`resolve_width`]** — the effective band width `W`. Absolute (`Cols`) is
-//!   fixed for the session; proportional (`Percent`) tracks `real_cols`, so
-//!   resize recomputes it (floored at [`MIN_W`], capped at `real_cols`).
+//! See ADR-011 for width resolution and ADR-006 for the band-fit margin rule.
 
-/// The minimum band width. A proportional band on a tiny terminal, or a tiny
-/// percentage, floors here rather than collapsing toward zero — but only up to
-/// `real_cols`, so on a terminal narrower than `MIN_W` the band caps at the
-/// terminal width (a band can never be wider than the screen).
+/// Minimum band width. A proportional band on a tiny terminal floors here rather
+/// than collapsing toward zero — but capped at `real_cols`, so on a terminal
+/// narrower than `MIN_W` the band caps at the terminal width.
 pub const MIN_W: u16 = 20;
 
-/// The band's horizontal alignment, selected by `--center` / `--left`.
-///
-/// `Center` is the default. The offset each produces is computed by [`margin`];
-/// the enum carries no offset arithmetic itself (one function, no duplication).
+/// The band's horizontal alignment, selected by `--center` / `--left`. The
+/// offset each produces is computed by [`margin`], not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Layout {
-    /// Centre the band: equal gutters either side (slack rounded down). The
-    /// default alignment.
+    /// Centre the band: equal gutters either side, slack rounded down.
     #[default]
     Center,
     /// Left-align the band: gutter on the right only (margin 0).
     Left,
 }
 
-/// The requested band width from `--width`, before it is resolved against the
-/// real terminal by [`resolve_width`].
+/// The requested band width from `--width`, before [`resolve_width`] resolves it
+/// against the real terminal. See ADR-011.
 ///
-/// - `Cols(n)` — **absolute**: the band is exactly `n` columns; fixed for the
-///   session, resize never changes it.
-/// - `Percent(p)` — **proportional**: the band is `p`% of `real_cols`, resolved
-///   at startup and recomputed on every resize (ADR-011).
+/// - `Cols(n)` — absolute: exactly `n` columns, fixed for the session.
+/// - `Percent(p)` — proportional: `p`% of `real_cols`, recomputed on resize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Width {
     Cols(u16),
@@ -50,13 +32,10 @@ pub enum Width {
 }
 
 /// The band's left margin for the given layout, real terminal width and band
-/// width `W`. The single source of truth for the offset — called by the startup
-/// path and by the resize handler (ADR-011 / slice-05 re-scope checkpoint).
+/// width `W`. See ADR-011.
 ///
-/// `Center` = half the slack between the terminal and the band, rounded down;
-/// `saturating_sub` pins the slack to zero when `W >= real_cols`, so a band as
-/// wide as (or wider than) the terminal sits flush at column 0 and the margin
-/// is never negative or wrapped. `Left` = `0`.
+/// `Center` is half the slack, rounded down; `saturating_sub` pins the slack to
+/// zero when `W >= real_cols`, so the margin never wraps negative. `Left` is `0`.
 #[must_use]
 pub fn margin(layout: Layout, real_cols: u16, width: u16) -> u16 {
     match layout {
@@ -65,25 +44,19 @@ pub fn margin(layout: Layout, real_cols: u16, width: u16) -> u16 {
     }
 }
 
-/// The physical column a child cell at in-band column `col` maps to, given the
-/// band's left margin. Saturating so an out-of-range column can never wrap.
+/// The physical column an in-band column `col` maps to, given the band's left
+/// margin. Saturating, so an out-of-range column can never wrap.
 #[must_use]
 pub fn physical_col(left_margin: u16, col: u16) -> u16 {
     left_margin.saturating_add(col)
 }
 
 /// Resolve the effective band width `W` from the requested [`Width`] against the
-/// current real terminal width. The single source of truth for band width —
-/// called once at startup (initial `W`) and again on every resize for the
-/// proportional path (ADR-011).
+/// current real terminal width. See ADR-011.
 ///
-/// - `Cols(n)` — the identity on `n` (clamped to at least 1 and capped at
-///   `real_cols` so an absolute width wider than the terminal can't overflow the
-///   screen). Independent of `real_cols` otherwise: resize is a no-op.
-/// - `Percent(p)` — `real_cols * p / 100`, then **floored at [`MIN_W`]** and
-///   **capped at `real_cols`**. So a tiny percentage or a tiny terminal clamps
-///   the band to `MIN_W` (or to `real_cols` when the terminal is narrower than
-///   `MIN_W`), never `0`, never `> real_cols`.
+/// `Cols(n)` is the identity on `n`, clamped to `[1, real_cols]`. `Percent(p)` is
+/// `real_cols * p / 100`, floored at [`MIN_W`] and capped at `real_cols` — so a
+/// tiny percentage or terminal never collapses the band to `0`.
 #[must_use]
 pub fn resolve_width(width: Width, real_cols: u16) -> u16 {
     let real_cols = real_cols.max(1);
@@ -143,10 +116,9 @@ mod tests {
     }
 
     proptest! {
-        /// The ADR-006 band-fit invariant for the centred formula, now over the
-        /// live flag: for any terminal/band/column the physical column the
-        /// repaint targets never wraps, never lands a content cell at or past
-        /// `real_cols`, and in-band content stays within `[margin, margin + W)`.
+        /// The ADR-006 band-fit invariant: for any terminal/band/column the
+        /// physical column never wraps, never lands at or past `real_cols`, and
+        /// stays within `[margin, margin + W)`.
         #[test]
         fn centred_margin_never_overflows_band(
             real_cols in 1u16..=1000,
@@ -182,9 +154,8 @@ mod tests {
             }
         }
 
-        /// Recompute-on-resize: the centred margin computed at one terminal width
-        /// then recomputed at another yields the correct offset for each — the
-        /// one function serving both callers, the recompute actually running.
+        /// Recompute on resize: the centred margin computed at one terminal width
+        /// then at another yields the correct offset for each.
         #[test]
         fn centred_margin_recomputes_on_resize(
             old_cols in 21u16..=1000,
@@ -199,11 +170,9 @@ mod tests {
             prop_assert_eq!(m_new, new_cols.saturating_sub(w_new) / 2);
         }
 
-        /// `resolve_width(Percent)` floor/cap acceptance criterion (ADR-011): for
-        /// any terminal and any percentage `1..=100`, the band is `>=
-        /// MIN_W.min(real_cols)`, `<= real_cols`, never `0`, never panics, and is
-        /// monotonic non-decreasing in `real_cols` (a wider terminal never yields
-        /// a narrower band).
+        /// `resolve_width(Percent)` floor/cap (ADR-011): for any terminal and
+        /// percentage `1..=100` the band is `>= MIN_W.min(real_cols)`, `<=
+        /// real_cols`, never `0`, and monotonic non-decreasing in `real_cols`.
         #[test]
         fn percent_width_floor_cap_monotonic(
             real_cols in 1u16..=2000,
@@ -223,8 +192,7 @@ mod tests {
         }
 
         /// `resolve_width(Cols)` is the identity on `n` (clamped), independent of
-        /// `real_cols` whenever `n <= real_cols` — the absolute path is untouched
-        /// by the proportional feature.
+        /// `real_cols` whenever `n <= real_cols`.
         #[test]
         fn absolute_width_is_independent_of_real_cols(
             n in 1u16..=500,

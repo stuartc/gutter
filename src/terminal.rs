@@ -1,84 +1,66 @@
-//! Outer-terminal handle (Thread 2 only): lifecycle + the render output sink.
+//! Outer-terminal handle, owned by Thread 2: terminal lifecycle plus the render
+//! output sink, behind one injectable trait so the render path can be tested
+//! against a recording mock.
 //!
-//! Two responsibilities behind one injectable trait:
-//!
-//! 1. **Lifecycle** — raw mode, the mirrored alt screen, and the explicit
-//!    ordered restore (conditionally leave alt screen → pop kitty flags → disable
-//!    mouse → show cursor → disable raw mode) run BEFORE `process::exit`
-//!    (ADR-010). The alt screen is no longer forced at setup; it mirrors the
-//!    child's mode from the render thread (ADR-012), so the teardown leave is
-//!    conditional. `process::exit` runs no destructors, so teardown cannot be a
-//!    `Drop` guard.
-//! 2. **Render output** — the offset repaint paints through this handle:
-//!    `move_to(col, row)` positions a row at its physical left margin,
-//!    `write_row(bytes)` emits that row's `rows_diff` byte run, `place_cursor`
-//!    repositions the real cursor inside the band, and `set_cursor_visible`
-//!    mirrors the child's DECTCEM state. Keeping output behind the trait lets
-//!    the render path be unit-tested against a recording mock — physical-cell
-//!    assertions read back what was painted to which column.
-//!
-//! Setup mirrors teardown: the eager startup `enable_mouse`
-//! (`EnableMouseCapture`, ADR-005) and the kitty push are paired with
-//! `disable_mouse`/`pop_keyboard_flags` in the restore — each undoes only what it
-//! actually set.
+//! Lifecycle is raw mode, the mirrored alt screen, and an explicit ordered
+//! restore (ADR-010). Teardown runs before `process::exit`, which skips
+//! destructors — so it cannot be a `Drop` guard. Setup and teardown are
+//! symmetric: each restore step undoes only what was actually set up. The alt
+//! screen is not forced at setup; it mirrors the child's mode (ADR-012).
 
 use std::io::{self, Write};
 
 /// The outer-terminal side effects the setup, render and teardown paths perform.
 ///
-/// The real impl ([`CrosstermTerminal`]) wraps crossterm against stdout; the
-/// test mock ([`mock::MockTerminal`]) records the ordered sequence of calls so
-/// the ADR-010 restore-order test and the offset-repaint test can assert.
+/// [`CrosstermTerminal`] wraps crossterm against stdout; [`mock::MockTerminal`]
+/// records the ordered calls so the restore-order and offset-repaint tests can
+/// assert against them.
 pub trait OuterTerminal {
     // --- Setup ---
-    /// Enter raw mode. Setup; first thing after the PTY is up.
+    /// Enter raw mode. The first setup step once the PTY is up.
     fn enable_raw_mode(&mut self) -> io::Result<()>;
     /// Probe whether the outer terminal supports the kitty keyboard protocol —
-    /// the inbound `CSI ? u` grant `vt100` cannot observe (ADR-003). Called once
-    /// at startup, after raw mode, before spawning the child. Wraps crossterm's
-    /// `supports_keyboard_enhancement()`. The returned bool is the
-    /// `outer_supports` clamp fed to the child's kitty state and the encoder.
+    /// the inbound grant `vt100` cannot observe (ADR-003). The returned bool
+    /// clamps the child's kitty state and the encoder. Called once at startup,
+    /// after raw mode.
     fn supports_keyboard_enhancement(&mut self) -> io::Result<bool>;
-    /// Push the kitty enhancement flags (`DISAMBIGUATE_ESCAPE_CODES |
-    /// REPORT_EVENT_TYPES`) onto the outer terminal so crossterm thereafter
-    /// delivers `KeyEvent`s that distinguish Shift+Enter from Enter (ADR-003).
-    /// Called at startup **only when** the probe returned `true`; paired with
-    /// [`pop_keyboard_flags`] in teardown.
+    /// Push the kitty enhancement flags onto the outer terminal so crossterm
+    /// thereafter delivers `KeyEvent`s that distinguish Shift+Enter from Enter
+    /// (ADR-003). Called at startup only when the probe returned `true`; paired
+    /// with [`pop_keyboard_flags`] in teardown.
     ///
     /// [`pop_keyboard_flags`]: OuterTerminal::pop_keyboard_flags
     fn push_keyboard_flags(&mut self) -> io::Result<()>;
-    /// Enable mouse capture eagerly (ADR-005): crossterm emits the fixed bundle
-    /// `?1000h ?1002h ?1003h ?1015h ?1006h` (any-motion SGR reporting). Called
-    /// once at startup, after raw mode and the kitty push, before the alt screen.
-    /// Paired with [`disable_mouse`] in teardown — set once, never tracking the
-    /// child's mode (the forwarding gate narrows in software).
+    /// Enable mouse capture eagerly (ADR-005), emitting the fixed any-motion SGR
+    /// bundle. Called once at startup; never re-issued to track the child's mode
+    /// (the forwarding gate narrows in software). Paired with [`disable_mouse`].
     ///
     /// [`disable_mouse`]: OuterTerminal::disable_mouse
     fn enable_mouse(&mut self) -> io::Result<()>;
-    /// Enter the alternate screen — mirroring the child's `?1049h` edge from the
-    /// render thread (ADR-012). gutter never forces the alt screen at setup; this
-    /// is called mid-run, only when the child enters it.
+    /// Enter the alternate screen, mirroring the child's `?1049h` edge (ADR-012).
+    /// gutter never forces the alt screen at setup; called mid-run only when the
+    /// child enters it.
     fn enter_alt_screen(&mut self) -> io::Result<()>;
 
     // --- Render output (per frame) ---
-    /// Move the cursor to physical `(col, row)`. Emitted by gutter before each
-    /// repainted row so the row's bytes land at the band's left margin.
+    /// Move the cursor to physical `(col, row)`, emitted before each repainted
+    /// row so the row's bytes land at the band's left margin.
     fn move_to(&mut self, col: u16, row: u16) -> io::Result<()>;
-    /// Write a row's `rows_diff` byte run verbatim (it carries its own intra-row
-    /// SGR and relative cursor moves, scoped to `[0, W)`).
+    /// Write a row's `rows_diff` byte run verbatim — `prepare_row` has made it
+    /// self-contained, so it carries its own intra-row SGR and relative cursor
+    /// moves, scoped to `[0, W)` (ADR-014).
     fn write_row(&mut self, bytes: &[u8]) -> io::Result<()>;
-    /// Advance the real terminal one line (`\r\n`), scrolling it when the cursor
-    /// is on the bottom row. The scroll-aware primary paint (ADR-013) emits a
-    /// departed top line then this newline so the line enters the **real
-    /// terminal's own** scrollback — gutter keeps vt100 at `scrollback=0` and lets
-    /// the real terminal be the store.
+    /// Advance the real terminal one line (`\r\n`), scrolling when on the bottom
+    /// row. The scroll-aware primary paint emits a departed top line then this
+    /// newline so the line enters the real terminal's own scrollback — gutter
+    /// keeps vt100 at `scrollback=0` and lets the real terminal be the store
+    /// (ADR-013).
     fn newline(&mut self) -> io::Result<()>;
-    /// Clear the gutter columns — everything outside the band `[margin,
-    /// margin + width)` across every physical row `[0, rows)` of a `real_cols`-wide
-    /// terminal. Called on resize (ADR-008 step 4): a shrink that moved the margin
-    /// leftward, or a centred→narrower transition, can strand painted cells where
-    /// the gutter now is, and the `rows_diff` repaint only touches `[margin,
-    /// margin + width)` — so the cells outside it must be cleared explicitly.
+    /// Clear the gutter columns outside the band `[margin, margin + width)` across
+    /// every row. Called only on an alt-screen resize (ADR-008 step 5 is alt-screen
+    /// only): a shrink or centred→narrower transition can strand painted cells where
+    /// the gutter now is, and the `rows_diff` repaint only touches the band — so the
+    /// stranded cells must be cleared explicitly.
     fn clear_gutter(
         &mut self,
         margin: u16,
@@ -86,50 +68,47 @@ pub trait OuterTerminal {
         real_cols: u16,
         rows: u16,
     ) -> io::Result<()>;
-    /// Reposition the real cursor inside the band at physical `(col, row)` after
-    /// the repaint, from the child's `screen.cursor_position()`.
+    /// Reposition the real cursor inside the band after the repaint, from the
+    /// child's cursor position.
     fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()>;
-    /// Mirror the child's cursor visibility (DECTCEM / `CSI ?25l`).
+    /// Mirror the child's cursor visibility (DECTCEM).
     fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()>;
-    /// Mirror the child's cursor SHAPE (DECSCUSR / `CSI Ps SP q`, slice 08). The
-    /// `bytes` are the ready-made `CSI Ps SP q` sequence the watcher produced;
-    /// the outer terminal forwards them verbatim. Emitted only on a real shape
-    /// change (the watcher de-dupes), alongside the per-frame cursor reposition.
+    /// Mirror the child's cursor shape (DECSCUSR). `bytes` is the ready-made
+    /// `CSI Ps SP q` the watcher produced, forwarded verbatim. Emitted only on a
+    /// real shape change (the watcher de-dupes).
     fn set_cursor_shape(&mut self, bytes: &[u8]) -> io::Result<()>;
     /// Flush the queued frame to the real terminal. Exactly once per frame.
     fn flush(&mut self) -> io::Result<()>;
 
     // --- Teardown (ADR-010 order) ---
-    /// Leave the alternate screen. Teardown step 1 — but **conditional** on the
-    /// outer terminal actually being in the alt screen (ADR-012): a plain command
-    /// never entered it, so teardown skips the leave. Also called mid-run on the
-    /// child's alt→primary edge.
+    /// Leave the alternate screen — conditional on the outer terminal actually
+    /// being in it (ADR-012): a plain command never entered, so teardown skips the
+    /// leave. Also called mid-run on the child's alt→primary edge.
     fn leave_alt_screen(&mut self) -> io::Result<()>;
-    /// Pop kitty keyboard enhancement flags. Teardown step 2. No-op until
-    /// slice 04 pushes them.
+    /// Pop the kitty keyboard enhancement flags (teardown), only if they were
+    /// pushed.
     fn pop_keyboard_flags(&mut self) -> io::Result<()>;
-    /// Disable mouse capture. Teardown step 3 — after the kitty pop, before the
-    /// cursor show (ADR-010). Pairs with [`enable_mouse`]; runs via the explicit
-    /// restore (not a `Drop` guard — `process::exit` skips destructors, which
-    /// would leave the shell emitting mouse escapes after gutter dies).
+    /// Disable mouse capture (teardown). Pairs with [`enable_mouse`]. Runs via the
+    /// explicit restore, not a `Drop` guard — `process::exit` skips destructors,
+    /// which would leave the shell emitting mouse escapes after gutter dies.
     ///
     /// [`enable_mouse`]: OuterTerminal::enable_mouse
     fn disable_mouse(&mut self) -> io::Result<()>;
-    /// Show the cursor. Teardown step 4.
+    /// Show the cursor (teardown).
     fn show_cursor(&mut self) -> io::Result<()>;
-    /// Disable raw mode. Teardown step 5 — must run **after** leaving the alt
-    /// screen, or control sequences leak to the user's shell.
+    /// Disable raw mode (teardown). Must run after leaving the alt screen, or
+    /// control sequences leak to the user's shell.
     fn disable_raw_mode(&mut self) -> io::Result<()>;
 }
 
 /// The real outer terminal, backed by crossterm against stdout.
 pub struct CrosstermTerminal {
     out: io::Stdout,
-    /// Whether kitty enhancement flags were pushed at startup — so teardown only
-    /// pops what it actually set (ADR-003: don't pop flags you never pushed).
+    /// Whether kitty flags were pushed at startup, so teardown pops only what it
+    /// set (ADR-003).
     kitty_pushed: bool,
-    /// Whether mouse capture was enabled at startup — so teardown only disables
-    /// what it actually enabled (symmetry with the kitty pop).
+    /// Whether mouse capture was enabled at startup, so teardown disables only
+    /// what it set.
     mouse_enabled: bool,
 }
 
@@ -248,8 +227,7 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn set_cursor_shape(&mut self, bytes: &[u8]) -> io::Result<()> {
-        // Forward the watcher's ready-made `CSI Ps SP q` verbatim — gutter does
-        // not re-derive the sequence, it mirrors what the child requested.
+        // Mirror what the child requested rather than re-deriving it.
         self.out.write_all(bytes)
     }
 
@@ -264,8 +242,8 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn pop_keyboard_flags(&mut self) -> io::Result<()> {
-        // Only pop what was actually pushed (ADR-003) — popping flags we never
-        // set would corrupt an unrelated terminal state.
+        // Pop only what was pushed (ADR-003); popping flags we never set would
+        // corrupt unrelated terminal state.
         if self.kitty_pushed {
             use crossterm::event::PopKeyboardEnhancementFlags;
             use crossterm::queue;
@@ -277,9 +255,9 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn disable_mouse(&mut self) -> io::Result<()> {
-        // Only disable what was actually enabled (symmetry with the kitty pop):
-        // emitting `DisableMouseCapture` when we never captured would still be
-        // harmless, but mirroring the push/pop rule keeps the contract clean.
+        // Disable only what was enabled. Emitting `DisableMouseCapture` when we
+        // never captured would be harmless, but mirroring the push/pop rule keeps
+        // the contract clean.
         if self.mouse_enabled {
             use crossterm::{event::DisableMouseCapture, queue};
             queue!(self.out, DisableMouseCapture)?;
@@ -302,15 +280,15 @@ impl OuterTerminal for CrosstermTerminal {
 
 #[cfg(test)]
 pub mod mock {
-    //! A recording [`OuterTerminal`] for the ADR-010 restore-order test and the
-    //! offset-repaint unit test.
+    //! A recording [`OuterTerminal`] for the restore-order and offset-repaint
+    //! tests.
 
     use super::OuterTerminal;
     use std::io;
 
-    /// One recorded side effect, in the order it was invoked. Render-output
-    /// calls carry their arguments so physical-column assertions can read back
-    /// what was painted where.
+    /// One recorded side effect, in the order it was invoked. Render-output calls
+    /// carry their arguments so physical-column assertions can read back what was
+    /// painted where.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Call {
         EnableRawMode,
@@ -320,15 +298,15 @@ pub mod mock {
         EnterAltScreen,
         MoveTo(u16, u16),
         WriteRow(Vec<u8>),
-        /// `\r\n` — a departed line was advanced into the real terminal's
-        /// scrollback (ADR-013). The count-based scroll-delta test asserts one
-        /// `Newline` per departed line, not per frame.
+        /// `\r\n` — a departed line advanced into the real terminal's scrollback
+        /// (ADR-013). The test asserts one `Newline` per departed line, not per
+        /// frame.
         Newline,
         /// `clear_gutter(margin, width, real_cols, rows)`.
         ClearGutter(u16, u16, u16, u16),
         PlaceCursor(u16, u16),
         SetCursorVisible(bool),
-        /// `set_cursor_shape(bytes)` — the mirrored `CSI Ps SP q` (slice 08).
+        /// `set_cursor_shape(bytes)` — the mirrored `CSI Ps SP q`.
         SetCursorShape(Vec<u8>),
         Flush,
         LeaveAltScreen,
@@ -342,17 +320,14 @@ pub mod mock {
     #[derive(Default)]
     pub struct MockTerminal {
         pub calls: Vec<Call>,
-        /// What the kitty-capability probe should report. Lets the teardown test
-        /// drive both the kitty-capable (push then pop) and non-kitty (neither)
-        /// paths without a real terminal.
+        /// What the kitty-capability probe reports. Lets the teardown test drive
+        /// both the push-then-pop and neither paths without a real terminal.
         pub supports_kitty: bool,
-        /// Whether [`OuterTerminal::push_keyboard_flags`] was actually called —
-        /// so the mock's `pop` only records a [`Call::PopKeyboardFlags`] when
-        /// flags were pushed, mirroring the real "pop only what you pushed" rule.
+        /// Tracks whether [`OuterTerminal::push_keyboard_flags`] was called, so
+        /// the mock pops only when flags were pushed — mirroring the real rule.
         kitty_pushed: bool,
-        /// Whether [`OuterTerminal::enable_mouse`] was actually called — so the
-        /// mock's `disable_mouse` only records a [`Call::DisableMouse`] when
-        /// capture was enabled, mirroring the real "disable only what you enabled".
+        /// Tracks whether [`OuterTerminal::enable_mouse`] was called, so the mock
+        /// disables only when capture was enabled — mirroring the real rule.
         mouse_enabled: bool,
     }
 
@@ -370,7 +345,7 @@ pub mod mock {
         }
 
         /// The restore subsequence only, for the ADR-010 order assertion —
-        /// filters out the render-output noise a frame may have emitted first.
+        /// filters out any render-output noise a frame emitted first.
         pub fn restore_calls(&self) -> Vec<Call> {
             self.calls
                 .iter()
@@ -389,21 +364,17 @@ pub mod mock {
         }
     }
 
-    /// A physical-cell-readback [`OuterTerminal`] (the ADR-006 seam). Unlike
-    /// [`MockTerminal`], which only records the *sequence* of calls, this paints
-    /// into an in-memory grid the size of the **real** outer terminal
-    /// (`phys_cols × rows`) by replaying gutter's own `move_to` + `write_row`
-    /// bytes through a `vt100` parser at that physical width. After a render the
-    /// test reads back cell `(row, margin + W)` and asserts it is blank — the
-    /// "no bleed past the band" assertion that `COLUMNS == W` can never make,
-    /// because the corruption lives in the physical outer cells, not the child
-    /// grid (ADR-006).
+    /// A physical-cell-readback [`OuterTerminal`]. Where [`MockTerminal`] records
+    /// the sequence of calls, this paints gutter's own `move_to`/`write_row` bytes
+    /// through a `vt100` parser sized to the **real** outer terminal
+    /// (`phys_cols × rows`). Tests then read back cell `(row, margin + W)` and
+    /// assert it is blank — the "no bleed past the band" check that a `COLUMNS ==
+    /// W` child grid structurally cannot make, because the corruption lives in the
+    /// physical outer cells (ADR-006).
     ///
-    /// Render-output calls (`move_to`/`write_row`/`place_cursor`/visibility) are
-    /// translated to the equivalent escape bytes and fed to the parser, exactly
-    /// as the real `CrosstermTerminal` would emit them to stdout. Lifecycle and
-    /// teardown calls are no-ops here (the ordered-restore assertion is
-    /// [`MockTerminal`]'s job).
+    /// Render-output calls are translated to escape bytes and fed to the parser,
+    /// just as `CrosstermTerminal` emits them. Lifecycle and teardown calls are
+    /// no-ops.
     pub struct RecordingGrid {
         parser: vt100::Parser,
     }
@@ -416,11 +387,11 @@ pub mod mock {
             }
         }
 
-        /// A recording grid with a bounded scrollback (slice 04 / ADR-013) — models
-        /// the **real terminal's own scrollback store** so the scroll-off survival
-        /// assertions can read back the departed lines the `\r\n`s scrolled in. A
-        /// production terminal keeps history; the default `new` keeps `scrollback=0`
-        /// to mirror the edge-of-band physical-cell readback that needs no history.
+        /// A recording grid with bounded scrollback (ADR-013) — models the real
+        /// terminal's own scrollback store, so scroll-off survival assertions can
+        /// read back the departed lines the `\r\n`s scrolled in. The default `new`
+        /// keeps `scrollback=0`, enough for the edge-of-band readback that needs no
+        /// history.
         pub fn with_scrollback(phys_cols: u16, rows: u16, scrollback: usize) -> Self {
             Self {
                 parser: vt100::Parser::new(rows, phys_cols, scrollback),
@@ -438,11 +409,10 @@ pub mod mock {
         }
 
         /// Whether physical cell `(row, col)` carries reverse-video. A
-        /// background-only flood (`ESC[K` under reverse video) erases the cell, so
-        /// its `contents()` stays `""` while its background bleeds — invisible to
-        /// [`cell_contents`]. The slice-09 band-edge assertion reads this to catch
-        /// the statusline highlight spilling past the band, the corruption a
-        /// content-only readback structurally cannot see.
+        /// background-only flood (`ESC[K` under reverse video) erases the cell —
+        /// `contents()` stays `""` while the background bleeds. The band-edge
+        /// assertion reads this to catch a statusline highlight spilling past the
+        /// band, which a content-only readback cannot see.
         pub fn cell_inverse(&self, row: u16, col: u16) -> bool {
             self.parser
                 .screen()
@@ -466,9 +436,7 @@ pub mod mock {
         }
 
         /// The lines in the recorder's scrollback, oldest first, each read across
-        /// the band columns `[0, width)` (the tests paint a margin-0 band). Walks
-        /// the scrollback offsets deepest-to-one, reading the top row at each — the
-        /// same way a user scrolling back through their terminal would see them.
+        /// the band columns `[0, width)` (the tests paint a margin-0 band).
         pub fn scrollback_top_rows(&mut self, width: u16) -> Vec<String> {
             // Probe the filled scrollback length by clamping the offset.
             self.parser.screen_mut().set_scrollback(usize::MAX);
@@ -514,8 +482,8 @@ pub mod mock {
             Ok(())
         }
         fn newline(&mut self) -> io::Result<()> {
-            // Feed `\r\n` through the physical-sized parser exactly as the real
-            // terminal would, so a departed line scrolls into the recording grid.
+            // Feed `\r\n` through the physical parser, so a departed line scrolls
+            // into the recording grid.
             self.parser.process(b"\r\n");
             Ok(())
         }
@@ -526,8 +494,8 @@ pub mod mock {
             real_cols: u16,
             rows: u16,
         ) -> io::Result<()> {
-            // Paint blanks over the physical gutter columns, exactly as the real
-            // terminal would — so the physical-cell readback sees them cleared.
+            // Paint blanks over the physical gutter columns, as the real terminal
+            // would, so the readback sees them cleared.
             let band_end = margin.saturating_add(width).min(real_cols);
             self.parser.process(b"\x1b[0m");
             for row in 0..rows {

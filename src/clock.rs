@@ -1,27 +1,10 @@
-//! The injectable [`Clock`] the render loop is generic over (ADR-007).
+//! The injectable [`Clock`] the render loop is generic over. See ADR-007.
 //!
-//! The 60fps coalescing loop must be deterministically testable with no
-//! wall-clock sleeps. The loop's behaviour depends on time in three places, and
-//! ALL three must be interceptable or a virtual-clock test would still touch the
-//! wall clock (or block forever on a real channel):
-//!
-//! - reading "now" (`now` / `deadline`),
-//! - the **blocking** wait for the first message of a frame (`recv`), and
-//! - the **bounded** wait while draining to the deadline (`recv_timeout`).
-//!
-//! `Receiver::recv_deadline` is nightly-only, so the real bounded wait is the
-//! stable `recv_timeout(Duration)` — but the loop works in abstract `Instant`s,
-//! so the trait exposes the bounded wait as `recv_until(deadline)` and each
-//! impl computes the remaining timeout internally. The real impl
-//! ([`RealClock`]) wraps `std::time::Instant` and a real
-//! `std::sync::mpsc::Receiver`; the virtual impl (in the render-loop tests)
-//! advances time only when the test scripts it and resolves both receives
-//! against a scripted queue — so the cap, starvation, idle-park and
-//! input-liveness tests are deterministic with no sleeps.
-//!
-//! The `Clock` owns the receiver so the loop never touches a raw channel: that
-//! is what lets the virtual clock intercept the blocking `recv()` too (otherwise
-//! the idle-park test would block forever instead of proving zero wakeups).
+//! The loop touches time in three places — reading "now", the blocking wait for
+//! a frame's first message (`recv`), and the bounded wait while draining to the
+//! deadline (`recv_until`). All three go through the trait so a virtual clock can
+//! drive the cap, starvation, idle-park and liveness tests on scripted time, with
+//! no wall-clock sleeps and no real channel to block on.
 
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -33,14 +16,17 @@ pub enum Recv<M> {
     Msg(M),
     /// The wait hit its deadline with no message (idle-gap exit).
     Timeout,
-    /// All senders dropped — the shutdown backstop (ADR-009/010).
+    /// All senders dropped — the shutdown backstop, not the normal
+    /// `ChildExited` route.
     Disconnected,
 }
 
-/// The render loop's view of time and its message source (ADR-007).
+/// The render loop's view of time and its message source. See ADR-007.
 ///
-/// `Instant` is abstract so the virtual clock can use a plain tick counter; the
-/// real clock uses `std::time::Instant`.
+/// The clock owns the receiver so the loop never touches a raw channel — that is
+/// what lets the virtual clock intercept the blocking `recv()`, not just the
+/// timed waits. `Instant` is abstract so the virtual clock can use a plain tick
+/// counter; the real clock uses `std::time::Instant`.
 pub trait Clock {
     /// The message type drained from the channel.
     type Msg;
@@ -51,17 +37,17 @@ pub trait Clock {
     /// idle-park test can assert the loop never polls time while parked.
     fn now(&mut self) -> Self::Instant;
 
-    /// `from + dur` — the per-frame deadline, captured once.
+    /// The per-frame deadline `from + dur`, captured once per frame.
     fn deadline(&self, from: Self::Instant, dur: Duration) -> Self::Instant;
 
-    /// Block until the first message of a frame arrives (Phase A). `None` means
-    /// all senders are gone (the loop then exits via the backstop). This is the
-    /// single park point — zero idle CPU.
+    /// Blocks until the first message of a frame arrives; `None` once all senders
+    /// are gone. This is the loop's only park point — zero idle CPU.
     fn recv(&mut self) -> Option<Self::Msg>;
 
-    /// Block for the next message until at most `deadline` (Phase B). Mirrors
-    /// `Receiver::recv_timeout(deadline - now)` — the impl computes the
-    /// remaining timeout — so the loop logic is identical under both clocks.
+    /// Blocks for the next message until at most `deadline`.
+    /// `Receiver::recv_deadline` is nightly-only, so each impl computes the
+    /// remaining timeout and calls the stable `recv_timeout`; the loop stays in
+    /// abstract `Instant`s either way.
     fn recv_until(&mut self, deadline: Self::Instant) -> Recv<Self::Msg>;
 }
 
@@ -94,9 +80,9 @@ impl<M> Clock for RealClock<M> {
 
     fn recv_until(&mut self, deadline: Instant) -> Recv<M> {
         use std::sync::mpsc::RecvTimeoutError;
-        // saturating: if the deadline already passed, a zero timeout is a
-        // non-blocking poll. The loop's explicit `now >= deadline` check
-        // normally prevents calling this past the deadline, but stay safe.
+        // If the deadline already passed, saturating to zero makes this a
+        // non-blocking poll. The loop's `now >= deadline` check normally
+        // prevents that, but don't underflow if it slips through.
         let timeout = deadline.saturating_duration_since(Instant::now());
         match self.rx.recv_timeout(timeout) {
             Ok(m) => Recv::Msg(m),

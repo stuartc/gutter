@@ -1,28 +1,18 @@
-//! Cursor-shape mirroring (DECSCUSR / `CSI Ps SP q`) — slice 08.
+//! Cursor-shape mirroring (DECSCUSR / `CSI Ps SP q`).
 //!
-//! ADR-001/003/004 are explicit that `vt100`'s only `Callbacks` hooks are
-//! `unhandled_csi` and `copy_to_clipboard`, and that `process_cb` does not
-//! exist — so before building a watcher the slice confirmed against `vt100`
-//! source whether cursor shape is observable at all. **It is:** `vt100` does
-//! not implement DECSCUSR, so the child's `CSI Ps SP q` surfaces through
-//! `unhandled_csi` with the intermediate `SP` (0x20) reported as `i1` and the
-//! final byte `q` — verified by probing the pinned `vt100 0.16.2`. (The
-//! intermediate lands in `i1`, not `i2`, which is the trap.)
-//!
-//! So cursor shape **is in scope** (not the documented-gap path): the watcher
-//! records the child's requested shape, and the render loop re-emits the matching
-//! `CSI Ps SP q` to the outer terminal alongside the existing cursor reposition
-//! (slice 02). The watcher lives on the shared [`crate::callbacks::GutterCallbacks`]
-//! struct beside the kitty watcher and the clipboard hook; it touches only its
-//! own field.
+//! vt100 doesn't implement DECSCUSR, so the child's request surfaces through
+//! `unhandled_csi`. The watcher records the requested shape and the render loop
+//! re-emits the matching `CSI Ps SP q` to the outer terminal. It lives on
+//! [`crate::callbacks::GutterCallbacks`] beside the kitty and clipboard hooks
+//! and touches only its own field.
 
-/// The intermediate byte of DECSCUSR (`CSI Ps SP q`) — a space (0x20). `vt100`
-/// surfaces it as `unhandled_csi`'s `i1`.
+/// The intermediate byte of DECSCUSR (`CSI Ps SP q`) — a space (0x20).
 pub const DECSCUSR_INTERMEDIATE: u8 = b' ';
 
-/// Is this unhandled CSI a DECSCUSR cursor-shape request? `i1 == Some(' ')` and
-/// final byte `q` (verified against `vt100 0.16.2` — the space intermediate is
-/// reported in `i1`, not `i2`).
+/// Returns whether this unhandled CSI is a DECSCUSR cursor-shape request.
+///
+/// vt100 reports the space intermediate in `i1`, not `i2` (verified against
+/// vt100 0.16.2) — that's the trap.
 #[must_use]
 pub fn is_decscusr(i1: Option<u8>, c: char) -> bool {
     i1 == Some(DECSCUSR_INTERMEDIATE) && c == 'q'
@@ -30,18 +20,18 @@ pub fn is_decscusr(i1: Option<u8>, c: char) -> bool {
 
 /// The child's requested cursor shape, tracked from the DECSCUSR `Ps` parameter.
 ///
-/// Only the latest request is kept — the outer terminal's shape is a single
-/// piece of state, so the most recent `CSI Ps SP q` wins (DECSCUSR is not a
-/// stack like the kitty flags). `None` means the child has never set a shape, so
-/// gutter leaves the outer terminal's default untouched.
+/// Only the latest request is kept: the outer terminal's shape is a single value,
+/// so the most recent `CSI Ps SP q` wins (DECSCUSR is not a stack like the kitty
+/// flags). `None` means the child never set a shape, so gutter leaves the outer
+/// terminal's default untouched.
 #[derive(Debug, Default, Clone)]
 pub struct CursorShape {
     /// The latest DECSCUSR `Ps` the child emitted, or `None` if it never did.
     /// `0`/`1` = blinking block, `2` = steady block, `3` = blinking underline,
     /// `4` = steady underline, `5` = blinking bar, `6` = steady bar.
     requested: Option<u16>,
-    /// The `Ps` last mirrored to the outer terminal, so the render loop only
-    /// re-emits a `CSI Ps SP q` when the requested shape actually changed.
+    /// The `Ps` last mirrored to the outer terminal, so the render loop re-emits
+    /// only when the requested shape actually changed.
     mirrored: Option<u16>,
 }
 
@@ -51,18 +41,17 @@ impl CursorShape {
         Self::default()
     }
 
-    /// Record a DECSCUSR request. `params` is the `unhandled_csi` parameter list;
-    /// the `Ps` is its first value (absent → `0`, the default per DECSCUSR).
+    /// Records a DECSCUSR request. `Ps` is the first value in the parameter list;
+    /// absent → `0`, the DECSCUSR default.
     pub fn apply_csi(&mut self, params: &[&[u16]]) {
         let ps = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
         self.requested = Some(ps);
     }
 
-    /// If the requested shape differs from what was last mirrored, return the
-    /// `CSI Ps SP q` bytes to emit to the outer terminal and mark it mirrored.
-    /// Returns `None` when there is nothing new to mirror (no request yet, or the
-    /// shape is unchanged) — so the render loop emits a shape change only on a
-    /// real transition, never every frame.
+    /// Returns the `CSI Ps SP q` bytes to emit when the requested shape differs
+    /// from what was last mirrored, marking it mirrored. `None` when there's
+    /// nothing new (no request yet, or unchanged), so the render loop emits a
+    /// shape change on a real transition, not every frame.
     #[must_use]
     pub fn take_pending(&mut self) -> Option<Vec<u8>> {
         match self.requested {

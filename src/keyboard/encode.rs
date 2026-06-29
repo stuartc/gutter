@@ -1,27 +1,16 @@
-//! The pure keyboard encoder — `KeyEvent` → bytes (ADR-002 / ADR-003).
+//! Pure `KeyEvent` → bytes encoder. See ADR-002 (keyboard always re-encoded)
+//! and ADR-003 (kitty levels).
 //!
-//! This is the deep, testable seam: a free function with no I/O, no terminal, no
-//! PTY. crossterm 0.29 hands gutter a **decoded** `KeyEvent` (no raw-byte
-//! accessor), so gutter ALWAYS re-encodes — there is no original byte stream to
-//! forward. Given a `KeyEvent` and the child's currently-negotiated
-//! [`KittyLevel`], [`encode_key`] returns the bytes to write into the PTY master.
+//! Two byte forms, chosen by the child's negotiated [`KittyLevel`]:
 //!
-//! Two byte forms:
-//!
-//! - **Legacy** (no kitty negotiated): the classic VT byte tables — `\r` for
-//!   Enter, `\x1b[A` for Up, a control byte for Ctrl-letter, raw UTF-8 for text.
-//!   Shift+Enter and plain Enter both collapse to `\r` here — legacy cannot tell
-//!   them apart, which is exactly why the target program needs kitty.
-//! - **Kitty** (`CSI ... u` at the child's flag level): special keys take the
-//!   functional `CSI codepoint [; modifier] u` form, so plain Enter is
-//!   `CSI 13 u` and Shift+Enter is `CSI 13 ; 2 u` — two **distinct** byte
-//!   sequences. Ordinary printable text still passes through as raw UTF-8 under
-//!   `DISAMBIGUATE_ESCAPE_CODES` (only ambiguous/functional keys are escaped),
-//!   so normal typing does not regress.
-//!
-//! The load-bearing property (proptest): under [`KittyLevel::Kitty`] Shift+Enter
-//! and plain Enter map to **different** bytes; under [`KittyLevel::Legacy`] they
-//! map to the **same** bytes.
+//! - **Legacy** — classic VT byte tables: `\r` for Enter, `\x1b[A` for Up, a
+//!   control byte for Ctrl-letter, raw UTF-8 for text. Plain Enter and
+//!   Shift+Enter both collapse to `\r`; legacy cannot tell them apart, which is
+//!   why a child needs kitty to distinguish them.
+//! - **Kitty** — special keys take the `CSI codepoint [; modifier] u` form, so
+//!   Enter is `CSI 13 u` and Shift+Enter is `CSI 13 ; 2 u`. Printable text still
+//!   passes through as raw UTF-8 under `DISAMBIGUATE_ESCAPE_CODES`, so normal
+//!   typing is level-independent.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -32,10 +21,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 pub enum KittyLevel {
     /// No kitty negotiated — classic VT byte encoding.
     Legacy,
-    /// Kitty keyboard active at the given enhancement-flag level (the `N` from
-    /// the child's `CSI > N u`). The flag value is carried so a future slice can
-    /// vary encoding by flag; this slice needs only "kitty on vs off" for the
-    /// Enter/Shift+Enter disambiguation, but keeps the negotiated level honest.
+    /// Kitty keyboard active at the child's enhancement-flag level (the `N` from
+    /// `CSI > N u`). The encoder only distinguishes kitty on/off today, but the
+    /// flag is carried so the negotiated level stays honest.
     Kitty(u16),
 }
 
@@ -77,9 +65,8 @@ fn kitty_seq(codepoint: u16, mods: KeyModifiers) -> Vec<u8> {
     }
 }
 
-/// The kitty codepoint for a special key, per the protocol's "functional key"
-/// table for the keys this slice handles. Returns `None` for keys with no
-/// special codepoint (ordinary printable characters, handled separately).
+/// The kitty functional-key codepoint for a special key. Returns `None` for keys
+/// with no special codepoint (ordinary printable characters, handled separately).
 fn special_codepoint(code: KeyCode) -> Option<u16> {
     Some(match code {
         KeyCode::Enter => 13,
@@ -90,11 +77,11 @@ fn special_codepoint(code: KeyCode) -> Option<u16> {
     })
 }
 
-/// Encode a decoded `KeyEvent` into the bytes to write to the PTY master at the
+/// Encodes a decoded `KeyEvent` into the bytes to write to the PTY master at the
 /// child's current [`KittyLevel`].
 ///
-/// Returns an empty `Vec` for events that produce no bytes (key releases, and —
-/// under legacy — keys with no byte form). Callers treat an empty result as
+/// Returns an empty `Vec` for events that produce no bytes (key releases, and
+/// keys with no byte form at either level). Callers treat an empty result as
 /// "nothing to send". The encoder never panics for any `KeyCode`/`KeyModifiers`
 /// combination (proptest-enforced).
 pub fn encode_key(event: &KeyEvent, level: KittyLevel) -> Vec<u8> {
@@ -123,13 +110,13 @@ fn encode_kitty(event: &KeyEvent) -> Vec<u8> {
         return kitty_seq(codepoint, mods);
     }
     match event.code {
-        // Arrows keep their legacy CSI form (no `u` disambiguation needed for the
-        // target program; this slice does not expand arrow kitty coverage).
+        // Arrows keep their legacy CSI form; the child needs no `u` disambiguation
+        // for them.
         KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left => arrow_bytes(event.code),
         // Ordinary printable characters: a Ctrl-letter still maps to its control
         // byte (so Ctrl-C reaches the child as 0x03); otherwise raw UTF-8.
         KeyCode::Char(c) => char_bytes(c, mods),
-        // Anything else has no byte form in this slice's scope.
+        // Anything else has no byte form.
         _ => Vec::new(),
     }
 }
@@ -158,14 +145,14 @@ fn char_bytes(c: char, mods: KeyModifiers) -> Vec<u8> {
         if upper.is_ascii_alphabetic() {
             return vec![(upper as u8) - b'A' + 1];
         }
-        // Ctrl with a non-letter (e.g. Ctrl-Space) has no simple control byte in
-        // this slice; fall through to the raw character.
+        // Ctrl with a non-letter (e.g. Ctrl-Space) has no simple control byte;
+        // fall through to the raw character.
     }
     let mut buf = [0u8; 4];
     c.encode_utf8(&mut buf).as_bytes().to_vec()
 }
 
-/// The legacy CSI arrow bytes. Arrows are level-independent in this slice.
+/// The legacy CSI arrow bytes, used at both levels.
 fn arrow_bytes(code: KeyCode) -> Vec<u8> {
     match code {
         KeyCode::Up => b"\x1b[A".to_vec(),
@@ -194,9 +181,8 @@ mod tests {
         }
     }
 
-    /// The table the slice's acceptance criteria name explicitly: Enter,
-    /// Shift+Enter, ASCII, arrows, Esc, Tab, Backspace, Ctrl-C/Ctrl-D, under both
-    /// `Legacy` and `Kitty` levels.
+    /// The full encoder table: Enter, Shift+Enter, ASCII, arrows, Esc, Tab,
+    /// Backspace, Ctrl-C/Ctrl-D, under both `Legacy` and `Kitty` levels.
     #[test]
     fn encoder_table() {
         let kitty = KittyLevel::Kitty(1);
@@ -287,8 +273,8 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
-        /// A strategy over the `KeyCode`s this slice encodes, plus an arbitrary
-        /// printable char.
+        /// A strategy over the `KeyCode`s we encode, plus an arbitrary printable
+        /// char.
         fn key_code() -> impl Strategy<Value = KeyCode> {
             prop_oneof![
                 Just(KeyCode::Enter),

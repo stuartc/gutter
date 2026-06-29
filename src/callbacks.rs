@@ -1,22 +1,12 @@
-//! The `vt100::Callbacks` impl carried by the render thread's parser.
+//! The `vt100::Callbacks` impl carried by the render thread's parser — the single
+//! place gutter hooks the parser.
 //!
-//! This is the **shared callbacks struct** (ADR-003/004): the single place
-//! gutter hooks the parser. It is wired in by slice 02 as inert plumbing; slice
-//! 04 added the kitty keyboard-level watcher, and slice 06 (this slice) adds the
-//! OSC-52 `copy_to_clipboard` override plus an injected `/dev/tty` writer to
-//! **this same struct** — a sibling field/method, not a reshape. The kitty
-//! watcher and the clipboard concern share no state and must not reach into each
-//! other: `unhandled_csi` only touches `kitty_state`, `copy_to_clipboard` only
-//! touches `clipboard_out`.
-//!
-//! Construct the parser with
-//! `vt100::Parser::new_with_callbacks(rows, cols, scrollback, GutterCallbacks::new(..))`
-//! — there is **no** `process_cb` method (that reference in the rough plan is
-//! wrong). The callbacks fire on `parser.process(bytes)` on the render thread,
-//! the only thread that touches the parser, so there is no shared mutable state
-//! and `kitty_state.current()` is read lock-free at encode time (ADR-009). The
-//! OSC-52 write therefore also happens inline on the render thread (Thread 2),
-//! on a fd that is not stdout.
+//! Independent concerns live here and must not reach into each other:
+//! `unhandled_csi` touches only `kitty_state`/`cursor_shape`/`replies`,
+//! `copy_to_clipboard` only `clipboard_out`. Callbacks fire inside
+//! `parser.process()` on the render thread, the only thread that touches the
+//! parser, so `kitty_state.current()` is read lock-free at encode time and the
+//! OSC-52 write runs inline on that thread. See ADR-003, ADR-004, ADR-009.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -25,56 +15,52 @@ use crate::clipboard::forward_osc52;
 use crate::cursor::{is_decscusr, CursorShape};
 use crate::keyboard::{is_kitty_csi, KittyLevel, KittyState};
 
-/// The fixed Primary Device Attributes (DA1) identity gutter answers `CSI c` with
-/// (VT100 with Advanced Video Option). The exact identity does not matter — a
-/// child gating on a DA1 handshake only needs *an* answer to proceed — so a
-/// stable, conventional reply is used.
+/// The fixed DA1 identity gutter answers `CSI c` with (VT100 with Advanced Video
+/// Option). The exact identity doesn't matter — a child gating on the DA1
+/// handshake only needs *an* answer to proceed — so we send a conventional one.
 const DA1_REPLY: &[u8] = b"\x1b[?1;2c";
 
 /// The single callbacks struct the parser owns.
 ///
-/// Carries two independent concerns: the kitty [`KittyState`] (slice 04 — the
-/// child's negotiated keyboard level, clamped to the outer terminal's
-/// capability) and the clipboard sink (slice 06 — where a reconstructed OSC 52
-/// is written). They sit side by side; neither method reads the other's field.
+/// Carries independent concerns — the kitty [`KittyState`], the cursor shape, the
+/// clipboard sink, and buffered device-query replies — side by side; no method
+/// reads another's field.
 pub struct GutterCallbacks {
     /// The child's negotiated kitty keyboard level — driven by the
     /// `unhandled_csi` watcher below, read by the encoder at keystroke time.
     pub kitty_state: KittyState,
     /// The child's requested cursor shape (DECSCUSR / `CSI Ps SP q`) — driven by
     /// the same `unhandled_csi` watcher (vt100 surfaces DECSCUSR as an unhandled
-    /// CSI, slice 08), read by the render loop to mirror the shape on the outer
-    /// terminal. Touches only its own field; independent of the kitty watcher.
+    /// CSI), read by the render loop to mirror the shape on the outer terminal.
     pub cursor_shape: CursorShape,
-    /// The clipboard write sink (ADR-004). Production injects the real
-    /// `/dev/tty` handle ([`crate::clipboard::open_tty_read_write`]); tests
-    /// inject a buffer they read back. Baseline (diff-only) parsers get an
-    /// `io::sink()` — they never run the live OSC-52 path. Behind a `Box<dyn
-    /// Write>` rather than a concrete `File` so the callback is testable without
-    /// a real tty.
+    /// The clipboard write sink. Production injects the real `/dev/tty` handle
+    /// ([`crate::clipboard::open_tty_read_write`]); tests inject a buffer they read
+    /// back. Baseline (diff-only) parsers get `io::sink()` — they never run the
+    /// live OSC-52 path. A `Box<dyn Write>` rather than a concrete `File` so the
+    /// callback is testable without a real tty. See ADR-004.
     clipboard_out: Box<dyn Write + Send>,
-    /// Replies buffered for the child's device queries (slice 11). gutter is the
-    /// child's emulator, so it answers `CSI c` / `CSI 5 n` / `CSI 6 n` / `CSI ? u`
-    /// itself rather than proxying them. `unhandled_csi` only *buffers* here — the
-    /// render loop drains this to the PTY master (the one writer it owns) right
-    /// after `parser.process()`, so no reply leaves callbacks.
+    /// Replies buffered for the child's device queries. gutter is the child's
+    /// emulator, so it answers `CSI c` / `CSI 5 n` / `CSI 6 n` / `CSI ? u` itself
+    /// rather than proxying them. `unhandled_csi` only *buffers* here — the render
+    /// loop drains this to the PTY master (the one writer it owns) right after
+    /// `parser.process()`, so no reply leaves callbacks.
     replies: Vec<u8>,
 }
 
 impl GutterCallbacks {
-    /// Build the callbacks with the outer terminal's kitty capability (the
-    /// startup `supports_keyboard_enhancement()` probe) and a discarding
-    /// clipboard sink. When `outer_supports` is `false`, the child's kitty enable
-    /// is clamped to a no-op (case-B degradation).
+    /// Builds the callbacks with the outer terminal's kitty capability (the
+    /// startup `supports_keyboard_enhancement()` probe) and a discarding clipboard
+    /// sink. When `outer_supports` is `false`, the child's kitty enable is clamped
+    /// to a no-op.
     ///
-    /// The default sink is `io::sink()` — used by the diff-baseline parsers,
-    /// which only replay formatted content and never carry the live clipboard
-    /// fd. The live parser injects a real sink via [`Self::with_clipboard`].
+    /// The `io::sink()` default is what the diff-baseline parsers use: they replay
+    /// formatted content and never carry the live clipboard fd. The live parser
+    /// injects a real sink via [`Self::with_clipboard`].
     pub fn new(outer_supports: bool) -> Self {
         Self::with_clipboard(outer_supports, Box::new(io::sink()))
     }
 
-    /// Build the callbacks with a specific clipboard sink injected. Production
+    /// Builds the callbacks with a specific clipboard sink injected. Production
     /// passes the real `/dev/tty` handle; the OSC-52 dispatch and end-to-end
     /// tests pass a recording buffer.
     pub fn with_clipboard(outer_supports: bool, clipboard_out: Box<dyn Write + Send>) -> Self {
@@ -86,18 +72,18 @@ impl GutterCallbacks {
         }
     }
 
-    /// Take the device-query replies buffered since the last drain (slice 11).
-    /// Called by the render loop in the `Msg::Pty` arm after `parser.process()`,
-    /// which writes them to the PTY master with the same `write_all` + `flush` the
-    /// key/mouse paths use. Empty when the child issued no query this frame.
+    /// Takes the device-query replies buffered since the last drain. Called by the
+    /// render loop in the `Msg::Pty` arm after `parser.process()`, which writes
+    /// them to the PTY master with the same `write_all` + `flush` the key/mouse
+    /// paths use. Empty when the child issued no query this frame.
     pub fn drain_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.replies)
     }
 
-    /// Buffer the kitty keyboard-protocol report for `CSI ? u`: `CSI ? <flags> u`
-    /// carrying the child's **live** progressive-enhancement level (the top of the
-    /// push/pop stack, `0` when legacy). Reading the live level here is why a
-    /// query issued after a push reflects the state the child actually set.
+    /// Buffers the kitty keyboard-protocol report for `CSI ? u`: `CSI ? <flags> u`
+    /// carrying the child's **live** level (the top of the push/pop stack, `0`
+    /// when legacy). Reading the live level here is why a query issued after a
+    /// push reflects the state the child actually set.
     fn buffer_kitty_report(&mut self) {
         let flags = match self.kitty_state.current() {
             KittyLevel::Legacy => 0,
@@ -108,13 +94,13 @@ impl GutterCallbacks {
     }
 }
 
-/// The reply for a non-private DSR / DA1 device query, or `None` when the final
-/// is not one gutter answers. Only the bare (`i1 == None`) forms are answered:
-/// the secondary/tertiary DA (`CSI > c` / `CSI = c`) and private DSR carry an
+/// Returns the reply for a bare DSR / DA1 device query, or `None` when the final
+/// is not one gutter answers. Only the `i1 == None` forms are answered: the
+/// secondary/tertiary DA (`CSI > c` / `CSI = c`) and private DSR carry an
 /// intermediate and are out of scope. The cursor-position reply reads
-/// `screen.cursor_position()` — the child's **W-grid** coordinates — and reports
-/// them 1-based per the DSR spec; the band's left-margin offset lives in the
-/// render thread and never reaches here, so it cannot leak into the reply.
+/// `screen.cursor_position()` — the child's **W-grid** coordinates — 1-based per
+/// the DSR spec; the band's left-margin offset lives in the render thread and
+/// never reaches here, so it cannot leak into the reply.
 fn device_query_reply(
     i1: Option<u8>,
     params: &[&[u16]],
@@ -149,13 +135,10 @@ impl fmt::Debug for GutterCallbacks {
 }
 
 impl vt100::Callbacks for GutterCallbacks {
-    /// The kitty keyboard watcher (ADR-003). The child enables/disables kitty on
-    /// its **output** via `CSI > N u` / `CSI < u`, which surface here as
-    /// unhandled CSI sequences. Recognise the family, then hand the sequence to
-    /// the push/pop stack — which applies the outer-capability clamp.
-    ///
-    /// Touches **only** `kitty_state`. The clipboard lives in
-    /// `copy_to_clipboard`, a sibling method, with no entanglement here.
+    /// vt100's catch-all for CSI sequences it doesn't implement. Three of those
+    /// matter to gutter: the kitty enable/disable family (`CSI > N u` / `CSI < u`,
+    /// see ADR-003), DECSCUSR cursor-shape requests, and DA1/DSR device queries.
+    /// Each routes to its own field; the clipboard is untouched here.
     fn unhandled_csi(
         &mut self,
         screen: &mut vt100::Screen,
@@ -173,29 +156,21 @@ impl vt100::Callbacks for GutterCallbacks {
                 self.kitty_state.apply_csi(i1, params, c);
             }
         } else if is_decscusr(i1, c) {
-            // DECSCUSR cursor-shape request (slice 08). vt100 doesn't implement
-            // it, so it lands here with the SP intermediate in `i1`; record the
-            // requested shape for the render loop to mirror. Touches only
-            // `cursor_shape` — sibling to the kitty and clipboard concerns.
+            // vt100 doesn't implement DECSCUSR, so it lands here with the SP
+            // intermediate in `i1`. Record the shape for the render loop to mirror.
             self.cursor_shape.apply_csi(params);
         } else if let Some(reply) = device_query_reply(i1, params, c, screen) {
-            // A DA1 / DSR device query (slice 11). gutter is the child's emulator,
-            // so it buffers a spec-correct reply here; the render loop drains it to
-            // the PTY master. Touches only `replies`.
+            // gutter answers device queries itself; buffer the reply for the
+            // render loop to drain to the PTY master.
             self.replies.extend_from_slice(&reply);
         }
     }
 
-    /// The OSC-52 clipboard write (ADR-004). vt100/vte hands us a complete,
-    /// already-reassembled OSC 52 with `data` still base64-encoded; we reconstruct
-    /// `ESC ] 52 ; ty ; data BEL` verbatim and write it to the injected sink (the
-    /// separately-opened `/dev/tty` in production), on this thread, inside
-    /// `parser.process()`.
-    ///
-    /// Touches **only** `clipboard_out`. `screen` is ignored — a clipboard event
-    /// never touches the grid. The error is swallowed (logged), never propagated:
-    /// a failed clipboard write must not unwind out of `process()` or take down
-    /// the render loop (best-effort side effect).
+    /// The OSC-52 clipboard write. vt100/vte hands us a complete, reassembled
+    /// OSC 52 with `data` still base64-encoded; we reconstruct
+    /// `ESC ] 52 ; ty ; data BEL` verbatim and write it to the injected sink. The
+    /// error is swallowed, never propagated: a failed clipboard write must not
+    /// unwind out of `process()` and take down the render loop. See ADR-004.
     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
         if let Err(e) = forward_osc52(&mut self.clipboard_out, ty, data) {
             eprintln!("gutter: clipboard write failed: {e}");
@@ -208,10 +183,9 @@ mod tests {
     use super::*;
     use crate::keyboard::KittyLevel;
 
-    /// The watcher tracks the child's kitty level **through the real `vt100`
-    /// callback path** — drive `parser.process()` with enable/disable bytes and
-    /// assert `kitty_state.current()` at each step (the AC: "negotiated level
-    /// tracked as a push/pop stack via `unhandled_csi`").
+    /// Tracks the child's kitty level through the real `vt100` callback path:
+    /// drive `parser.process()` with enable/disable bytes and assert
+    /// `kitty_state.current()` at each step.
     #[test]
     fn unhandled_csi_tracks_kitty_level_through_parser() {
         let mut parser =
@@ -234,11 +208,9 @@ mod tests {
         assert_eq!(parser.callbacks().kitty_state.current(), KittyLevel::Legacy);
     }
 
-    /// The cursor-shape watcher (slice 08) tracks the child's DECSCUSR through
-    /// the real `vt100` callback path: drive `parser.process()` with a
-    /// `CSI Ps SP q` and assert the shared callbacks recorded a pending shape to
-    /// mirror — proving DECSCUSR is observable via `unhandled_csi` (in scope,
-    /// not a documented gap) and tracked on the shared struct.
+    /// Tracks the child's DECSCUSR through the real `vt100` callback path: drive
+    /// `parser.process()` with a `CSI Ps SP q` and assert the callbacks recorded a
+    /// pending shape to mirror — proving DECSCUSR is observable via `unhandled_csi`.
     #[test]
     fn decscusr_tracked_through_parser() {
         let mut parser =
@@ -291,13 +263,11 @@ mod tests {
         assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[0n");
     }
 
-    /// **The reply most worth pinning (PRD §5).** DSR cursor-position (`CSI 6 n`)
-    /// is answered `CSI row ; col R` in the child's **W-grid** coordinates, 1-based.
-    /// The callbacks only ever see the parser's own grid — the band's left-margin
-    /// offset lives in the render thread and never reaches here — so the reply is
-    /// the child's true position, never shifted by the gutter. Position the cursor
-    /// with `CSI 3 ; 7 H` and assert the reply echoes `3 ; 7`, not a margin-shifted
-    /// column.
+    /// DSR cursor-position (`CSI 6 n`) is answered `CSI row ; col R` in the child's
+    /// **W-grid** coordinates, 1-based. The callbacks only ever see the parser's
+    /// own grid — the band's left-margin offset lives in the render thread and
+    /// never reaches here — so the reply is the child's true position, never
+    /// shifted by the gutter.
     #[test]
     fn cursor_position_reply_uses_w_grid_coords() {
         let mut parser =
@@ -337,7 +307,7 @@ mod tests {
     }
 
     /// With the outer terminal unable to source kitty, the child's enable is
-    /// neutralised through the real callback path — the case-B clamp.
+    /// neutralised through the real callback path.
     #[test]
     fn clamp_neutralises_enable_through_parser() {
         let mut parser =
@@ -361,15 +331,12 @@ mod tests {
         assert_eq!(parser.callbacks().kitty_state.current(), KittyLevel::Legacy);
     }
 
-    /// The **recording** callbacks shape (PRD Testing Decisions §1–3): the same
-    /// two concerns as [`GutterCallbacks`] — the kitty watcher and the OSC-52
-    /// hook — but `copy_to_clipboard` records each `(ty, data)` into a `Vec`
-    /// instead of writing a tty. This lets the dispatch-confirmation and
+    /// A test double with the same two concerns as [`GutterCallbacks`] — the kitty
+    /// watcher and the OSC-52 hook — but `copy_to_clipboard` records each
+    /// `(ty, data)` into a `Vec` instead of writing a tty. Lets the dispatch and
     /// coexistence tests drive `parser.process()` directly and assert what fired,
-    /// with no PTY, no `/dev/tty`, no threads. The kitty watcher body is
-    /// **identical** to production's (`is_kitty_csi` → `apply_csi`); only the
-    /// clipboard body differs (record vs forward) — exactly the seam the PRD
-    /// describes.
+    /// with no PTY, no `/dev/tty`, no threads. The kitty watcher body is identical
+    /// to production's; only the clipboard body differs (record vs forward).
     struct RecordingCallbacks {
         kitty_state: KittyState,
         recorded: Vec<(Vec<u8>, Vec<u8>)>,
@@ -403,56 +370,45 @@ mod tests {
         }
     }
 
-    /// **OSC-52 dispatch confirmation** (the core seam test, ADR-004). gutter
-    /// does not parse OSC itself — it relies on vt100/vte's dispatch — so this
-    /// test drives `parser.process()` directly with a recording callback and pins
-    /// **exactly** what the pinned `vt100 0.16.2` / `vte 0.15.0` dispatches for
-    /// each terminator and abort form. It is the unit-level proof of "the only
-    /// unconfirmed link is vt100's own dispatch layer" — and, as ADR-004 foresaw,
-    /// it is where a divergence between that layer and the VT spec surfaces ("if
-    /// it trips it's a vt100 wrapper bug to report, not a reason to revert to a
-    /// hand-rolled scanner").
+    /// gutter does not parse OSC itself — it relies on vt100/vte's dispatch — so
+    /// this test pins exactly what the pinned `vt100 0.16.2` / `vte 0.15.0`
+    /// dispatches for each terminator and abort form. See ADR-004.
     ///
-    /// Running this against the pinned vte 0.15.0 turned up **two verified
-    /// divergences from the VT spec**, recorded here as findings (NOT gutter
-    /// bugs — gutter forwards verbatim whatever vt100 hands it):
+    /// Two of those forms diverge from the VT spec. These are vte gaps, not gutter
+    /// bugs — gutter forwards verbatim whatever vt100 hands it:
     ///
     /// 1. **C1 ST `0x9C` is NOT an OSC terminator.** In `vte::advance_osc_string`
     ///    the raw `0x9C` byte falls into the catch-all `action_osc_put` arm — it
     ///    is appended to the OSC payload, not treated as ST. Only the two-byte
-    ///    `ESC \` ST form terminates. (An 8-bit-clean child that emits a bare
-    ///    `0x9C` ST would have its OSC swallowed until the next real terminator.)
+    ///    `ESC \` ST form terminates. An 8-bit-clean child emitting a bare `0x9C`
+    ///    ST would have its OSC swallowed until the next real terminator.
     /// 2. **CAN `0x18` / SUB `0x1A` DISPATCH the OSC, they do not abort it.** In
     ///    `vte`, `0x18`/`0x1A` inside an OSC string call `osc_end` →
-    ///    `osc_dispatch` (then `execute(byte)`), so a partial OSC-52 cut short by
-    ///    CAN is delivered with the bytes seen so far rather than discarded.
+    ///    `osc_dispatch`, so a partial OSC-52 cut short by CAN is delivered with
+    ///    the bytes seen so far rather than discarded.
     ///
-    /// The spec'd behaviour is the *desired* one; these are upstream gaps to file
-    /// against vte/vt100. This test asserts the **verified actual** behaviour so
-    /// CI is green and stable on the pinned toolchain AND so a future vte upgrade
-    /// that fixes either divergence trips the test (forcing a conscious update).
-    /// The forms gutter's transparency promise actually leans on every day — BEL,
-    /// `ESC \`, and split-read reassembly across `process()` calls — all work
-    /// exactly as required.
+    /// The test asserts the verified actual behaviour, so a future vte upgrade
+    /// that fixes either divergence trips it and forces a conscious update. The
+    /// forms gutter relies on daily — BEL, `ESC \`, and split-read reassembly
+    /// across `process()` calls — all work as required.
     #[test]
     fn osc52_dispatch_confirmation_against_pinned_vte() {
         let mut parser =
             vt100::Parser::new_with_callbacks(24, 80, 0, RecordingCallbacks::new(true));
 
-        // 1. BEL (0x07) terminator — works (spec-conformant).
+        // 1. BEL (0x07) terminator.
         parser.process(b"\x1b]52;c;QUJD\x07");
-        // 2. ST (ESC \) terminator — works (spec-conformant).
+        // 2. ST (ESC \) terminator.
         parser.process(b"\x1b]52;c;REVG\x1b\\");
         // 3. Split form A: cut mid-payload across two process() calls — vte's
-        //    persistent osc_raw buffer reassembles across the boundary (works).
+        //    osc_raw buffer reassembles across the boundary.
         parser.process(b"\x1b]52;c;S0xN");
         parser.process(b"Tk9Q\x07");
-        // 4. Split form B: a DIFFERENT cut — between the `ty` and the payload
-        //    (the two mandated distinct adversarial splits; works).
+        // 4. Split form B: a different cut, between the `ty` and the payload.
         parser.process(b"\x1b]52;p;");
         parser.process(b"UlNU\x07");
         // 5. Non-52 OSC: a window-title set (OSC 0). Must NOT dispatch
-        //    copy_to_clipboard — vt100 routes it to set_window_title (works).
+        //    copy_to_clipboard — vt100 routes it to set_window_title.
         parser.process(b"\x1b]0;my title\x07");
 
         // The four clean OSC-52s dispatched once each, in order, verbatim; the
@@ -469,11 +425,9 @@ mod tests {
              a non-52 OSC does not reach copy_to_clipboard"
         );
 
-        // --- Finding 1: C1 ST 0x9C is NOT a terminator in vte 0.15.0. ---
-        // The OSC stays open and the 0x9C is absorbed into the payload; only a
-        // later real terminator closes it. We prove that by feeding the 0x9C form
-        // then a BEL-terminated continuation and observing they merged into ONE
-        // dispatch (the OSC never closed at the 0x9C).
+        // Finding 1: bare C1 ST 0x9C does not terminate the OSC in vte 0.15.0.
+        // It is absorbed into the payload, so nothing dispatches until a real
+        // terminator arrives.
         let mut c1 =
             vt100::Parser::new_with_callbacks(24, 80, 0, RecordingCallbacks::new(true));
         c1.process(b"\x1b]52;c;R0hJ\x9c");
@@ -483,7 +437,7 @@ mod tests {
              nothing dispatched yet (spec gap to file upstream)"
         );
 
-        // --- Finding 2: CAN 0x18 DISPATCHES the OSC, it does not abort it. ---
+        // Finding 2: CAN 0x18 dispatches the partial OSC, it does not abort it.
         let mut can =
             vt100::Parser::new_with_callbacks(24, 80, 0, RecordingCallbacks::new(true));
         can.process(b"\x1b]52;c;aGV\x18");
@@ -495,11 +449,10 @@ mod tests {
         );
     }
 
-    /// **Shared-struct coexistence** (PRD §3 / the slice AC). On the **one**
-    /// recording callbacks instance, drive a stream carrying BOTH a kitty enable
-    /// (`CSI > 1 u`, watched by `unhandled_csi`) AND an OSC-52 write. Assert the
-    /// tracked kitty level updated AND `copy_to_clipboard` fired — proving the
-    /// struct carries both concerns and neither method touched the other's state.
+    /// On one recording callbacks instance, drive a stream carrying both a kitty
+    /// enable (`CSI > 1 u`) and an OSC-52 write, then assert the kitty level
+    /// updated and `copy_to_clipboard` fired — proving the struct carries both
+    /// concerns and neither method touched the other's state.
     #[test]
     fn kitty_watcher_and_clipboard_coexist_without_coupling() {
         let mut parser =

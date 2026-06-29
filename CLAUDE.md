@@ -76,15 +76,19 @@ Most files map one-to-one onto a concern; the non-obvious split:
 
 ### Invariants to respect
 
-These are load-bearing and easy to break:
+These are load-bearing and easy to break. Each has a full record under `docs/adr/`;
+the one-liners below are the quick reference.
 
-- **Coalescing loop.** The render loop is a fixed-deadline ~60fps coalescer with an explicit `now >= deadline` burst-exit check — this is **mandatory**, because `recv_timeout` never times out under a saturating burst, so a naive loop would starve rendering. One render per frame; zero idle CPU (single blocking `recv()`).
-- **Resize order (same turn, on Thread 2).** Recompute `W` → `resizer.resize(W, rows)` (TIOCSWINSZ to the child *first*) → `parser.set_size(rows, W)` (note the `(rows, cols)` argument order) → recompute margin → gutter clear (alt-screen only) + diff-baseline reset.
-- **Teardown is explicit and ordered.** No destructors run after `process::exit`, so restore by hand, in order: leave alt screen → pop kitty flags → disable mouse → show cursor → disable raw mode — each step conditional on what was actually set up.
-- **Keyboard is always re-encoded.** crossterm yields a decoded `KeyEvent` only, so there is no verbatim passthrough; re-encode at the child's negotiated level. Two independent kitty states: the outer terminal's capability (probed once, clamps the child) and the child's live level (a stack driven by the `unhandled_csi` watcher).
-- **Mouse: eager capture.** One enable at startup, one disable at teardown (kills the dropped-first-click race). Each frame, a poll-diff gate reads the child's live `(mode, encoding)`, translates coordinates (subtract margin, drop the gutter), down-filters motion, and re-encodes SGR-1006.
-- **Width.** `--width N` is absolute (fixed for the session); `--width Npct`/`N%` is proportional (recomputed on every resize). The child is *always* told it has `W` columns, never the real terminal width.
-- **Outer screen mirrors the child.** Read `screen.alternate_screen()` each frame and toggle the outer alt-screen on its edges. Plain commands stay on the primary screen so their output survives exit. The band is anchored at `base_row` (the launch cursor row) and flows inline from there, settling into the scroll-emit engine once it fills the screen. Teardown chooses on the live `outer_alt_active`: a child still in alt takes the leave-alt path; a child that exited inline hands back on a fresh line below the band, gated by an `ever_painted_inline` signal (so a straight-to-alt TUI leaves no stray status line).
+- **Coalescing loop.** Fixed-deadline ~60fps coalescer; the explicit `now >= deadline` burst-exit check is mandatory. See [ADR-007](docs/adr/0007-coalescing-loop.md).
+- **Resize order (on the render thread).** Recompute `W` → `resizer.resize(W, rows)` (TIOCSWINSZ first) → `parser.set_size(rows, W)` (mind the `(rows, cols)` order) → recompute margin → baseline reset. See [ADR-008](docs/adr/0008-resize-ordering.md).
+- **Teardown is explicit and ordered.** No destructors after `process::exit`; restore by hand, each step conditional on what was set up. See [ADR-010](docs/adr/0010-ordered-teardown.md).
+- **Keyboard is always re-encoded.** No verbatim passthrough; re-encode at the child's level, with two independent kitty states. See [ADR-002](docs/adr/0002-keyboard-always-re-encoded.md) and [ADR-003](docs/adr/0003-two-independent-kitty-states.md).
+- **Mouse: eager capture.** One enable at startup, one disable at teardown; a per-frame poll-diff gate translates and re-encodes SGR-1006. See [ADR-005](docs/adr/0005-mouse-eager-capture-poll-gate.md).
+- **Width.** `--width N` is absolute, `--width Npct`/`N%` proportional; the child is always told it owns `W` columns. See [ADR-011](docs/adr/0011-width-resolution.md).
+- **Outer screen mirrors the child.** Mirror the child's alt-screen on its edges; the band anchors at `base_row` and flows inline on the primary screen. See [ADR-012](docs/adr/0012-screen-mode-mirroring.md) and [ADR-013](docs/adr/0013-inline-anchor-scroll-paint.md).
+
+The full set (including the equivalence gate, clipboard fd, margin rule, channel
+topology, and row clipping) is indexed in [docs/adr/README.md](docs/adr/README.md).
 
 ## Equivalence gate & fixtures
 
@@ -95,3 +99,17 @@ The declared width a fixture is captured at **must** equal the `W` the gate repl
 ## Working conventions
 
 Work proceeds in thin **vertical slices**, each cutting through every layer it touches and leaving the binary runnable and green. Commits are prefixed with the slice number: `feat(04): …`, `test(06): … (A2)`, `docs(05): …`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked as local markdown files under `.scratch/<feature>/` (no GitHub Issues; PRs are not a triage surface). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical roles, used verbatim: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root (created lazily when needed). See `docs/agents/domain.md`.

@@ -1,27 +1,10 @@
-//! Clip a vt100 row run to the band width (slice 09, ADR-014).
+//! Clip a vt100 row run to the band width. See ADR-014.
 //!
-//! gutter paints each `rows_diff(prev, 0, W)` row by moving the cursor to the
-//! band's `left_margin` and writing the row's bytes verbatim. vt100 builds those
-//! bytes for a grid that is **exactly `W` columns wide**, so the one unbounded
-//! construct it ever emits into a row — the row-final `ESC[K` (`ClearRowForward`,
-//! erase-to-right-edge under the active background) — erases to the **real**
-//! terminal's right edge once painted at the offset, flooding the right gutter
-//! with a reverse-video statusline's highlight.
-//!
-//! [`clip_row_to_width`] rewrites that single sequence into a **bounded fill**:
-//! `(W - col)` spaces under the active SGR (the run's preceding bytes already set
-//! it, so the spaces inherit it) followed by a `CUB` back to where the erase
-//! began, so the in-band highlight reaches the band edge and not one column past
-//! it, and any bytes vt100 appended after the erase still compute from the
-//! position they expect. Everything else vt100 emits into a row is already
-//! bounded, so the clip touches that one sequence and nothing else.
-//!
-//! To know `col` at the erase the function tracks a virtual in-band column across
-//! the run's whole vocabulary: literals (`+ UnicodeWidthChar::width`, the same
-//! width model vt100 uses), `MoveRight` (`ESC[…C`, `+ count`), `Backspace`
-//! (`-1`), `SGR`/`EraseChar` (no move), and — crucially — an **absolute** cursor
-//! move (`CUP`/`CHA`, final `H`/`G`): a rightward-only tracker would desync and
-//! miscompute the fill at a backward jump.
+//! [`clip_row_to_width_into`] rewrites the row-final `ESC[K` (erase to right edge)
+//! into a `W`-bounded fill so a painted row stays inside its `[0, W)` rectangle
+//! rather than flooding the right gutter. To place the fill it tracks a virtual
+//! in-band column across the run, honouring absolute moves (`CUP`/`CHA`) as well
+//! as relative ones — a rightward-only tracker would desync at a backward jump.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -59,12 +42,9 @@ fn parse_param(field: &[u8], default: u16) -> u16 {
     n
 }
 
-/// Rewrite the row-final `ESC[K` in `run` into a `W`-bounded fill so the run is
-/// self-contained within its `[0, W)` rectangle once painted at the band offset.
-///
-/// Returns the run unchanged when it carries no `ESC[K`. The column tracker
-/// honours the full row vocabulary (literals, `MoveRight`, `Backspace`, absolute
-/// `CUP`/`CHA`) so the fill length is correct even after a backward cursor jump.
+/// Rewrites the row-final `ESC[K` in `run` into a `W`-bounded fill so the run stays
+/// within its `[0, W)` rectangle once painted at the band offset. Returns the run
+/// unchanged when it carries no `ESC[K`.
 #[cfg(test)]
 pub fn clip_row_to_width(run: &[u8], w: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(run.len());
@@ -72,10 +52,9 @@ pub fn clip_row_to_width(run: &[u8], w: u16) -> Vec<u8> {
     out
 }
 
-/// As [`clip_row_to_width`], but **append** the clipped run to a caller-owned
-/// buffer instead of allocating a fresh `Vec`. The paint hot path seeds `out` with
-/// the per-row `ESC[m` reset and clips straight into it, so a painted row is built
-/// in one allocation rather than two.
+/// As [`clip_row_to_width`], but appends to a caller-owned buffer instead of
+/// allocating. The paint hot path seeds `out` with the per-row `ESC[m` reset and
+/// clips straight into it, building a painted row in one allocation, not two.
 pub fn clip_row_to_width_into(run: &[u8], w: u16, out: &mut Vec<u8>) {
     let mut col: u16 = 0;
     let mut i = 0;
@@ -84,8 +63,8 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, out: &mut Vec<u8>) {
         let b = run[i];
 
         if b == 0x1b {
-            // An escape sequence. CSI (`ESC[`) carries the cursor-affecting verbs;
-            // any other `ESC x` two-byte escape moves no column.
+            // CSI (`ESC[`) carries the cursor-affecting verbs; any other `ESC x`
+            // two-byte escape moves no column.
             if run.get(i + 1) == Some(&b'[') {
                 let params_start = i + 2;
                 let mut j = params_start;
@@ -101,12 +80,10 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, out: &mut Vec<u8>) {
                 let params = &run[params_start..j];
                 match final_byte {
                     b'K' => {
-                        // The single unbounded construct is the forward erase
-                        // (`ESC[K` / `ESC[0K`); only it floods past `W`. Replace it
-                        // with a bounded fill under the active SGR (already set by the
-                        // preceding bytes), restoring the cursor so trailing bytes
-                        // still align. The erase-left (`ESC[1K`) and whole-line
-                        // (`ESC[2K`) variants are already bounded — copy them verbatim.
+                        // Forward erase (`ESC[K`/`ESC[0K`) is the only sequence that
+                        // floods past `W`. Replace it with a bounded fill under the
+                        // active SGR, then a `CUB` so trailing bytes still align.
+                        // `ESC[1K`/`ESC[2K` are already bounded — copy them verbatim.
                         if first_param(params, 0) == 0 {
                             let rem = w.saturating_sub(col);
                             if rem > 0 {
@@ -115,7 +92,6 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, out: &mut Vec<u8>) {
                                 out.extend_from_slice(rem.to_string().as_bytes());
                                 out.push(b'D');
                             }
-                            // The erase moves no column; `col` is unchanged.
                         } else {
                             out.extend_from_slice(&run[i..=j]);
                         }
@@ -129,7 +105,7 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, out: &mut Vec<u8>) {
                         out.extend_from_slice(&run[i..=j]);
                     }
                     b'H' | b'f' => {
-                        // CUP `ESC[row;colH`: the column is the LAST param (1-based).
+                        // CUP `ESC[row;colH`: the column is the last param (1-based).
                         // A single param is the row only (`ESC[5H`); the column then
                         // defaults to 1, i.e. in-band column 0.
                         let col1 = if params.contains(&b';') {
@@ -207,18 +183,18 @@ mod tests {
         format!("\x1b[{n}D").into_bytes()
     }
 
-    /// **A run with no `ESC[K` is returned byte-identical.** The clip only ever
-    /// touches the one unbounded sequence.
+    /// A run with no `ESC[K` is returned byte-identical; the clip only ever touches
+    /// the one unbounded sequence.
     #[test]
     fn no_erase_is_identity() {
         let run = b"\x1b[1;31mhello\x1b[mworld";
         assert_eq!(clip_row_to_width(run, 80), run.to_vec());
     }
 
-    /// **Reverse-video full-width row.** A leading `ESC[7m` then an immediate
-    /// `ESC[K` (the attributed-but-empty statusline) at column 0 clips to exactly
-    /// `W` spaces under the active reverse SGR plus a `CUB(W)` — the highlight
-    /// reaches the band edge and the cursor is restored.
+    /// Reverse-video full-width row: a leading `ESC[7m` then an immediate `ESC[K`
+    /// (the attributed-but-empty statusline) at column 0 clips to exactly `W` spaces
+    /// under the reverse SGR plus a `CUB(W)`, so the highlight reaches the band edge
+    /// and the cursor is restored.
     #[test]
     fn reverse_video_full_width_clips_to_w_spaces_plus_cub() {
         let w = 10u16;
@@ -230,12 +206,12 @@ mod tests {
         want.extend(std::iter::repeat_n(b' ', usize::from(w)));
         want.extend(cub(w));
         assert_eq!(got, want);
-        // Crucially the original unbounded ESC[K is gone.
+        // The original unbounded ESC[K is gone.
         assert!(!got.windows(3).any(|s| s == b"\x1b[K"));
     }
 
-    /// **The fill starts at the cursor, not column 0.** Some glyphs then an
-    /// `ESC[K`: only `W - col` spaces are emitted, so the fill stops at the band
+    /// The fill starts at the cursor, not column 0: after some glyphs and an
+    /// `ESC[K`, only `W - col` spaces are emitted, so the fill stops at the band
     /// edge regardless of where the erase began.
     #[test]
     fn fill_is_remaining_columns_from_cursor() {
@@ -250,10 +226,10 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// **A wide glyph at the band edge.** The tracker must agree with vt100's
-    /// width model: a double-width glyph counts as two columns, so the fill after
-    /// it is `W - (cols consumed)`, not `W - (chars consumed)`. Here `一` (col 0)
-    /// then `ESC[K` at a `W = 4` band leaves `4 - 2 = 2` fill spaces.
+    /// A wide glyph at the band edge: the tracker must agree with vt100's width
+    /// model, so a double-width glyph counts as two columns and the fill after it is
+    /// `W - (cols consumed)`, not `W - (chars consumed)`. Here `一` (col 0) then
+    /// `ESC[K` at a `W = 4` band leaves `4 - 2 = 2` fill spaces.
     #[test]
     fn wide_glyph_counts_two_columns() {
         let w = 4u16;
@@ -271,11 +247,10 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// **Absolute cursor move honoured (the mandatory correctness point).** A run
-    /// that prints to column 8, then jumps back to column 2 via an absolute `CUP`
-    /// (`ESC[1;3H`), then erases — a rightward-only tracker would compute the fill
-    /// from column 8 and under-fill. The fill must be `W - 2`, proving the
-    /// absolute move reset the column.
+    /// An absolute cursor move resets the tracked column. A run prints to column 8,
+    /// jumps back to column 2 via an absolute `CUP` (`ESC[1;3H`), then erases: a
+    /// rightward-only tracker would fill from column 8 and under-fill. The fill must
+    /// be `W - 2`.
     #[test]
     fn absolute_move_resets_column_not_rightward_only() {
         let w = 20u16;
@@ -291,9 +266,9 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// **Row-only `CUP` defaults the column to 1.** `ESC[5H` moves to row 5,
-    /// column default (in-band column 0) — not column 4. A run that prints to
-    /// column 8, then a row-only `CUP`, then erases must fill the full `W`.
+    /// Row-only `CUP` defaults the column to 1: `ESC[5H` moves to row 5, column
+    /// default (in-band column 0), not column 4. A run that prints to column 8, then
+    /// a row-only `CUP`, then erases must fill the full `W`.
     #[test]
     fn row_only_cup_defaults_column_to_zero() {
         let w = 20u16;
@@ -307,9 +282,8 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// **Only the forward erase is clipped.** `ESC[1K` (erase-left) and `ESC[2K`
-    /// (erase-whole-line) are already bounded, so they pass through verbatim —
-    /// the clip never rewrites them into a forward fill.
+    /// Only the forward erase is clipped. `ESC[1K` (erase-left) and `ESC[2K`
+    /// (erase-whole-line) are already bounded, so they pass through verbatim.
     #[test]
     fn non_forward_erase_is_copied_verbatim() {
         let w = 10u16;
@@ -321,7 +295,7 @@ mod tests {
         }
     }
 
-    /// **`CHA` (`ESC[…G`) is also absolute.** The same desync guard for the
+    /// `CHA` (`ESC[…G`) is also absolute — the same desync guard, for the
     /// column-only absolute move.
     #[test]
     fn cha_is_absolute() {
@@ -336,7 +310,7 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// **`MoveRight` advances the column.** `ESC[5C` skips five columns before the
+    /// `MoveRight` advances the column: `ESC[5C` skips five columns before the
     /// erase, so the fill is `W - 5`.
     #[test]
     fn move_right_advances_column() {
@@ -351,7 +325,7 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// **Backspace retreats the column.** Three glyphs then a backspace leaves the
+    /// Backspace retreats the column: three glyphs then a backspace leaves the
     /// cursor at column 2, so the fill is `W - 2`.
     #[test]
     fn backspace_retreats_column() {
@@ -366,9 +340,8 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// **The erase at the band edge clips to nothing.** With the cursor already at
-    /// column `W` the fill is empty and no `CUB` is emitted — the `ESC[K` simply
-    /// vanishes.
+    /// The erase at the band edge clips to nothing: with the cursor already at
+    /// column `W` the fill is empty and no `CUB` is emitted, so the `ESC[K` vanishes.
     #[test]
     fn erase_at_edge_emits_no_fill() {
         let w = 3u16;
@@ -377,7 +350,7 @@ mod tests {
         assert_eq!(got, b"\x1b[7mABC".to_vec());
     }
 
-    /// **`EraseChar` moves no column.** An interior `ESC[3X` between glyphs and the
+    /// `EraseChar` moves no column: an interior `ESC[3X` between glyphs and the
     /// trailing erase does not shift the fill length.
     #[test]
     fn erase_char_is_no_move() {
