@@ -9,8 +9,8 @@ use crate::geometry::{Layout, Width};
 /// The parsed invocation: the band width, the alignment, and the child command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// `None` defaults to the real terminal width at startup, so gutter is a
-    /// transparent passthrough.
+    /// `None` means a full-width band that tracks the real terminal, so gutter
+    /// is a transparent passthrough.
     pub width: Option<Width>,
     /// Defaults to [`Layout::Center`].
     pub layout: Layout,

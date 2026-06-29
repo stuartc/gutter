@@ -81,7 +81,7 @@ impl Replay {
         assert_ne!(
             std::any::type_name::<WeztermGrid>(),
             std::any::type_name::<Vt100Grid>(),
-            "the gate MUST run two DIFFERENT emulators (ADR-001 story 2): a \
+            "the gate MUST run two DIFFERENT emulators (ADR-001): a \
              shared parser hides any sequence vt100 swallows"
         );
 

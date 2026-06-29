@@ -16,7 +16,7 @@
 //!   offset repaint.
 //! - Thread 3 (`input::run`)   — owns crossterm's event source exclusively.
 //! - Thread 4 (`waiter::run`)  — blocks on `child.wait()`, the authoritative
-//!   child-death signal (ADR-010).
+//!   child-death signal.
 
 mod callbacks;
 mod cli;
