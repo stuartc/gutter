@@ -217,7 +217,7 @@ fn cursor_visibility_mirrored_on_outer() {
 #[test]
 fn vim_renders_inside_band() {
     let _guard = pty_guard();
-    let child = "/usr/bin/vim -u NONE -N -i NONE";
+    let child = "/usr/bin/vim -u NONE -N -n -i NONE";
     let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
     let mut session = spawn(cmd);
 
