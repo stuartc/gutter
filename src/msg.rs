@@ -13,9 +13,15 @@ use portable_pty::ExitStatus;
 /// - `ChildExited` — the authoritative child-death signal from Thread 4 (the
 ///   waiter). This, **not** PTY EOF and **not** channel `Disconnected`, drives
 ///   shutdown. See ADR-009 / ADR-010.
+/// - `PtyEof` — the PTY forwarder hit EOF and has sent every `Pty` chunk ahead
+///   of it (same-thread FIFO ordering). A **drain terminator only**: it lets the
+///   shutdown path know the child's final bytes have all landed, so teardown can
+///   read `outer_alt_active` without racing the last frame. It never triggers
+///   shutdown — the waiter stays authoritative (ADR-010, PTY EOF unreliable).
 #[derive(Debug)]
 pub enum Msg {
     Pty(Vec<u8>),
     Input(crossterm::event::Event),
     ChildExited(ExitStatus),
+    PtyEof,
 }

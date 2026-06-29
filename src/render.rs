@@ -43,6 +43,13 @@ use crate::terminal::OuterTerminal;
 /// The 60fps frame budget. One render per `FRAME` of wall (or virtual) time.
 pub const FRAME: Duration = Duration::from_millis(16);
 
+/// The upper bound on how long the shutdown path waits for the PTY forwarder's
+/// `Msg::PtyEof` after the child exits (the teardown-race drain, ADR-013). In the
+/// normal case the sentinel arrives at once and the drain returns immediately, so
+/// this cap is only hit when a grandchild keeps the PTY slave open and the master
+/// never EOFs — without it teardown would hang waiting for a sentinel that never comes.
+pub const TEARDOWN_DRAIN_GRACE: Duration = Duration::from_millis(100);
+
 /// The scroll-tracker's bounded scrollback (ADR-013). It only ever needs to hold
 /// one frame's worth of scrolled-off lines (the tracker is reset to the live grid
 /// at the end of every `render_once`), so this caps a single coalesced frame's
@@ -113,6 +120,12 @@ pub struct Renderer {
     /// (`gutter vim`) — never showing inline content — leaves no stray status line
     /// below an empty band. Set true the first time a non-empty primary paint runs.
     ever_painted_inline: bool,
+    /// Whether the PTY forwarder's `Msg::PtyEof` sentinel has been seen (the child
+    /// closed the PTY master, so all its output has been delivered). Set when
+    /// `PtyEof` is dispatched at any time. The shutdown drain reads it to know the
+    /// final frame has already landed and skip the bounded wait (ADR-013). Purely a
+    /// drain hint — it never triggers shutdown; the waiter stays authoritative.
+    pty_eof_seen: bool,
     /// The mouse forwarding gate (ADR-005): the button-held flag the
     /// `ButtonMotion` down-filter needs. The child's `(mode, encoding)` is read
     /// live from the screen each `Event::Mouse` dispatch, not cached here.
@@ -189,6 +202,7 @@ impl Renderer {
             // row, clamped into the grid so a stale/odd value can't strand it.
             base_row: base_row.min(rows.saturating_sub(1)),
             ever_painted_inline: false,
+            pty_eof_seen: false,
             mouse_gate: MouseGate::default(),
         }
     }
@@ -319,6 +333,13 @@ where
         // Other input events (focus/paste) are swallowed here.
         Msg::Input(_) => None,
         Msg::ChildExited(status) => Some(status.exit_code() as i32),
+        // The PTY path reached EOF — record it so the shutdown drain knows the
+        // child's final bytes have all landed (ADR-013). Carries no bytes and
+        // never triggers shutdown; the waiter stays the authoritative trigger.
+        Msg::PtyEof => {
+            renderer.pty_eof_seen = true;
+            None
+        }
     }
 }
 
@@ -904,6 +925,7 @@ where
         let mut shutdown = false;
         if let Some(code) = dispatch(first, renderer, pty_writer, resizer, term) {
             exit_code = Some(code);
+            drain_pty_path(clock, renderer, pty_writer, resizer, term);
             shutdown = true;
         }
 
@@ -924,6 +946,7 @@ where
                     Recv::Msg(m) => {
                         if let Some(code) = dispatch(m, renderer, pty_writer, resizer, term) {
                             exit_code = Some(code);
+                            drain_pty_path(clock, renderer, pty_writer, resizer, term);
                             shutdown = true;
                             break;
                         }
@@ -954,6 +977,56 @@ where
     // leave) and the inline anchor (the hand-back below the band) — ADR-012/013.
     let _ = run_teardown(renderer, term, exit_code.unwrap_or(0));
     exit_code
+}
+
+/// On a child-exit shutdown, give the PTY path a bounded chance to deliver its
+/// final bytes before teardown reads `outer_alt_active` (ADR-013, the teardown race).
+///
+/// The waiter (Thread 4) and the PTY reader (Thread 1) race with no ordering
+/// guarantee, so the child's last frame — e.g. the `?1049h` of a TUI that exits the
+/// instant it enters the alt screen — can still be queued behind the `ChildExited`,
+/// or not yet read off the master, when shutdown fires. A plain "render the frame
+/// and tear down" would miss it: `outer_alt_active` would read `false` and teardown
+/// would take the inline hand-back instead of leaving the alt screen (no `?1049l`).
+///
+/// So dispatch every remaining `Msg` until the PTY forwarder's `Msg::PtyEof` sentinel
+/// arrives — the deterministic common case, guaranteed to follow every `Msg::Pty`
+/// by same-thread FIFO ordering — or the channel disconnects, or the grace cap
+/// elapses. If `PtyEof` was already seen earlier, there are no stragglers and this
+/// returns at once. The grace cap ([`TEARDOWN_DRAIN_GRACE`]) is the backstop for a
+/// grandchild holding the PTY slave open, so the master never EOFs and the sentinel
+/// never comes — without it the drain would block forever.
+///
+/// Any shutdown code a dispatched message returns is ignored here: we are already
+/// shutting down, and `PtyEof` (the only message that matters) returns `None`.
+fn drain_pty_path<C, T, P, R>(
+    clock: &mut C,
+    renderer: &mut Renderer,
+    pty_writer: &mut P,
+    resizer: &R,
+    term: &mut T,
+) where
+    C: Clock<Msg = Msg>,
+    T: OuterTerminal,
+    P: Write,
+    R: PtyResizer,
+{
+    if renderer.pty_eof_seen {
+        return;
+    }
+    let now = clock.now();
+    let grace_deadline = clock.deadline(now, TEARDOWN_DRAIN_GRACE);
+    loop {
+        if renderer.pty_eof_seen || clock.now() >= grace_deadline {
+            break;
+        }
+        match clock.recv_until(grace_deadline) {
+            Recv::Msg(m) => {
+                let _ = dispatch(m, renderer, pty_writer, resizer, term);
+            }
+            Recv::Timeout | Recv::Disconnected => break,
+        }
+    }
 }
 
 /// The explicit, ordered terminal restore (ADR-010), now mode-aware (ADR-012/013):
@@ -1434,6 +1507,106 @@ mod tests {
                 .count(),
             0,
             "an alt-screen TUI replays nothing onto the primary screen"
+        );
+    }
+
+    /// The teardown-race regression guard (ADR-013). The adversarial ordering the
+    /// CI flake exposed: the waiter's `ChildExited` lands FIRST, with the child's
+    /// final `?1049h` queued behind it and the forwarder's `PtyEof` behind that. The
+    /// shutdown drain must process the queued alt-screen bytes before teardown reads
+    /// `outer_alt_active`, so restore leaves the alt screen (`?1049l`) rather than
+    /// taking the inline hand-back. Without the drain this dropped the final frame and
+    /// emitted no `LeaveAltScreen` — exactly the captured failure.
+    #[test]
+    fn child_exit_before_final_alt_frame_still_leaves_alt() {
+        use crate::terminal::OuterTerminal;
+        let mut clock = VirtualClock::new(vec![
+            // The waiter's ChildExited lands first; the alt-screen bytes the child
+            // wrote just before exiting are still queued behind it, then PtyEof.
+            (0u64, Msg::ChildExited(ExitStatus::with_exit_code(7))),
+            (0, Msg::Pty(b"\x1b[?1049h".to_vec())),
+            (0, Msg::PtyEof),
+        ]);
+        let mut renderer = left_renderer(80, 24, true);
+        let mut term = MockTerminal::kitty_capable();
+        assert!(term.supports_keyboard_enhancement().unwrap());
+        term.push_keyboard_flags().unwrap();
+        term.enable_mouse().unwrap();
+        let mut pty: Vec<u8> = Vec::new();
+
+        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+
+        assert_eq!(code, Some(7), "the child's exit code still propagates");
+        assert!(
+            renderer.pty_eof_seen,
+            "the drain consumes the PtyEof sentinel"
+        );
+        assert!(
+            term.restore_calls().contains(&Call::LeaveAltScreen),
+            "the child's final alt-screen frame must be processed before teardown, \
+             so restore leaves the alt screen, got {:?}",
+            term.restore_calls()
+        );
+    }
+
+    /// The grace cap (ADR-013) bounds the shutdown drain when no `PtyEof` ever
+    /// arrives — the grandchild-holds-the-fd case, where the master never EOFs. Here
+    /// a straggler `Pty` is scheduled FAR past [`TEARDOWN_DRAIN_GRACE`]; the drain must
+    /// NOT wait for it. It caps out at the grace deadline, the late `?1049h` is never
+    /// processed, and teardown still completes and returns the exit code — proving the
+    /// loop can't hang on a sentinel that never comes.
+    #[test]
+    fn shutdown_drain_caps_at_grace_when_no_eof() {
+        use crate::terminal::OuterTerminal;
+        let grace_ms = TEARDOWN_DRAIN_GRACE.as_millis() as u64;
+        let mut clock = VirtualClock::new(vec![
+            (0u64, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+            // A straggler arriving well past the grace window: never reached.
+            (grace_ms + 500, Msg::Pty(b"\x1b[?1049h".to_vec())),
+        ]);
+        let mut renderer = left_renderer(80, 24, true);
+        let mut term = MockTerminal::kitty_capable();
+        term.push_keyboard_flags().unwrap();
+        let mut pty: Vec<u8> = Vec::new();
+
+        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+
+        assert_eq!(code, Some(0), "teardown completes and returns the exit code");
+        assert!(
+            !renderer.pty_eof_seen,
+            "no PtyEof arrived — the cap, not the sentinel, ended the drain"
+        );
+        assert!(
+            !term.restore_calls().contains(&Call::LeaveAltScreen),
+            "the post-grace straggler is never processed, so there is no alt screen to leave"
+        );
+    }
+
+    /// `PtyEof` before `ChildExited` (ADR-013): the PTY path finished cleanly, so by
+    /// the time the waiter fires there are no stragglers. The shutdown drain reads the
+    /// already-set `pty_eof_seen` and short-circuits — no bounded wait — and teardown
+    /// still leaves the alt screen the (already processed) `?1049h` put us in.
+    #[test]
+    fn pty_eof_before_child_exit_short_circuits_drain() {
+        use crate::terminal::OuterTerminal;
+        let mut clock = VirtualClock::new(vec![
+            (0u64, Msg::Pty(b"\x1b[?1049h".to_vec())),
+            (1, Msg::PtyEof),
+            (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ]);
+        let mut renderer = left_renderer(80, 24, true);
+        let mut term = MockTerminal::kitty_capable();
+        term.push_keyboard_flags().unwrap();
+        let mut pty: Vec<u8> = Vec::new();
+
+        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+
+        assert_eq!(code, Some(0), "the child's exit code propagates");
+        assert!(renderer.pty_eof_seen, "the early PtyEof was recorded");
+        assert!(
+            term.restore_calls().contains(&Call::LeaveAltScreen),
+            "the alt screen entered before EOF is left at teardown, got {:?}",
+            term.restore_calls()
         );
     }
 

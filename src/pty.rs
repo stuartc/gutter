@@ -162,7 +162,13 @@ pub fn forward_to_merge(
 ) {
     for chunk in staging {
         if merged.send(Msg::Pty(chunk)).is_err() {
-            break;
+            return;
         }
     }
+    // The reader hit EOF, so `staging` closed and the loop drained every chunk.
+    // Both the chunks and this sentinel come from this one thread, so the merged
+    // channel delivers all `Msg::Pty` before `Msg::PtyEof` — the FIFO-per-sender
+    // ordering the render loop's bounded shutdown drain relies on. PtyEof only
+    // terminates that drain; it never triggers shutdown (the waiter is authoritative).
+    let _ = merged.send(Msg::PtyEof);
 }
