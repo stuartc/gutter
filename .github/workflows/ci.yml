@@ -9,6 +9,12 @@ env:
   # terminal type that exists on the runner so they don't fall back or error.
   TERM: xterm-256color
   CARGO_TERM_COLOR: always
+  # The PTY integration tests drive real terminals with timing-sensitive waits.
+  # libtest runs tests within a binary in parallel by default, so on a loaded
+  # runner several PTY children compete and a click/echo/resize settles slower
+  # than its wait — the tests flake. Serialise every harness so only one PTY child
+  # is live at a time; costs a little wall-clock, buys determinism.
+  RUST_TEST_THREADS: 1
 
 jobs:
   build-test-clippy:
