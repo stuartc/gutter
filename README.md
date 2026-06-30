@@ -3,6 +3,8 @@
 Run a terminal program inside a narrower column, while the program still
 believes it owns the whole terminal.
 
+![Neovim running inside a centred gutter band, with empty margins either side of the editor](docs/screenshot.png)
+
 `gutter` starts a command in its own pseudo-terminal, renders the output into a
 fixed-width band — centred or left-aligned — and passes your keyboard, mouse,
 clipboard and window resizes straight through. The program wraps its lines,
@@ -48,18 +50,36 @@ positioning, scrollback — simply works.
 
 ## Install
 
-You'll need Rust 1.96.0. It's pinned in `.tool-versions`, so
-[asdf](https://asdf-vm.com/) / [mise](https://mise.jdx.dev/) will pick the right
-version up automatically.
+### Prebuilt binary
+
+Grab the archive for your platform from the
+[latest release](https://github.com/stuartc/gutter/releases/latest) — Linux
+x86_64 and a universal macOS binary (Apple Silicon + Intel) are published, each
+with a SHA-256 checksum. Unpack it and drop `gutter` somewhere on your `$PATH`.
+
+The binaries are unsigned, so on macOS Gatekeeper will refuse to run a freshly
+downloaded one. Clear the quarantine attribute first:
 
 ```sh
-git clone git@github.com:stuartc/gutter.git
-cd gutter
-cargo install --path .
+xattr -c ./gutter
+```
+
+Or run it once via right-click → Open in Finder and confirm the warning, which
+allows it from then on.
+
+### From source
+
+You'll need Rust 1.96.0. It's pinned in `.tool-versions`, so
+[asdf](https://asdf-vm.com/) / [mise](https://mise.jdx.dev/) will pick the right
+version up automatically. With a toolchain in place:
+
+```sh
+cargo install --git https://github.com/stuartc/gutter --locked
 ```
 
 That drops a `gutter` binary on your `$PATH` (`~/.cargo/bin` by default).
-Alternatively, `cargo build --release` and run `target/release/gutter` directly.
+Alternatively, clone the repo and `cargo build --release` to run
+`target/release/gutter` directly.
 
 ## Usage
 
@@ -84,7 +104,7 @@ Flags:
 
 A few things worth knowing:
 
-- Flags are only read *before* the command. Anything after the command name
+- Flags are only read _before_ the command. Anything after the command name
   belongs to the child, so `gutter vim --width 100` passes `--width 100` to vim,
   not to gutter.
 - There is no `--help`. An unrecognised leading token is taken to be the command

@@ -3,6 +3,18 @@ name = "gutter"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
+description = "Render a child terminal program inside a narrower column band while it behaves as if it owns the full terminal."
+repository = "https://github.com/stuartc/gutter"
+readme = "README.md"
+publish = false
+
+[package.metadata.release]
+publish = false
+allow-branch = ["main"]
+# Regenerate the changelog and stage it: cargo-release only auto-stages Cargo.toml
+# and pre-release-replacements, so a hook-written file must be `git add`ed by the hook
+# itself. The `v` prefix matches the real tags; `&&` aborts the release if cliff fails.
+pre-release-hook = ["bash", "-c", "git cliff -o CHANGELOG.md --tag v${NEW_VERSION} && git add CHANGELOG.md"]
 
 [dependencies]
 portable-pty = "0.9.0"
@@ -29,3 +41,8 @@ proptest = "1.11.0"
 # and its tests are `#[cfg(feature = "oracle")]`, so a normal build never pulls
 # the heavy wezterm dependency tree.
 oracle = ["dep:tattoy-wezterm-term"]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
