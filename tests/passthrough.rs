@@ -24,9 +24,9 @@ use expectrl::process::unix::WaitStatus;
 use expectrl::session::OsSession;
 use expectrl::{Eof, Expect, Session};
 
-/// The window size expectrl gives the outer PTY. gutter queries this and sizes
-/// its inner PTY to match (slice 01 = real width, no offset yet), so the
-/// wrapped child must report this column count.
+/// The window size expectrl gives the outer PTY. Tests that need the child to
+/// see this exact column count pass `--width full`, since the no-flag default
+/// is a 100-column band that would only match here via the clamp (80 < 100).
 const OUTER_COLS: u16 = 80;
 const OUTER_ROWS: u16 = 24;
 
@@ -87,10 +87,9 @@ fn passthrough_echo() {
 
 /// `--width full` sizes the child's PTY to the real terminal's dimensions: the
 /// inner PTY matches the outer terminal's `cols`, so `tput cols` inside the
-/// child reports `OUTER_COLS`. Pinned to `--width full` rather than the
-/// no-flag default, which since the 100-column default is no longer a
-/// terminal-tracking passthrough (it would only match `OUTER_COLS` here
-/// because 80 happens to be narrower than 100 — the wrong reason).
+/// child reports `OUTER_COLS`. Pinned to `--width full`: the no-flag default
+/// is a 100-column band, which at `OUTER_COLS` = 80 would only match via the
+/// clamp — the wrong reason for this test to pass.
 #[test]
 fn child_sees_real_dimensions() {
     // `tput cols` reads the child's own controlling tty (gutter's inner PTY).

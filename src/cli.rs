@@ -20,7 +20,7 @@ pub struct Config {
     pub args: Vec<String>,
 }
 
-/// Parses `gutter [--width <N|Npct>] [--center|--left] <cmd> [args...]` from an
+/// Parses `gutter [--width <N|Npct|full>] [--center|--left] <cmd> [args...]` from an
 /// argument iterator (excluding argv[0]).
 ///
 /// Flags are only recognised before the command; once the command is seen,
@@ -227,5 +227,6 @@ mod tests {
     #[test]
     fn rejects_capitalised_full() {
         assert!(parse(v(&["--width", "Full", "echo"])).is_err());
+        assert!(parse(v(&["--width", "FULL", "echo"])).is_err());
     }
 }
