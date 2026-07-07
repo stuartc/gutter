@@ -78,11 +78,6 @@ pub struct Renderer {
     /// The cursor visibility last mirrored to the outer terminal, so we only
     /// emit a show/hide when it actually changes.
     cursor_visible: bool,
-    /// The startup kitty-capability probe result (ADR-003). Stored so the resume
-    /// path can re-push the enhancement flags without re-probing — a `CSI ? u`
-    /// round-trip at resume would be eaten by the input thread, which by then owns
-    /// crossterm's event source (ADR-0019).
-    outer_supports_kitty: bool,
     /// Whether the OUTER terminal is in the alternate screen, mirroring the child's
     /// `alternate_screen()` (ADR-012). Edge-triggered like `cursor_visible`: we emit
     /// an enter/leave only on a real change. Never forced — gutter enters the alt
@@ -159,7 +154,6 @@ impl Renderer {
             layout,
             real_cols,
             left_margin: geometry::margin(layout, real_cols, width),
-            outer_supports_kitty,
             // vt100 starts with the cursor visible; mirror that initial state.
             cursor_visible: true,
             // gutter never forces the alt screen (ADR-012); start false.
@@ -1288,10 +1282,8 @@ where
     // alt screen before stopping) fires here, keeping `outer_alt_active` truthful.
     let _ = render_once(renderer, term);
 
-    let rows = renderer.parser.screen().size().0;
-
     // Step 3 — park (restore, ADR-010 order, minus the exit-status line).
-    let _ = park(renderer, term, rows);
+    let _ = park(renderer, term);
 
     // Step 4 — stop gutter's own process group. THE WHOLE PROCESS STOPS HERE until
     // the shell `fg`s it; all four threads freeze at this call site.
@@ -1358,11 +1350,7 @@ where
 /// lands before the self-stop. Deliberately does NOT clear `outer_alt_active`: it
 /// stays as "the child's screen is alt" for the resume re-derivation (the
 /// double-meaning note in ADR-0019).
-fn park<T: OuterTerminal>(
-    renderer: &mut Renderer,
-    term: &mut T,
-    rows: u16,
-) -> std::io::Result<()> {
+fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
     // Best-effort per step (ADR-010's "restore by hand, each step conditional"):
     // attempt EVERY restore step even if an earlier one errors, so an early failure
     // (e.g. a flush inside leave_alt_screen) can't short-circuit the rest and strand
@@ -1380,12 +1368,8 @@ fn park<T: OuterTerminal>(
     if renderer.outer_alt_active {
         record(term.leave_alt_screen());
     } else if renderer.ever_painted_inline {
-        let bottom = renderer
-            .base_row
-            .saturating_add(renderer.deepest_live_row())
-            .min(rows.saturating_sub(1));
-        record(term.move_to(0, bottom));
-        record(term.newline());
+        // Same hand-back as run_teardown's exit-0 path: a fresh line below the band.
+        record(hand_back_inline(renderer, term, 0));
     }
     record(term.write_row(b"\x1b[0m")); // drop any leftover attribute run
     record(term.set_cursor_shape(b"\x1b[0 q")); // hand the shell a default cursor shape
@@ -1405,7 +1389,7 @@ fn park<T: OuterTerminal>(
 /// source, so re-push from the stored startup capability instead.
 fn unpark<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
     retry_enable_raw(term)?;
-    if renderer.outer_supports_kitty {
+    if renderer.parser.callbacks().kitty_state.outer_supports() {
         let _ = term.push_keyboard_flags();
     }
     term.enable_mouse()?;
