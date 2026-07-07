@@ -13,10 +13,12 @@
 use std::io::Write;
 use std::time::Duration;
 
+use crossterm::event::{Event, KeyEvent};
+
 use crate::callbacks::GutterCallbacks;
 use crate::clock::{Clock, Recv};
 use crate::geometry::{self, Layout, Width};
-use crate::keyboard;
+use crate::keyboard::{self, KeyChord};
 use crate::mouse::{MouseDecision, MouseGate};
 use crate::msg::Msg;
 use crate::pty::PtyResizer;
@@ -25,6 +27,10 @@ use crate::terminal::OuterTerminal;
 
 /// The 60fps frame budget. One render per `FRAME` of wall (or virtual) time.
 pub const FRAME: Duration = Duration::from_millis(16);
+
+/// Resize-mode idle auto-exit window (~3 s). Uses the injected clock (ADR-007),
+/// so it is unit-testable on virtual time. PRD 0001, Feature 2 ("Exiting").
+pub const RESIZE_IDLE: Duration = Duration::from_secs(3);
 
 /// Upper bound on how long the shutdown path waits for the PTY forwarder's
 /// `Msg::PtyEof` after the child exits (ADR-013). Normally the sentinel arrives at
@@ -94,6 +100,10 @@ pub struct Renderer {
     /// down-filter needs. The child's `(mode, encoding)` is read live from the screen
     /// each `Event::Mouse` dispatch, not cached here.
     mouse_gate: MouseGate,
+    /// The reserved resize-mode enter chord (`--resize-key`, default Ctrl-\). The one
+    /// key gutter ever withholds from the child, and only as the enter chord or while
+    /// in the mode (PRD 0001, Feature 2).
+    resize_key: KeyChord,
 }
 
 impl Renderer {
@@ -152,7 +162,14 @@ impl Renderer {
             ever_painted_inline: false,
             pty_eof_seen: false,
             mouse_gate: MouseGate::default(),
+            resize_key: KeyChord::default(),
         }
+    }
+
+    /// Override the resize-mode enter chord (from `--resize-key`). Called once at
+    /// startup from `main`; tests keep the default.
+    pub fn set_resize_key(&mut self, chord: KeyChord) {
+        self.resize_key = chord;
     }
 
     /// Read-only view of the virtual screen — for the insta snapshot and the
@@ -279,6 +296,68 @@ where
     }
 }
 
+/// What the render loop should do with a decoded key while resize mode is / isn't
+/// active. `PassThrough` is the only variant that reaches `encode_key`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyAction {
+    Enter,        // the chord, not in mode → enter resize mode
+    Exit,         // Esc or the chord, in mode → leave
+    Step(i32),    // in mode → nudge width by this many units (±1 / ±10)
+    Swallow,      // in mode, unrecognised key → consume, stay in mode
+    PassThrough,  // forward to the child (the normal path)
+}
+
+/// Classify a key against the reserved chord and the current mode.
+///
+/// Releases are filtered FIRST: with kitty REPORT_EVENT_TYPES active on the outer
+/// terminal, every press is followed by a release event — without this guard the
+/// chord's own release would match again and instantly toggle the mode back
+/// (enter → exit on key-up). A release is inert: swallowed in mode (without
+/// refreshing idle), passed through otherwise (`encode_key` already returns empty
+/// bytes for releases, so passthrough preserves today's behaviour byte-for-byte).
+///
+/// The chord itself fires on `Press` only — an auto-repeating held chord must not
+/// toggle enter/exit every repeat. Step keys DO act on repeats (hold `h` to keep
+/// shrinking). The chord is checked in BOTH states: not-in-mode it enters, in-mode
+/// it exits — so a chord that happens to be a letter can never collide with an
+/// in-mode command.
+fn classify_key(ev: &KeyEvent, chord: KeyChord, in_mode: bool) -> KeyAction {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    if ev.kind == KeyEventKind::Release {
+        return if in_mode { KeyAction::Swallow } else { KeyAction::PassThrough };
+    }
+    if chord.matches(ev) && ev.kind == KeyEventKind::Press {
+        return if in_mode { KeyAction::Exit } else { KeyAction::Enter };
+    }
+    if !in_mode {
+        return KeyAction::PassThrough;
+    }
+    // In mode: interpret the adjustment keys, swallow everything else. A step key
+    // carrying CONTROL or ALT is NOT a step (Ctrl-h in mode must not resize) —
+    // swallow it like any other stray key.
+    if ev
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return if matches!(ev.code, KeyCode::Esc) { KeyAction::Exit } else { KeyAction::Swallow };
+    }
+    let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
+    match ev.code {
+        KeyCode::Esc => KeyAction::Exit,
+        KeyCode::Left | KeyCode::Char('h') if !shift => KeyAction::Step(-1),
+        KeyCode::Right | KeyCode::Char('l') if !shift => KeyAction::Step(1),
+        KeyCode::Char('-') => KeyAction::Step(-1),
+        KeyCode::Char('+') | KeyCode::Char('=') => KeyAction::Step(1),
+        KeyCode::Char('H') => KeyAction::Step(-10),
+        KeyCode::Char('L') => KeyAction::Step(10),
+        // Shifted forms (kitty reports `Char('H')`+SHIFT; some legacy paths report
+        // SHIFT + lowercase; Shift+arrows mirror H/L for symmetry):
+        KeyCode::Char('h') | KeyCode::Left if shift => KeyAction::Step(-10),
+        KeyCode::Char('l') | KeyCode::Right if shift => KeyAction::Step(10),
+        _ => KeyAction::Swallow,
+    }
+}
+
 /// The resize handler — the ADR-008 ordering plus the ADR-011 proportional-width
 /// recompute, in one render-thread turn. Recompute `W` → resize the PTY → resize the
 /// parser (`set_size(rows, W)` — param order is the trap) → recompute the margin →
@@ -324,6 +403,191 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     // Force a full repaint next frame: reset the diff baseline to a blank grid of the
     // new size so rows_diff re-emits every row into the resized band.
     renderer.reset_prev_baseline();
+}
+
+/// A snapshot of the band's physical geometry, handed to the overlay painter so it
+/// can clear the strip the band vacated on a shrink and place the rails/readout.
+/// (Defined by stream B; consumed by stream C — the fields are unread until then.)
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct BandGeom {
+    pub left_margin: u16,
+    pub width: u16,
+    pub real_cols: u16,
+    pub rows: u16,
+}
+impl BandGeom {
+    pub(crate) fn of(r: &Renderer) -> Self {
+        Self {
+            left_margin: r.left_margin,
+            width: r.width,
+            real_cols: r.real_cols,
+            rows: r.parser.screen().size().0,
+        }
+    }
+}
+
+/// Enter the visual mode: paint the rails + readout for the current geometry.
+/// Called by stream B on the enter chord. (STUB: `Ok(())`; stream C replaces the
+/// body.)
+pub(crate) fn enter_resize_overlay<T: OuterTerminal>(
+    renderer: &Renderer,
+    term: &mut T,
+) -> std::io::Result<()> {
+    let _ = (renderer, term);
+    Ok(())
+}
+
+/// Refresh the overlay after a width change: clear the strip the band vacated
+/// relative to `prev` (uniform, primary + alt), then redraw the rails + readout for
+/// the current geometry. `prev` is `Some` on a manual step or a SIGWINCH-driven
+/// move, `None` on enter (nothing vacated).
+///
+/// This stub is NOT a pure no-op: it keeps parity with `handle_resize` step 4
+/// (above) by running the existing alt-screen-only `clear_gutter`, so an in-mode
+/// shrink on the alt screen does not strand stale band columns that the v1
+/// SIGWINCH path already clears. Stream C replaces this body with the uniform
+/// (primary + alt) strip clear + rail paint.
+pub(crate) fn refresh_resize_overlay<T: OuterTerminal>(
+    renderer: &Renderer,
+    term: &mut T,
+    prev: Option<BandGeom>,
+) -> std::io::Result<()> {
+    let _ = prev;
+    if renderer.outer_alt_active {
+        let rows = renderer.parser.screen().size().0;
+        term.clear_gutter(renderer.left_margin, renderer.width, renderer.real_cols, rows)?;
+    }
+    Ok(())
+}
+
+/// Leave the visual mode: erase the rails + readout and clear-to-blank the strip.
+/// Called by stream B on Esc / chord-exit / idle-exit / shutdown. (STUB: `Ok(())`;
+/// stream C replaces the body.)
+pub(crate) fn clear_resize_overlay<T: OuterTerminal>(
+    renderer: &Renderer,
+    term: &mut T,
+) -> std::io::Result<()> {
+    let _ = (renderer, term);
+    Ok(())
+}
+
+/// Apply one resize-mode step: change the band width by `delta` units, holding
+/// real_cols fixed, in the ADR-008 order. PRD 0001 §"Resize implementation shape".
+///
+/// Order (load-bearing, ADR-008): step the config → resolve W → `resizer.resize`
+/// (TIOCSWINSZ first) → `set_size(rows, W)` (param-order trap) → update geometry →
+/// (stream C: clear vacated strip + paint rails) → reset the diff baseline.
+fn apply_resize_step<R: PtyResizer, T: OuterTerminal>(
+    renderer: &mut Renderer,
+    resizer: &R,
+    term: &mut T,
+    delta: i32,
+) {
+    let rows = renderer.parser.screen().size().0;
+    let real = renderer.real_cols; // held FIXED (unlike handle_resize)
+    let prev = BandGeom::of(renderer); // capture BEFORE mutating (seam)
+
+    // Step 0 — unit-preserving step + clamp.
+    renderer.width_config = geometry::step_width(renderer.width_config, delta, real);
+    let w = geometry::resolve_width(renderer.width_config, real);
+
+    // Idempotent clamp: at a bound the width is unchanged — skip the PTY/parser
+    // churn, but still refresh the overlay so the readout is consistent.
+    if w != renderer.width {
+        // Step 1 — PTY first, cols = W, never real_cols.
+        let _ = resizer.resize(w, rows);
+        // Step 2 — parser, same turn. (rows, cols).
+        renderer.parser.screen_mut().set_size(rows, w);
+        // Step 3 — live geometry (real_cols unchanged).
+        renderer.width = w;
+        renderer.left_margin = geometry::margin(renderer.layout, real, w);
+        // Step 4 — clear the vacated strip + (re)paint rails. Stream C.
+        let _ = refresh_resize_overlay(renderer, term, Some(prev));
+        // Step 5 — force a full band repaint next frame.
+        renderer.reset_prev_baseline();
+    } else {
+        let _ = refresh_resize_overlay(renderer, term, Some(prev));
+    }
+}
+
+/// Loop-owned resize-mode control. `Some(deadline)` == in mode, holding the instant
+/// idle auto-exit fires; `None` == not in mode. Generic over the clock's `Instant`
+/// so the idle window is virtual-clock testable (ADR-007).
+struct ResizeCtl<I> {
+    idle_deadline: Option<I>,
+}
+impl<I: Copy + Ord> ResizeCtl<I> {
+    fn inactive() -> Self {
+        Self { idle_deadline: None }
+    }
+    fn active(&self) -> bool {
+        self.idle_deadline.is_some()
+    }
+    fn arm(&mut self, deadline: I) {
+        self.idle_deadline = Some(deadline);
+    }
+    fn disarm(&mut self) {
+        self.idle_deadline = None;
+    }
+}
+
+/// Handle one live-loop message: intercept resize-mode keys BEFORE `encode_key`
+/// (PRD 0001, Feature 2), else delegate to `dispatch`. Returns the child exit code
+/// exactly as `dispatch` does.
+fn apply_message<C, T, P, R>(
+    m: Msg,
+    clock: &mut C,
+    renderer: &mut Renderer,
+    resize: &mut ResizeCtl<C::Instant>,
+    term: &mut T,
+    pty_writer: &mut P,
+    resizer: &R,
+) -> Option<i32>
+where
+    C: Clock<Msg = Msg>,
+    T: OuterTerminal,
+    P: Write,
+    R: PtyResizer,
+{
+    if let Msg::Input(Event::Key(key)) = &m {
+        match classify_key(key, renderer.resize_key, resize.active()) {
+            KeyAction::PassThrough => {} // fall through to dispatch (encode + write)
+            KeyAction::Enter => {
+                // Two statements, NOT `clock.deadline(clock.now(), ..)`: `deadline`
+                // takes `&self` and `now` takes `&mut self`, so nesting them in one
+                // expression is an E0502 overlapping borrow.
+                let now = clock.now();
+                resize.arm(clock.deadline(now, RESIZE_IDLE));
+                let _ = enter_resize_overlay(renderer, term);
+                return None; // consumed, no PTY
+            }
+            KeyAction::Step(delta) => {
+                let now = clock.now();
+                resize.arm(clock.deadline(now, RESIZE_IDLE)); // a resize key = activity
+                apply_resize_step(renderer, resizer, term, delta);
+                return None;
+            }
+            KeyAction::Exit => {
+                resize.disarm();
+                let _ = clear_resize_overlay(renderer, term);
+                return None;
+            }
+            KeyAction::Swallow => {
+                // Consumed but NOT counted as activity: a swallowed stray key must
+                // not keep the mode alive forever (PRD: idle = "no resize key").
+                return None;
+            }
+        }
+    }
+    // A terminal resize (SIGWINCH) while in mode moved the band — repaint the
+    // overlay after handle_resize has updated the geometry.
+    let was_resize = matches!(m, Msg::Input(Event::Resize(..)));
+    let code = dispatch(m, renderer, pty_writer, resizer, term);
+    if was_resize && resize.active() {
+        let _ = refresh_resize_overlay(renderer, term, None);
+    }
+    code
 }
 
 /// Paint the current virtual grid to the outer terminal at the band's offset
@@ -687,16 +951,44 @@ where
     R: PtyResizer,
 {
     let mut exit_code: Option<i32> = None;
+    let mut resize = ResizeCtl::inactive();
 
     'frames: loop {
-        // --- Phase A: block for the first message (zero idle CPU) ---
-        let first = match clock.recv() {
-            Some(m) => m,
-            // Backstop only: all senders gone with no ChildExited.
-            None => break 'frames,
+        // Top-of-frame idle check (handles a flooding child that never lets Phase A
+        // block): if the idle deadline has already passed, exit the mode and repaint
+        // before doing anything else this frame.
+        if let Some(dl) = resize.idle_deadline {
+            if clock.now() >= dl {
+                resize.disarm();
+                let _ = clear_resize_overlay(renderer, term);
+                let _ = render_once(renderer, term); // erase rails this frame
+                continue 'frames;
+            }
+        }
+
+        // --- Phase A: block for the first message (zero idle CPU when not in mode;
+        // a bounded wait while in mode, so a quiet child still wakes for auto-exit) ---
+        let first = if let Some(dl) = resize.idle_deadline {
+            match clock.recv_until(dl) {
+                Recv::Msg(m) => m,
+                Recv::Timeout => {
+                    // ~3 s idle elapsed.
+                    resize.disarm();
+                    let _ = clear_resize_overlay(renderer, term);
+                    let _ = render_once(renderer, term);
+                    continue 'frames;
+                }
+                Recv::Disconnected => break 'frames,
+            }
+        } else {
+            match clock.recv() {
+                Some(m) => m,
+                // Backstop only: all senders gone with no ChildExited.
+                None => break 'frames,
+            }
         };
         let mut shutdown = false;
-        if let Some(code) = dispatch(first, renderer, pty_writer, resizer, term) {
+        if let Some(code) = apply_message(first, clock, renderer, &mut resize, term, pty_writer, resizer) {
             exit_code = Some(code);
             drain_pty_path(clock, renderer, pty_writer, resizer, term);
             shutdown = true;
@@ -716,7 +1008,9 @@ where
                 }
                 match clock.recv_until(deadline) {
                     Recv::Msg(m) => {
-                        if let Some(code) = dispatch(m, renderer, pty_writer, resizer, term) {
+                        if let Some(code) =
+                            apply_message(m, clock, renderer, &mut resize, term, pty_writer, resizer)
+                        {
                             exit_code = Some(code);
                             drain_pty_path(clock, renderer, pty_writer, resizer, term);
                             shutdown = true;
@@ -738,6 +1032,11 @@ where
         if shutdown {
             break 'frames;
         }
+    }
+
+    // Clear the overlay on shutdown so a child that exits mid-mode leaves no rails.
+    if resize.active() {
+        let _ = clear_resize_overlay(renderer, term);
     }
 
     // Explicit ordered restore BEFORE process::exit (ADR-010): process::exit runs no
@@ -2168,6 +2467,272 @@ line two\r\n\
             vec![b"\x1b[6 q".to_vec(), b"\x1b[4 q".to_vec()],
             "each DECSCUSR change mirrored once, verbatim"
         );
+    }
+
+    /// Modal resize-mode state machine (stream B). `VirtualClock`, `MockTerminal`,
+    /// `mode_renderer` and `run_with_resizer` are nested here (rather than a
+    /// top-level sibling module) so the suite can reuse `VirtualClock`/`MockTerminal`,
+    /// which are private to this `mod tests` — a sibling module cannot see them.
+    /// `RecResizer` is a local copy of the one in the (sibling) `mod resize`, which
+    /// is likewise private to that module.
+    mod resize_mode {
+        use super::*;
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        use std::cell::RefCell;
+
+        /// A recording [`PtyResizer`], local to this module (the sibling `mod
+        /// resize`'s copy is private to it).
+        #[derive(Default)]
+        struct RecResizer {
+            calls: RefCell<Vec<(u16, u16)>>,
+        }
+        impl PtyResizer for RecResizer {
+            fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+                self.calls.borrow_mut().push((cols, rows));
+                Ok(())
+            }
+        }
+
+        fn mode_renderer(width: u16, rows: u16, real_cols: u16, cfg: Width) -> Renderer {
+            Renderer::new(
+                width,
+                rows,
+                real_cols,
+                Layout::Center,
+                cfg,
+                false,
+                Box::new(std::io::sink()),
+                0,
+            )
+        }
+
+        fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+            KeyEvent { code, modifiers: mods, kind: KeyEventKind::Press, state: KeyEventState::NONE }
+        }
+
+        fn release_key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+            KeyEvent { code, modifiers: mods, kind: KeyEventKind::Release, state: KeyEventState::NONE }
+        }
+
+        /// Bundles the state `apply_message` needs so tests read as a script of
+        /// `send`/`enter` calls rather than repeating six `&mut` arguments.
+        struct Ctx {
+            clock: VirtualClock,
+            renderer: Renderer,
+            resize: ResizeCtl<u64>,
+            term: MockTerminal,
+            pty: Vec<u8>,
+            resizer: RecResizer,
+        }
+
+        impl Ctx {
+            fn new(width: u16, rows: u16, real_cols: u16, cfg: Width) -> Self {
+                Self {
+                    clock: VirtualClock::new(vec![]),
+                    renderer: mode_renderer(width, rows, real_cols, cfg),
+                    resize: ResizeCtl::inactive(),
+                    term: MockTerminal::new(),
+                    pty: Vec::new(),
+                    resizer: RecResizer::default(),
+                }
+            }
+
+            fn send(&mut self, ev: KeyEvent) -> Option<i32> {
+                apply_message(
+                    Msg::Input(Event::Key(ev)),
+                    &mut self.clock,
+                    &mut self.renderer,
+                    &mut self.resize,
+                    &mut self.term,
+                    &mut self.pty,
+                    &self.resizer,
+                )
+            }
+
+            fn enter(&mut self) {
+                let c = KeyChord::default();
+                self.send(press(c.code, c.mods));
+            }
+        }
+
+        /// Drive the real loop (needed only by the idle tests, which exercise
+        /// `run`'s Phase-A bounded wait and top-of-frame idle check — behaviour
+        /// `apply_message` alone can't reach).
+        fn run_with_resizer(
+            script: Vec<(u64, Msg)>,
+            width: u16,
+            rows: u16,
+            real_cols: u16,
+            cfg: Width,
+        ) -> (Vec<u8>, Renderer, Option<i32>, RecResizer, MockTerminal) {
+            let mut clock = VirtualClock::new(script);
+            let mut renderer = mode_renderer(width, rows, real_cols, cfg);
+            let mut term = MockTerminal::new();
+            let mut pty: Vec<u8> = Vec::new();
+            let resizer = RecResizer::default();
+            let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &resizer);
+            (pty, renderer, code, resizer, term)
+        }
+
+        #[test]
+        fn enter_chord_consumed_no_pty_write() {
+            let mut ctx = Ctx::new(80, 24, 80, Width::Cols(80));
+            ctx.enter();
+            assert!(ctx.resize.active(), "the chord enters the mode");
+            assert!(ctx.pty.is_empty(), "the chord must never reach the child");
+        }
+
+        #[test]
+        fn enter_then_l_grows_one_column() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+
+            assert_eq!(ctx.renderer.width, 81);
+            assert_eq!(ctx.renderer.width_config, Width::Cols(81));
+            assert_eq!(*ctx.resizer.calls.borrow(), vec![(81, 24)]);
+            assert_eq!(ctx.renderer.parser.screen().size(), (24, 81));
+        }
+
+        #[test]
+        fn h_l_jump_ten() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('L'), KeyModifiers::SHIFT));
+            assert_eq!(ctx.renderer.width, 90, "L jumps by ten");
+            ctx.send(press(KeyCode::Char('H'), KeyModifiers::SHIFT));
+            assert_eq!(ctx.renderer.width, 80, "H jumps back by ten");
+        }
+
+        #[test]
+        fn percent_unit_preserved() {
+            let mut ctx = Ctx::new(100, 24, 200, Width::Percent(50));
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            assert_eq!(ctx.renderer.width_config, Width::Percent(51), "unit stays percentage");
+            assert_eq!(ctx.renderer.width, 102, "51% of 200 = 102");
+        }
+
+        #[test]
+        fn shrink_clamps_at_min_w_silently() {
+            let mut ctx = Ctx::new(20, 24, 200, Width::Cols(20));
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('h'), KeyModifiers::NONE));
+            assert_eq!(ctx.renderer.width, 20, "MIN_W floor holds");
+            assert!(
+                ctx.resizer.calls.borrow().is_empty(),
+                "a clamped (no-op) step must skip the PTY/parser churn"
+            );
+        }
+
+        #[test]
+        fn grow_clamps_at_real_cols_silently() {
+            let mut ctx = Ctx::new(200, 24, 200, Width::Cols(200));
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            assert_eq!(ctx.renderer.width, 200, "real_cols ceiling holds");
+            assert!(ctx.resizer.calls.borrow().is_empty());
+        }
+
+        #[test]
+        fn esc_exits_then_keys_pass_through() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            ctx.send(press(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(!ctx.resize.active(), "Esc exits the mode");
+            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            assert_eq!(ctx.pty, b"l", "once exited, l reaches the child instead of stepping");
+            assert_eq!(ctx.renderer.width, 80, "no step happened after exit");
+        }
+
+        #[test]
+        fn chord_again_exits() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            ctx.enter(); // the chord again, now in mode → exit
+            assert!(!ctx.resize.active());
+        }
+
+        #[test]
+        fn swallow_stays_in_mode_no_pty() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('z'), KeyModifiers::NONE));
+            assert!(ctx.pty.is_empty(), "an unrecognised key must not leak to the child");
+            assert!(ctx.resize.active(), "mode persists after a swallowed key");
+            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            assert_eq!(ctx.renderer.width, 81, "still in mode: l still steps");
+        }
+
+        #[test]
+        fn chord_release_does_not_toggle() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            let c = KeyChord::default();
+            ctx.send(release_key(c.code, c.mods));
+            assert!(ctx.resize.active(), "the chord's own release must not exit the mode");
+            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            assert_eq!(ctx.renderer.width, 81, "l still steps after the release");
+            assert!(ctx.pty.is_empty());
+        }
+
+        /// Mirrors `resize::resize_clears_the_gutter`: an in-mode shrink on the alt
+        /// screen must keep the B-stub's `clear_gutter` parity (§5 of the plan).
+        #[test]
+        fn alt_screen_step_keeps_clear_gutter_parity() {
+            let mut ctx = Ctx::new(100, 6, 120, Width::Cols(100));
+            ctx.renderer.outer_alt_active = true;
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('h'), KeyModifiers::NONE)); // shrink one step
+
+            assert_eq!(ctx.renderer.width, 99);
+            let expected_margin = geometry::margin(ctx.renderer.layout, 120, 99);
+            assert!(
+                ctx.term.calls.contains(&Call::ClearGutter(expected_margin, 99, 120, 6)),
+                "an in-mode shrink on the alt screen must clear the gutter, calls = {:?}",
+                ctx.term.calls
+            );
+        }
+
+        #[test]
+        fn idle_auto_exit_via_virtual_clock() {
+            let c = KeyChord::default();
+            let script = vec![
+                (0, Msg::Input(Event::Key(press(c.code, c.mods)))), // enter at t0
+                // Well past the ~3s idle window: the bounded Phase-A wait times
+                // out at the deadline, exiting the mode, before this is delivered.
+                (5000, Msg::Input(Event::Key(press(KeyCode::Char('l'), KeyModifiers::NONE)))),
+                (0, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+            ];
+            let (pty, renderer, code, resizer, _term) =
+                run_with_resizer(script, 80, 24, 200, Width::Cols(80));
+
+            assert_eq!(code, Some(0));
+            assert!(resizer.calls.borrow().is_empty(), "idle-exit happened before any step");
+            assert_eq!(renderer.width, 80);
+            assert_eq!(pty, b"l", "the delayed key passes through once the mode has exited");
+        }
+
+        #[test]
+        fn idle_refreshes_on_step() {
+            let c = KeyChord::default();
+            let script = vec![
+                (0, Msg::Input(Event::Key(press(c.code, c.mods)))), // enter at t0
+                // A step at t0+2000 re-arms the idle deadline to ~t0+5000, not
+                // ~t0+3000 — so this key, another 5s later, still finds the mode
+                // active until the RE-ARMED deadline.
+                (2000, Msg::Input(Event::Key(press(KeyCode::Char('l'), KeyModifiers::NONE)))),
+                (5000, Msg::Input(Event::Key(press(KeyCode::Char('l'), KeyModifiers::NONE)))),
+                (0, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+            ];
+            let (pty, renderer, code, resizer, _term) =
+                run_with_resizer(script, 80, 24, 200, Width::Cols(80));
+
+            assert_eq!(code, Some(0));
+            assert_eq!(renderer.width, 81, "the in-mode step before idle-exit applied");
+            assert_eq!(*resizer.calls.borrow(), vec![(81, 24)], "exactly one resize, from the step");
+            assert_eq!(pty, b"l", "the delayed key after idle-exit passes through to the child");
+        }
     }
 }
 

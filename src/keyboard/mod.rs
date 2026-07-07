@@ -8,8 +8,10 @@
 //! [`KittyState`] tracks the child's level as a push/pop stack, clamped to the
 //! outer terminal's probed capability (ADR-003).
 
+mod chord;
 mod encode;
 mod kitty_state;
 
+pub use chord::{parse_chord, KeyChord};
 pub use encode::{encode_key, KittyLevel};
 pub use kitty_state::{is_kitty_csi, KittyState};

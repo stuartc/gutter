@@ -71,6 +71,42 @@ pub fn resolve_width(width: Width, real_cols: u16) -> u16 {
     }
 }
 
+/// Apply one resize-mode nudge to a [`Width`], preserving its unit and clamping to
+/// the manual-resize bounds. `delta` is in the width's own unit — columns for
+/// `Cols`, percent for `Percent` — signed (negative shrinks). See PRD 0001,
+/// Feature 2 ("Step unit follows the width's own unit and never converts").
+///
+/// - `Cols(n)` steps from the **effective** width `n.min(real_cols)` (a config
+///   wider than the terminal steps from the terminal edge, not the stored figure,
+///   so the first shrink press moves the band). The floor is `MIN_W` (20), but
+///   never above `real_cols` (a tiny terminal caps the band at the terminal width,
+///   never inverts the clamp range) and never above the current width — note
+///   `resolve_width(Cols)` has NO `MIN_W` floor (above), so `--width 10` is a
+///   legal 10-column band; a shrink press on it must be a silent no-op, NOT snap
+///   the band UP to 20.
+/// - `Percent(p)` → `Percent(clamp(p + delta, 1, 100))`. The resolved column
+///   count is floored at `MIN_W` and capped at `real_cols` by [`resolve_width`],
+///   so a `1%` band on a narrow terminal may not visibly move (the accepted
+///   sub-column wart); `H`/`L` (±10) always moves.
+#[must_use]
+pub fn step_width(width: Width, delta: i32, real_cols: u16) -> Width {
+    match width {
+        Width::Cols(n) => {
+            let real = real_cols.max(1) as i32;
+            // Step from the effective width, not the raw config.
+            let cur = (n.max(1) as i32).min(real);
+            // Floor at MIN_W, but a band already below it (or a terminal narrower
+            // than it) only pins where it is — shrinking never grows the band.
+            let lo = (MIN_W as i32).min(real).min(cur);
+            Width::Cols((cur + delta).clamp(lo, real) as u16)
+        }
+        Width::Percent(p) => {
+            let v = (p as i32 + delta).clamp(1, 100);
+            Width::Percent(v as u8)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +149,79 @@ mod tests {
         assert_eq!(resolve_width(Width::Percent(50), 10), 10);
         // 100% is the whole terminal.
         assert_eq!(resolve_width(Width::Percent(100), 200), 200);
+    }
+
+    #[test]
+    fn step_width_preserves_unit() {
+        assert!(matches!(step_width(Width::Cols(50), 5, 200), Width::Cols(_)));
+        assert!(matches!(step_width(Width::Cols(50), -5, 200), Width::Cols(_)));
+        assert!(matches!(step_width(Width::Percent(50), 5, 200), Width::Percent(_)));
+        assert!(matches!(step_width(Width::Percent(50), -5, 200), Width::Percent(_)));
+    }
+
+    #[test]
+    fn step_width_absolute_clamps() {
+        assert_eq!(step_width(Width::Cols(20), -1, 200), Width::Cols(20));
+        assert_eq!(step_width(Width::Cols(200), 1, 200), Width::Cols(200));
+        assert_eq!(step_width(Width::Cols(100), 1, 200), Width::Cols(101));
+        assert_eq!(step_width(Width::Cols(100), -1, 200), Width::Cols(99));
+    }
+
+    #[test]
+    fn step_width_sub_min_start_never_grows_on_shrink() {
+        // Cols(10) is legal via `--width 10` (resolve_width(Cols) has no MIN_W
+        // floor); a shrink press must stay at 10, never snap up to MIN_W (20).
+        assert_eq!(step_width(Width::Cols(10), -1, 200), Width::Cols(10));
+        assert_eq!(step_width(Width::Cols(10), 1, 200), Width::Cols(11));
+    }
+
+    #[test]
+    fn step_width_overwide_config_steps_from_effective() {
+        // Cols(200) with real_cols = 120 steps from the effective 120, not 200.
+        assert_eq!(step_width(Width::Cols(200), -1, 120), Width::Cols(119));
+        assert_eq!(step_width(Width::Cols(200), 1, 120), Width::Cols(120));
+    }
+
+    #[test]
+    fn step_width_percent_clamps() {
+        assert_eq!(step_width(Width::Percent(1), -1, 200), Width::Percent(1));
+        assert_eq!(step_width(Width::Percent(100), 1, 200), Width::Percent(100));
+    }
+
+    proptest! {
+        /// `step_width` never panics and stays within `[MIN_W.min(real_cols,
+        /// effective-start), real_cols]` for `Cols`, `[1, 100]` for `Percent`; a
+        /// negative delta never yields a wider resolved band and a positive delta
+        /// never a narrower one (monotonicity).
+        #[test]
+        fn step_width_stays_in_bounds(
+            n in 1u16..=2000,
+            pct in 1u8..=100,
+            delta in -50i32..=50,
+            real_cols in 1u16..=2000,
+        ) {
+            let cols_before = Width::Cols(n);
+            let cols_w = resolve_width(cols_before, real_cols);
+            let cols_after = step_width(cols_before, delta, real_cols);
+            let cols_w2 = resolve_width(cols_after, real_cols);
+            let effective_start = (n.max(1)).min(real_cols.max(1));
+            let lo = MIN_W.min(real_cols.max(1)).min(effective_start);
+            prop_assert!(cols_w2 <= real_cols, "Cols result {cols_w2} exceeds real_cols {real_cols}");
+            prop_assert!(cols_w2 >= lo, "Cols result {cols_w2} below floor {lo}");
+            if delta < 0 {
+                prop_assert!(cols_w2 <= cols_w, "negative delta must not widen: {cols_w2} > {cols_w}");
+            } else if delta > 0 {
+                prop_assert!(cols_w2 >= cols_w, "positive delta must not narrow: {cols_w2} < {cols_w}");
+            }
+
+            let pct_before = Width::Percent(pct);
+            let pct_after = step_width(pct_before, delta, real_cols);
+            if let Width::Percent(p2) = pct_after {
+                prop_assert!((1..=100).contains(&p2), "Percent result {p2} out of [1,100]");
+            } else {
+                prop_assert!(false, "Percent must stay Percent");
+            }
+        }
     }
 
     proptest! {

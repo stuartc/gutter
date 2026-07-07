@@ -205,6 +205,8 @@ fn run() -> i32 {
         clipboard_out,
         anchor_row,
     );
+    renderer.set_resize_key(config.resize_key);
+
     let mut clock = RealClock::new(merged_rx);
     let code = render::run(
         &mut clock,

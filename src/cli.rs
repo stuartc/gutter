@@ -1,12 +1,14 @@
 //! Command-line parsing.
 //!
-//! `gutter [--width <N|Npct>] [--center|--left] <cmd> [args...]`. The first
-//! non-flag positional is the command, the rest are its arguments — a
-//! hand-rolled split of `std::env::args`, no clap.
+//! `gutter [--width <N|Npct>] [--center|--left] [--resize-key <chord>] <cmd>
+//! [args...]`. The first non-flag positional is the command, the rest are its
+//! arguments — a hand-rolled split of `std::env::args`, no clap.
 
 use crate::geometry::{Layout, Width};
+use crate::keyboard::{parse_chord, KeyChord};
 
-/// The parsed invocation: the band width, the alignment, and the child command.
+/// The parsed invocation: the band width, the alignment, the resize-mode
+/// chord, and the child command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// `None` means a full-width band that tracks the real terminal, so gutter
@@ -14,6 +16,8 @@ pub struct Config {
     pub width: Option<Width>,
     /// Defaults to [`Layout::Center`].
     pub layout: Layout,
+    /// The resize-mode enter chord (`--resize-key`). Defaults to Ctrl-\.
+    pub resize_key: KeyChord,
     pub cmd: String,
     pub args: Vec<String>,
 }
@@ -30,6 +34,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
     let mut iter = args.into_iter().peekable();
     let mut width: Option<Width> = None;
     let mut layout: Option<Layout> = None;
+    let mut resize_key: Option<KeyChord> = None;
 
     // Leading flags, terminated by the first non-flag (the command).
     while let Some(arg) = iter.peek() {
@@ -49,6 +54,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
         } else if arg == "--left" {
             iter.next();
             layout = Some(Layout::Left);
+        } else if arg == "--resize-key" {
+            iter.next();
+            let val = iter
+                .next()
+                .ok_or_else(|| "gutter: --resize-key needs a value".to_string())?;
+            resize_key = Some(parse_chord(&val)?);
+        } else if let Some(val) = arg.strip_prefix("--resize-key=") {
+            let val = val.to_string();
+            iter.next();
+            resize_key = Some(parse_chord(&val)?);
         } else {
             break;
         }
@@ -59,13 +74,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
     Ok(Config {
         width,
         layout: layout.unwrap_or_default(),
+        resize_key: resize_key.unwrap_or_default(),
         cmd,
         args: iter.collect(),
     })
 }
 
 fn usage() -> String {
-    "usage: gutter [--width <N|Npct>] [--center|--left] <cmd> [args...]".to_string()
+    "usage: gutter [--width <N|Npct>] [--center|--left] [--resize-key <chord>] <cmd> [args...]"
+        .to_string()
 }
 
 /// Parses a `--width` value into a [`Width`]: a bare integer is absolute
@@ -200,5 +217,39 @@ mod tests {
     #[test]
     fn rejects_empty() {
         assert!(parse(v(&[])).is_err());
+    }
+
+    #[test]
+    fn default_resize_key_is_ctrl_backslash() {
+        let cfg = parse(v(&["echo"])).unwrap();
+        assert_eq!(cfg.resize_key, KeyChord::default());
+    }
+
+    #[test]
+    fn parses_resize_key_flag() {
+        let cfg = parse(v(&["--resize-key", "ctrl-g", "echo"])).unwrap();
+        assert_eq!(
+            cfg.resize_key,
+            crate::keyboard::parse_chord("ctrl-g").unwrap()
+        );
+        let cfg = parse(v(&["--resize-key=ctrl-o", "echo"])).unwrap();
+        assert_eq!(
+            cfg.resize_key,
+            crate::keyboard::parse_chord("ctrl-o").unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_bad_resize_key() {
+        assert!(parse(v(&["--resize-key", "wat-x", "echo"])).is_err());
+        assert!(parse(v(&["--resize-key"])).is_err());
+    }
+
+    #[test]
+    fn resize_key_after_command_is_child_arg() {
+        let cfg = parse(v(&["vim", "--resize-key", "ctrl-g"])).unwrap();
+        assert_eq!(cfg.resize_key, KeyChord::default());
+        assert_eq!(cfg.cmd, "vim");
+        assert_eq!(cfg.args, v(&["--resize-key", "ctrl-g"]));
     }
 }
