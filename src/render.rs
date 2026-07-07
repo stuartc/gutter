@@ -362,9 +362,9 @@ fn classify_key(ev: &KeyEvent, chord: KeyChord, in_mode: bool) -> KeyAction {
 /// recompute, in one render-thread turn. Recompute `W` → resize the PTY → resize the
 /// parser (`set_size(rows, W)` — param order is the trap) → recompute the margin →
 /// reset the diff baseline, clearing the band's row-span across both screen modes
-/// (ADR-0016, generalising ADR-008 step 5's alt-only clear).
+/// (ADR-0017, generalising ADR-008 step 5's alt-only clear).
 ///
-/// The clear is uniform now (ADR-0016): alt clears `0..rows`, primary clears
+/// The clear is uniform now (ADR-0017): alt clears `0..rows`, primary clears
 /// `base_row..rows` so shell history above the inline band is never touched.
 fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     renderer: &mut Renderer,
@@ -394,7 +394,7 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     renderer.base_row = renderer.base_row.min(rows.saturating_sub(1));
 
     // Step 4 — clear the gutter across the band's row span (uniform margin
-    // management, ADR-0016). Screen-mode aware inside `repaint_margins`: alt clears
+    // management, ADR-0017). Screen-mode aware inside `repaint_margins`: alt clears
     // `0..rows`, primary clears `base_row..rows` so history above the band survives.
     //
     // `resize_active` is hard-coded `false` here rather than threaded from the
@@ -456,7 +456,7 @@ pub(crate) fn enter_resize_overlay<T: OuterTerminal>(
 }
 
 /// Refresh the overlay after a width change: blank the vacated chrome from `prev`'s
-/// geometry (see [`BandGeom`]), then uniformly clear the band's row span (ADR-0016,
+/// geometry (see [`BandGeom`]), then uniformly clear the band's row span (ADR-0017,
 /// both screen modes) and redraw the rails + readout at the current geometry.
 pub(crate) fn refresh_resize_overlay<T: OuterTerminal>(
     renderer: &Renderer,
@@ -2011,7 +2011,7 @@ mod tests {
         );
     }
 
-    /// Uniform margin management (ADR-0016): resize clears the gutter across the band's
+    /// Uniform margin management (ADR-0017): resize clears the gutter across the band's
     /// row span on BOTH screen modes, but the span's start differs. On the primary screen
     /// the clear starts at `base_row`, never at 0, so real shell history above the inline
     /// band is untouched. On the alt screen — where gutter owns the whole viewport — the
@@ -4106,7 +4106,7 @@ mod resize {
         );
     }
 
-    /// Primary-aware resize clears the live band's row span only (ADR-013/ADR-0016). On
+    /// Primary-aware resize clears the live band's row span only (ADR-013/ADR-0017). On
     /// the primary screen a resize must clear the gutter starting at `base_row`, never at
     /// 0 (that would blank rows holding real shell history), and must still force a full
     /// band repaint so the band tracks the new margin/width. Driving `handle_resize` then
@@ -4183,7 +4183,7 @@ mod resize {
     }
 }
 
-/// `repaint_margins` unit tests (uniform margin management, ADR-0016): the row-span
+/// `repaint_margins` unit tests (uniform margin management, ADR-0017): the row-span
 /// clear on both screen modes, the rails/readout paint, and the exit-clear gap the
 /// in-band readout fallback needs. Mock/`RecordingGrid`, no threads, no real PTY.
 #[cfg(test)]

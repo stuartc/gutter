@@ -17,7 +17,7 @@ Handle `Event::Resize` on the render thread (the only parser owner) in strict or
 3. `parser.set_size(rows, W)` — note the `(rows, cols)` argument order.
 4. Recompute the margin.
 5. Reset the diff baseline and clear the gutter (alt screen only — superseded in
-   part by [ADR-016](0016-uniform-margin-management.md), which generalises this
+   part by [ADR-017](0017-uniform-margin-management.md), which generalises this
    clear to a row-span on both screen modes).
 
 ## Consequences

@@ -19,8 +19,8 @@ The decisions behind gutter's design. Code comments reference these by number
 | [012](0012-screen-mode-mirroring.md) | Screen-mode mirroring |
 | [013](0013-inline-anchor-scroll-paint.md) | Inline anchor, scroll-aware paint, and hand-back |
 | [014](0014-row-run-self-containment.md) | Row-run self-containment at offset |
-| [015](0015-modal-resize.md) | Modal resize |
-| [016](0016-uniform-margin-management.md) | Uniform margin management |
+| [016](0016-modal-resize.md) | Modal resize |
+| [017](0017-uniform-margin-management.md) | Uniform margin management |
 
 ## Format
 

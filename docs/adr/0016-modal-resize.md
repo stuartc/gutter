@@ -1,4 +1,4 @@
-# ADR-015: Modal resize
+# ADR-016: Modal resize
 
 Status: Accepted
 

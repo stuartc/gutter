@@ -1,4 +1,4 @@
-# ADR-016: Uniform margin management
+# ADR-017: Uniform margin management
 
 Status: Accepted
 
@@ -96,4 +96,4 @@ old cells already fall in the new gutter.
 Supersedes, in part, [ADR-008](0008-resize-ordering.md) step 5 (the alt-screen-only
 clear). The band-fit margin rule the rails must respect is
 [ADR-006](0006-band-fit-margin-rule.md); the resize-mode state machine this is
-called from is [ADR-015](0015-modal-resize.md).
+called from is [ADR-016](0016-modal-resize.md).
