@@ -115,10 +115,15 @@ fn run() -> i32 {
         thread::spawn(move || pty::forward_to_merge(staging_rx, merged_tx));
     }
 
-    // Thread 4: the waiter, the authoritative child-death signal.
+    // Capture the child's pid BEFORE moving it into the waiter: the waiter reaps by
+    // raw `waitpid` on unix (ADR-0018), and the suspender continues the child's group
+    // by pid (ADR-0019). `None` → the waiter falls back to legacy `child.wait()`.
+    let child_pid = child.process_id();
+
+    // Thread 4: the waiter, the authoritative child-state signal (exit AND stop).
     {
         let merged_tx = merged_tx.clone();
-        thread::spawn(move || waiter::run(child, merged_tx));
+        thread::spawn(move || waiter::run(child_pid, child, merged_tx));
     }
 
     // Outer terminal setup: raw mode, kitty probe, eager mouse capture. No forced

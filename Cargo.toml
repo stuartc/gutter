@@ -21,6 +21,9 @@ portable-pty = "0.9.0"
 vt100 = "0.16.2"
 crossterm = "0.29.0"
 signal-hook = "0.4.4"
+# Raw waitpid(WUNTRACED|WCONTINUED) and kill(2) for the suspend/resume cycle
+# (ADR-0018/0019). Already in the tree transitively via crossterm/portable-pty.
+libc = "0.2"
 # The same width model vt100 itself uses (its own `unicode-width` dependency), so
 # the row-clip column tracker agrees with vt100 cell-for-cell on wide glyphs.
 unicode-width = "0.2"

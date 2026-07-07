@@ -200,8 +200,20 @@ impl Renderer {
     }
 }
 
-/// Apply one message to the render state. Returns the child's exit code when the
-/// message is `ChildExited` (the loop then tears down and stops), else `None`.
+/// What one dispatched message tells the render loop to do next. Replaces the old
+/// `Option<i32>` return so a stopped child (`ChildStopped`) is distinct from an
+/// exited one: `Exit(code)` tears down, `Suspend` runs the suspend/resume cycle,
+/// `Continue` is the ordinary path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Exit(i32),
+    Suspend,
+}
+
+/// Apply one message to the render state, returning the [`Flow`] the loop should
+/// take. `ChildExited` → `Exit`; `ChildStopped` → `Suspend`; `ChildContinued`
+/// forces a full repaint and continues; everything else continues.
 ///
 /// The PTY writer is injected as a `Write` sink so the input-liveness test can
 /// assert "key bytes reached the PTY-master mock within one frame" against a
@@ -214,7 +226,7 @@ fn dispatch<P, R, T>(
     pty_writer: &mut P,
     resizer: &R,
     term: &mut T,
-) -> Option<i32>
+) -> Flow
 where
     P: Write,
     R: PtyResizer,
@@ -236,7 +248,7 @@ where
             // frame. Robust to a burst that turns the screen over in one frame, where
             // a grid-vs-grid diff sees no surviving overlap and would report zero.
             renderer.scroll_tracker.process(&bytes);
-            None
+            Flow::Continue
         }
         Msg::Input(crossterm::event::Event::Key(key)) => {
             // Re-encode at the child's current kitty level (ADR-002/003). The level
@@ -247,13 +259,13 @@ where
                 let _ = pty_writer.write_all(&bytes);
                 let _ = pty_writer.flush();
             }
-            None
+            Flow::Continue
         }
         Msg::Input(crossterm::event::Event::Resize(cols, rows)) => {
             // The resize handler (ADR-008/011) runs on THIS thread, the only parser
             // owner. Param-order trap: (cols, rows) here, set_size(rows, cols) inside.
             handle_resize(renderer, resizer, term, cols, rows);
-            None
+            Flow::Continue
         }
         Msg::Input(crossterm::event::Event::Mouse(ev)) => {
             // The mouse forwarding gate (ADR-005). Read the child's (mode, encoding)
@@ -282,16 +294,25 @@ where
                     );
                 }
             }
-            None
+            Flow::Continue
         }
         // Other input events (focus/paste) are swallowed here.
-        Msg::Input(_) => None,
-        Msg::ChildExited(status) => Some(status.exit_code() as i32),
+        Msg::Input(_) => Flow::Continue,
+        Msg::ChildExited(status) => Flow::Exit(status.exit_code() as i32),
+        // The child stopped (ADR-0018): drive the suspend/resume cycle. `sig` is
+        // carried for tests/logging; v1 reacts to every stop signal identically.
+        Msg::ChildStopped { .. } => Flow::Suspend,
+        // The child was continued out from under gutter (or by our own SIGCONT):
+        // force a full repaint. A hint only — never triggers suspend.
+        Msg::ChildContinued => {
+            renderer.reset_prev_baseline();
+            Flow::Continue
+        }
         // PTY path reached EOF — record it so the shutdown drain knows the child's
         // final bytes have all landed (ADR-013). Never triggers shutdown.
         Msg::PtyEof => {
             renderer.pty_eof_seen = true;
-            None
+            Flow::Continue
         }
     }
 }
@@ -584,7 +605,7 @@ fn apply_message<C, T, P, R>(
     term: &mut T,
     pty_writer: &mut P,
     resizer: &R,
-) -> Option<i32>
+) -> Flow
 where
     C: Clock<Msg = Msg>,
     T: OuterTerminal,
@@ -601,24 +622,24 @@ where
                 let now = clock.now();
                 resize.arm(clock.deadline(now, RESIZE_IDLE));
                 let _ = enter_resize_overlay(renderer, term);
-                return None; // consumed, no PTY
+                return Flow::Continue; // consumed, no PTY
             }
             KeyAction::Step(delta) => {
                 let now = clock.now();
                 resize.arm(clock.deadline(now, RESIZE_IDLE)); // a resize key = activity
                 apply_resize_step(renderer, resizer, term, delta);
-                return None;
+                return Flow::Continue;
             }
             KeyAction::Exit => {
                 resize.disarm();
                 let _ = clear_resize_overlay(renderer, term);
                 renderer.reset_prev_baseline();
-                return None;
+                return Flow::Continue;
             }
             KeyAction::Swallow => {
                 // Consumed but NOT counted as activity: a swallowed stray key must
                 // not keep the mode alive forever (PRD: idle = "no resize key").
-                return None;
+                return Flow::Continue;
             }
         }
     }
@@ -1077,10 +1098,16 @@ where
             }
         };
         let mut shutdown = false;
-        if let Some(code) = apply_message(first, clock, renderer, &mut resize, term, pty_writer, resizer) {
-            exit_code = Some(code);
-            drain_pty_path(clock, renderer, pty_writer, resizer, term);
-            shutdown = true;
+        match apply_message(first, clock, renderer, &mut resize, term, pty_writer, resizer) {
+            Flow::Continue => {}
+            Flow::Exit(code) => {
+                exit_code = Some(code);
+                drain_pty_path(clock, renderer, pty_writer, resizer, term);
+                shutdown = true;
+            }
+            // Slice 1: the child stopped but the suspend/resume cycle is not wired
+            // yet — treat it as a no-op frame. Slice 2 replaces this with the cycle.
+            Flow::Suspend => {}
         }
 
         let frame_start = clock.now();
@@ -1097,13 +1124,18 @@ where
                 }
                 match clock.recv_until(deadline) {
                     Recv::Msg(m) => {
-                        if let Some(code) =
-                            apply_message(m, clock, renderer, &mut resize, term, pty_writer, resizer)
-                        {
-                            exit_code = Some(code);
-                            drain_pty_path(clock, renderer, pty_writer, resizer, term);
-                            shutdown = true;
-                            break;
+                        match apply_message(
+                            m, clock, renderer, &mut resize, term, pty_writer, resizer,
+                        ) {
+                            Flow::Continue => {}
+                            Flow::Exit(code) => {
+                                exit_code = Some(code);
+                                drain_pty_path(clock, renderer, pty_writer, resizer, term);
+                                shutdown = true;
+                                break;
+                            }
+                            // Slice 1: no-op (see Phase A). Slice 2 wires the cycle.
+                            Flow::Suspend => {}
                         }
                     }
                     Recv::Timeout => break, // idle-gap exit
@@ -2636,7 +2668,7 @@ line two\r\n\
                 }
             }
 
-            fn send(&mut self, ev: KeyEvent) -> Option<i32> {
+            fn send(&mut self, ev: KeyEvent) -> Flow {
                 apply_message(
                     Msg::Input(Event::Key(ev)),
                     &mut self.clock,
