@@ -1,6 +1,12 @@
 //! The reserved resize-mode chord: parsed from `--resize-key`, matched against a
 //! decoded crossterm `KeyEvent`. gutter reserves exactly one chord from the child
 //! (PRD 0001, Feature 2); everything else is only interpreted while in the mode.
+//!
+//! On a legacy (non-kitty) outer terminal a few Ctrl chords are indistinguishable
+//! from other keys because they share a byte — `ctrl-i` arrives as `Tab`, `ctrl-m`
+//! as `Enter`, `ctrl-[` as `Esc` — so those make poor `--resize-key` choices:
+//! `parse_chord` accepts them, but they only work reliably on a kitty-capable
+//! outer terminal.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 

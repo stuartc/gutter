@@ -215,9 +215,17 @@ mod tests {
             }
 
             let pct_before = Width::Percent(pct);
+            let pct_w = resolve_width(pct_before, real_cols);
             let pct_after = step_width(pct_before, delta, real_cols);
             if let Width::Percent(p2) = pct_after {
                 prop_assert!((1..=100).contains(&p2), "Percent result {p2} out of [1,100]");
+                let pct_w2 = resolve_width(pct_after, real_cols);
+                prop_assert!(pct_w2 <= real_cols, "Percent result {pct_w2} exceeds real_cols {real_cols}");
+                if delta < 0 {
+                    prop_assert!(pct_w2 <= pct_w, "negative delta must not widen: {pct_w2} > {pct_w}");
+                } else if delta > 0 {
+                    prop_assert!(pct_w2 >= pct_w, "positive delta must not narrow: {pct_w2} < {pct_w}");
+                }
             } else {
                 prop_assert!(false, "Percent must stay Percent");
             }

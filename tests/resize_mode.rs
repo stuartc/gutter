@@ -98,8 +98,12 @@ fn last_painted_col(screen: &vt100::Screen, cols: u16) -> Option<u16> {
 /// **`--resize-key ctrl-o` grows the band live.** Wrap a child that reprints its
 /// `stty size` on SIGWINCH (the resize path re-sizes the child's PTY, which the
 /// child observes exactly like a real terminal resize). Send the enter chord
-/// then several `l`s; the child's reported columns must grow, and the painted
-/// span must widen to match.
+/// then several `l`s; the child's reported columns must grow.
+///
+/// Not asserted here: the outer band's painted span widening to match. Without
+/// stream C's rails, the only painted content is this short `rows cols` text
+/// line at the left margin, so a grow does not itself widen what's painted —
+/// the child-reported column count is the robust observable until C lands.
 #[test]
 fn resize_key_grows_band() {
     let child = "/bin/sh -c 'trap \"stty size\" WINCH; stty size; while true; do sleep 0.2; done'";
