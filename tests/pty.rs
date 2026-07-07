@@ -117,13 +117,32 @@ fn first_content_row(screen: &vt100::Screen, cols: u16) -> String {
 
 /// Assert the gutter columns `[band, outer)` hold no painted glyph on any row.
 fn assert_gutters_empty(screen: &vt100::Screen, band: u16, outer_cols: u16, rows: u16) {
+    assert_cols_blank(screen, band, outer_cols, rows);
+}
+
+/// The physical column of the first painted (non-blank) cell on row 0, or `None`
+/// if the row is blank.
+fn first_painted_col(screen: &vt100::Screen, cols: u16) -> Option<u16> {
+    for c in 0..cols {
+        if let Some(cell) = screen.cell(0, c) {
+            let s = cell.contents();
+            if !s.is_empty() && s != " " {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// Assert columns `[from, to)` on every row are blank.
+fn assert_cols_blank(screen: &vt100::Screen, from: u16, to: u16, rows: u16) {
     for r in 0..rows {
-        for c in band..outer_cols {
+        for c in from..to {
             if let Some(cell) = screen.cell(r, c) {
                 let s = cell.contents();
                 assert!(
                     s.is_empty() || s == " ",
-                    "gutter cell ({r},{c}) must be empty, found {s:?}"
+                    "col {c} row {r} must be blank, found {s:?}"
                 );
             }
         }
@@ -146,6 +165,94 @@ fn child_sees_band_width() {
     assert!(
         row.contains("100"),
         "child must see W=100 columns (stty size row was {row:?})"
+    );
+}
+
+/// **Default width narrows a wide terminal.** No `--width` at all: the new
+/// default is a 100-column band, so on a 120-column outer terminal the child
+/// still only sees `W=100` (`stty size` reports it), not the full 120.
+#[test]
+fn default_width_narrows_on_wide_terminal() {
+    let _guard = pty_guard();
+    let cmd = gutter_in_terminal(120, 40, "/bin/sh -c 'stty size; sleep 3'");
+    let mut session = spawn(cmd);
+    let bytes = drain_window(&mut session, Duration::from_millis(700));
+
+    let parser = outer_grid(&bytes, 120, 40);
+    let row = first_content_row(parser.screen(), 120);
+    assert!(
+        row.contains("100"),
+        "default (no --width) must narrow the child to W=100 (stty size row was {row:?})"
+    );
+}
+
+/// **Default width centres the band.** Same wide outer terminal, no `--width`:
+/// content wraps at the 100-column band and must start at physical column
+/// `(120-100)/2 = 10`, with both gutters `[0,10)` and `[110,120)` blank.
+#[test]
+fn default_width_centres_on_wide_terminal() {
+    let _guard = pty_guard();
+    let child = "/bin/sh -c 'printf \"%0.s#\" $(seq 1 200); sleep 3'";
+    let cmd = gutter_in_terminal(120, 40, child);
+    let mut session = spawn(cmd);
+    let bytes = drain_window(&mut session, Duration::from_millis(800));
+
+    let parser = outer_grid(&bytes, 120, 40);
+    let screen = parser.screen();
+
+    let first = first_painted_col(screen, 120).expect("row 0 has painted content");
+    assert_eq!(first, 10, "default band must be centred: (120-100)/2 = 10");
+    assert_cols_blank(screen, 0, 10, 40);
+    assert_cols_blank(screen, 110, 120, 40);
+}
+
+/// **Default width clamps on a narrow terminal.** No `--width`, outer terminal
+/// at 80 cols (narrower than the 100-col default): the existing clamp makes the
+/// band full-width — no narrowing, no panic — so the child sees `W=80`.
+#[test]
+fn default_width_clamps_on_narrow_terminal() {
+    let _guard = pty_guard();
+    let cmd = gutter_in_terminal(80, 24, "/bin/sh -c 'stty size; sleep 3'");
+    let mut session = spawn(cmd);
+    let bytes = drain_window(&mut session, Duration::from_millis(700));
+
+    let parser = outer_grid(&bytes, 80, 24);
+    let row = first_content_row(parser.screen(), 80);
+    assert!(
+        row.contains("80"),
+        "default width must clamp to the narrow terminal (stty size row was {row:?})"
+    );
+}
+
+/// **`--width full` reproduces today's transparent passthrough exactly.** The
+/// child sees the full outer width, and content starts at physical column 0
+/// (margin 0) — not just `W == real_cols`, but no centring offset either.
+/// `--width 100%` is asserted alongside as the equivalent spelling.
+#[test]
+fn full_literal_is_passthrough() {
+    let _guard = pty_guard();
+    let cmd = gutter_in_terminal(120, 40, "--width full /bin/sh -c 'stty size; sleep 3'");
+    let mut session = spawn(cmd);
+    let bytes = drain_window(&mut session, Duration::from_millis(700));
+
+    let parser = outer_grid(&bytes, 120, 40);
+    let screen = parser.screen();
+    let row = first_content_row(screen, 120);
+    assert!(
+        row.contains("120"),
+        "--width full must be full-width passthrough (stty size row was {row:?})"
+    );
+    let first = first_painted_col(screen, 120).expect("row 0 has painted content");
+    assert_eq!(first, 0, "--width full must sit flush at margin 0");
+
+    let cmd = gutter_in_terminal(120, 40, "--width 100% /bin/sh -c 'stty size; sleep 3'");
+    let mut session = spawn(cmd);
+    let bytes = drain_window(&mut session, Duration::from_millis(700));
+    let parser = outer_grid(&bytes, 120, 40);
+    let row = first_content_row(parser.screen(), 120);
+    assert!(
+        row.contains("120"),
+        "--width 100% must behave identically to --width full (stty size row was {row:?})"
     );
 }
 
