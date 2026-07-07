@@ -407,7 +407,7 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
 
 /// A snapshot of the band's physical geometry, handed to the overlay painter so it
 /// can clear the strip the band vacated on a shrink and place the rails/readout.
-/// (Defined by stream B; consumed by stream C — the fields are unread until then.)
+/// Unread until the overlay painter lands (hence `dead_code`).
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub(crate) struct BandGeom {
@@ -428,8 +428,8 @@ impl BandGeom {
 }
 
 /// Enter the visual mode: paint the rails + readout for the current geometry.
-/// Called by stream B on the enter chord. (STUB: `Ok(())`; stream C replaces the
-/// body.)
+/// Runs on the enter chord. Stub for now (no-op); the rail/readout paint lands with
+/// the overlay painter.
 pub(crate) fn enter_resize_overlay<T: OuterTerminal>(
     renderer: &Renderer,
     term: &mut T,
@@ -443,11 +443,11 @@ pub(crate) fn enter_resize_overlay<T: OuterTerminal>(
 /// the current geometry. `prev` is `Some` on a manual step or a SIGWINCH-driven
 /// move, `None` on enter (nothing vacated).
 ///
-/// This stub is NOT a pure no-op: it keeps parity with `handle_resize` step 4
-/// (above) by running the existing alt-screen-only `clear_gutter`, so an in-mode
-/// shrink on the alt screen does not strand stale band columns that the v1
-/// SIGWINCH path already clears. Stream C replaces this body with the uniform
-/// (primary + alt) strip clear + rail paint.
+/// This stub is NOT a pure no-op: it keeps parity with `handle_resize`'s step 4 by
+/// running the existing alt-screen-only `clear_gutter`, so an in-mode shrink on the
+/// alt screen does not strand stale band columns that the SIGWINCH path already
+/// clears. The overlay painter replaces this body with the uniform (primary + alt)
+/// strip clear + rail paint.
 pub(crate) fn refresh_resize_overlay<T: OuterTerminal>(
     renderer: &Renderer,
     term: &mut T,
@@ -462,8 +462,8 @@ pub(crate) fn refresh_resize_overlay<T: OuterTerminal>(
 }
 
 /// Leave the visual mode: erase the rails + readout and clear-to-blank the strip.
-/// Called by stream B on Esc / chord-exit / idle-exit / shutdown. (STUB: `Ok(())`;
-/// stream C replaces the body.)
+/// Runs on Esc / chord-exit / idle-exit / shutdown. Stub for now (no-op); the erase +
+/// strip clear lands with the overlay painter.
 pub(crate) fn clear_resize_overlay<T: OuterTerminal>(
     renderer: &Renderer,
     term: &mut T,
