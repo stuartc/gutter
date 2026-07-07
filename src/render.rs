@@ -397,13 +397,13 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     // management, ADR-0016). Screen-mode aware inside `repaint_margins`: alt clears
     // `0..rows`, primary clears `base_row..rows` so history above the band survives.
     //
-    // SEAM(B): `resize_active` is hard-coded `false` here rather than threaded from
-    // B's resize-mode flag — that flag (`ResizeCtl`) lives in `run`'s local scope,
-    // not on `Renderer`, so it isn't reachable from this call site without widening
-    // `dispatch`'s signature. This is not a gap: `apply_message`'s post-dispatch
-    // check (`was_resize && resize.active()`) already calls `refresh_resize_overlay`
-    // right after this returns, which repaints with the rails when the mode really
-    // is active. Both calls are queued, not flushed (ADR-007), so an in-mode SIGWINCH
+    // `resize_active` is hard-coded `false` here rather than threaded from the
+    // resize-mode flag: `ResizeCtl` lives in `run`'s local scope, not on `Renderer`,
+    // so it isn't reachable from this call site without widening `dispatch`'s
+    // signature. Not a gap: `apply_message`'s post-dispatch check
+    // (`was_resize && resize.active()`) already calls `refresh_resize_overlay` right
+    // after this returns, which repaints with the rails when the mode really is
+    // active. Both calls are queued, not flushed (ADR-007), so an in-mode SIGWINCH
     // costs one redundant queued clear, never a visible flicker.
     let _ = repaint_margins(renderer, term, /* resize_active: */ false);
 
@@ -517,7 +517,7 @@ pub(crate) fn clear_resize_overlay<T: OuterTerminal>(
 ///
 /// Order (load-bearing, ADR-008): step the config → resolve W → `resizer.resize`
 /// (TIOCSWINSZ first) → `set_size(rows, W)` (param-order trap) → update geometry →
-/// (stream C: clear vacated strip + paint rails) → reset the diff baseline.
+/// clear vacated strip + paint rails → reset the diff baseline.
 fn apply_resize_step<R: PtyResizer, T: OuterTerminal>(
     renderer: &mut Renderer,
     resizer: &R,
@@ -526,15 +526,16 @@ fn apply_resize_step<R: PtyResizer, T: OuterTerminal>(
 ) {
     let rows = renderer.parser.screen().size().0;
     let real = renderer.real_cols; // held FIXED (unlike handle_resize)
-    let prev = BandGeom::of(renderer); // capture BEFORE mutating (seam)
+    let prev = BandGeom::of(renderer); // capture BEFORE mutating
 
     // Step 0 — unit-preserving step + clamp.
     renderer.width_config = geometry::step_width(renderer.width_config, delta, real);
     let w = geometry::resolve_width(renderer.width_config, real);
 
-    // Idempotent clamp: at a bound the width is unchanged — skip the PTY/parser
-    // churn, but still refresh the overlay so the readout is consistent.
-    if w != renderer.width {
+    // At a bound the width is unchanged: skip the PTY/parser churn (and the
+    // baseline reset), but still refresh the overlay so the readout stays consistent.
+    let changed = w != renderer.width;
+    if changed {
         // Step 1 — PTY first, cols = W, never real_cols.
         let _ = resizer.resize(w, rows);
         // Step 2 — parser, same turn. (rows, cols).
@@ -542,12 +543,12 @@ fn apply_resize_step<R: PtyResizer, T: OuterTerminal>(
         // Step 3 — live geometry (real_cols unchanged).
         renderer.width = w;
         renderer.left_margin = geometry::margin(renderer.layout, real, w);
-        // Step 4 — clear the vacated strip + (re)paint rails. Stream C.
-        let _ = refresh_resize_overlay(renderer, term, Some(prev));
-        // Step 5 — force a full band repaint next frame.
+    }
+    // Step 4 — clear the vacated strip + (re)paint rails.
+    let _ = refresh_resize_overlay(renderer, term, Some(prev));
+    // Step 5 — force a full band repaint next frame.
+    if changed {
         renderer.reset_prev_baseline();
-    } else {
-        let _ = refresh_resize_overlay(renderer, term, Some(prev));
     }
 }
 
@@ -2567,7 +2568,7 @@ line two\r\n\
         );
     }
 
-    /// Modal resize-mode state machine (stream B). `VirtualClock`, `MockTerminal`,
+    /// Modal resize-mode state machine. `VirtualClock`, `MockTerminal`,
     /// `mode_renderer` and `run_with_resizer` are nested here (rather than a
     /// top-level sibling module) so the suite can reuse `VirtualClock`/`MockTerminal`,
     /// which are private to this `mod tests` — a sibling module cannot see them.
@@ -2775,7 +2776,7 @@ line two\r\n\
         }
 
         /// Mirrors `resize::resize_clears_the_gutter`: an in-mode shrink on the alt
-        /// screen must keep the B-stub's `clear_gutter` parity (§5 of the plan).
+        /// screen must still clear the gutter across `0..rows`.
         #[test]
         fn alt_screen_step_keeps_clear_gutter_parity() {
             let mut ctx = Ctx::new(100, 6, 120, Width::Cols(100));
