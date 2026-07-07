@@ -117,17 +117,7 @@ fn first_content_row(screen: &vt100::Screen, cols: u16) -> String {
 
 /// Assert the gutter columns `[band, outer)` hold no painted glyph on any row.
 fn assert_gutters_empty(screen: &vt100::Screen, band: u16, outer_cols: u16, rows: u16) {
-    for r in 0..rows {
-        for c in band..outer_cols {
-            if let Some(cell) = screen.cell(r, c) {
-                let s = cell.contents();
-                assert!(
-                    s.is_empty() || s == " ",
-                    "gutter cell ({r},{c}) must be empty, found {s:?}"
-                );
-            }
-        }
-    }
+    assert_cols_blank(screen, band, outer_cols, rows);
 }
 
 /// The physical column of the first painted (non-blank) cell on row 0, or `None`

@@ -77,7 +77,6 @@ fn usage() -> String {
 /// See ADR-011.
 fn parse_width(s: &str) -> Result<Width, String> {
     if s == "full" {
-        // Readable alias for 100% — a full-width, terminal-tracking passthrough.
         return Ok(Width::Percent(100));
     }
     if let Some(digits) = s.strip_suffix("pct").or_else(|| s.strip_suffix('%')) {
