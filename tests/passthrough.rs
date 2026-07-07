@@ -5,7 +5,7 @@
 //! function returns. They cover the slice-01 acceptance criteria:
 //!
 //! - passthrough of a non-full-screen child's output,
-//! - the child seeing the real terminal's dimensions (the PTY is sized to it),
+//! - `--width full` sizing the child's PTY to the real terminal's dimensions,
 //! - gutter's exit code equalling the child's exit code,
 //! - the child-exit-restore real-PTY smoke (mid-alt-screen child exits, the
 //!   terminal is restored with NO keystroke), which also proves there is no
@@ -85,12 +85,16 @@ fn passthrough_echo() {
     p.expect(Eof).expect("gutter exits after child completes");
 }
 
-/// The child sees the real terminal's dimensions: the inner PTY is sized to the
-/// outer terminal's `cols`, so `tput cols` inside the child reports `OUTER_COLS`.
+/// `--width full` sizes the child's PTY to the real terminal's dimensions: the
+/// inner PTY matches the outer terminal's `cols`, so `tput cols` inside the
+/// child reports `OUTER_COLS`. Pinned to `--width full` rather than the
+/// no-flag default, which since the 100-column default is no longer a
+/// terminal-tracking passthrough (it would only match `OUTER_COLS` here
+/// because 80 happens to be narrower than 100 — the wrong reason).
 #[test]
 fn child_sees_real_dimensions() {
     // `tput cols` reads the child's own controlling tty (gutter's inner PTY).
-    let mut p = spawn_gutter(&["sh", "-c", "tput cols"]);
+    let mut p = spawn_gutter(&["--width", "full", "sh", "-c", "tput cols"]);
     let expected = OUTER_COLS.to_string();
     p.expect(expected.as_str())
         .unwrap_or_else(|e| panic!("child should report {OUTER_COLS} columns: {e:?}"));
