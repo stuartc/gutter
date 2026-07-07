@@ -107,6 +107,89 @@ pub fn step_width(width: Width, delta: i32, real_cols: u16) -> Width {
     }
 }
 
+/// Where the resize rails and readout land, computed from the band geometry.
+/// Pure data handed to `OuterTerminal::draw_rails`; the terminal only emits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rails {
+    /// Physical column for the left `▏` rail, or `None` where there is no left
+    /// gutter (full width, or a `--left` band).
+    pub left_col: Option<u16>,
+    /// Physical column for the right `▕` rail, or `None` where the band reaches
+    /// the terminal's right edge.
+    pub right_col: Option<u16>,
+    /// Physical row span the rails cover: `[row_start, row_end)`.
+    pub row_start: u16,
+    pub row_end: u16,
+    /// The width readout, or `None` when there are no rows to draw into.
+    pub readout: Option<Readout>,
+}
+
+/// The dim width readout's placement and text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Readout {
+    pub col: u16,
+    pub row: u16,
+    pub text: String,
+}
+
+/// The readout text: a bare column count for an absolute width, a `%`-suffixed
+/// percentage for a proportional one. `width` is the resolved (clamped) `W`, so the
+/// absolute readout shows what is actually on screen, not the pre-clamp request.
+#[must_use]
+pub fn readout_text(width_config: Width, width: u16) -> String {
+    match width_config {
+        Width::Cols(_) => format!("{width}"),
+        Width::Percent(p) => format!("{p}%"),
+    }
+}
+
+/// Lay out the rails + readout for a band of width `W` at `margin`, spanning physical
+/// rows `[offset, rows)` of a `real_cols`-wide terminal. `offset` is 0 on the alt
+/// screen and `base_row` on the primary screen, so the rails never reach into shell
+/// history above the inline band.
+#[must_use]
+pub fn rail_layout(
+    real_cols: u16,
+    margin: u16,
+    width: u16,
+    offset: u16,
+    rows: u16,
+    readout: &str,
+) -> Rails {
+    let band_end = margin.saturating_add(width).min(real_cols);
+    // `.then(...)` (lazy), not `.then_some(margin - 1)`: the latter evaluates
+    // `margin - 1` unconditionally and underflows when `margin == 0`.
+    let left_col = (margin > 0).then(|| margin - 1);
+    let right_col = (band_end < real_cols).then_some(band_end);
+
+    // The readout: prefer the right gutter; fall back to just inside the band's
+    // bottom-right; HIDE it when it fits neither (a sliver band on a tiny terminal).
+    // The fit checks are what make the bounds proptest sound: on the gutter path
+    // `col + len == real_cols`; on the fallback path `col >= margin` and
+    // `col + len == band_end <= real_cols` both hold by the guard. Note the fallback
+    // guard uses `band_end - margin` (the on-screen band width), not `width` —
+    // `width` can exceed the on-screen span when the band is clamped at the right
+    // edge (`margin + width > real_cols`).
+    let readout_placed = if rows == 0 || offset >= rows {
+        None
+    } else {
+        let len = readout.chars().count() as u16;
+        let right_gutter = real_cols.saturating_sub(band_end);
+        let col = if len > 0 && right_gutter >= len {
+            // Right-align in the right gutter.
+            Some(real_cols - len)
+        } else if len > 0 && len <= band_end.saturating_sub(margin) {
+            // No gutter room: just inside the band's bottom-right.
+            Some(band_end - len)
+        } else {
+            None // fits neither the gutter nor the band: hide it
+        };
+        col.map(|col| Readout { col, row: rows - 1, text: readout.to_string() })
+    };
+
+    Rails { left_col, right_col, row_start: offset, row_end: rows, readout: readout_placed }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +399,107 @@ mod tests {
             real_cols in 500u16..=2000,
         ) {
             prop_assert_eq!(resolve_width(Width::Cols(n), real_cols), n);
+        }
+    }
+
+    #[test]
+    fn readout_text_cols_is_bare_number() {
+        assert_eq!(readout_text(Width::Cols(80), 80), "80");
+    }
+
+    #[test]
+    fn readout_text_percent_has_suffix() {
+        assert_eq!(readout_text(Width::Percent(55), 110), "55%");
+    }
+
+    #[test]
+    fn rail_layout_center_has_both_rails() {
+        // real_cols 120, margin 20, width 80 → band_end 100, right gutter 20.
+        let rails = rail_layout(120, 20, 80, 0, 30, "80");
+        assert_eq!(rails.left_col, Some(19));
+        assert_eq!(rails.right_col, Some(100));
+        let readout = rails.readout.expect("readout placed");
+        assert_eq!(readout.col, 120 - 2, "right-aligned in the right gutter");
+        assert_eq!(readout.row, 29);
+    }
+
+    #[test]
+    fn rail_layout_left_suppresses_left_rail() {
+        let rails = rail_layout(120, 0, 100, 0, 30, "100");
+        assert_eq!(rails.left_col, None);
+        assert_eq!(rails.right_col, Some(100));
+    }
+
+    #[test]
+    fn rail_layout_full_width_suppresses_both() {
+        let rails = rail_layout(100, 0, 100, 0, 30, "100");
+        assert_eq!(rails.left_col, None);
+        assert_eq!(rails.right_col, None);
+        let readout = rails.readout.expect("readout falls back into the band");
+        assert!(readout.col as u32 + readout.text.chars().count() as u32 <= 100);
+    }
+
+    #[test]
+    fn rail_layout_hides_readout_when_it_fits_nowhere() {
+        // real_cols 2, band [0, 2) fills the terminal: no gutter, and "55%" (len 3)
+        // doesn't fit inside the 2-wide band either.
+        let rails = rail_layout(2, 0, 2, 0, 5, "55%");
+        assert_eq!(rails.readout, None);
+    }
+
+    #[test]
+    fn rail_layout_zero_rows_hides_readout() {
+        let rails = rail_layout(120, 20, 80, 0, 0, "80");
+        assert_eq!(rails.readout, None);
+        assert_eq!(rails.row_start, 0);
+        assert_eq!(rails.row_end, 0);
+    }
+
+    proptest! {
+        /// The rails/readout bounds hold for any geometry production can actually
+        /// construct: `margin`/`W` are derived via `resolve_width`/`margin`, not
+        /// generated free — a free margin would produce off-screen geometries no
+        /// caller can construct.
+        #[test]
+        fn rails_stay_within_bounds(
+            real_cols in 1u16..=1000,
+            raw_width in 1u16..=1000,
+            left_layout in any::<bool>(),
+            rows in 0u16..=100,
+            offset_frac in 0u16..=100,
+            readout_len in 0usize..=6,
+        ) {
+            let layout = if left_layout { Layout::Left } else { Layout::Center };
+            let w = resolve_width(Width::Cols(raw_width), real_cols);
+            let m = margin(layout, real_cols, w);
+            let offset = if rows == 0 { 0 } else { offset_frac % rows };
+            let readout: String = "5".repeat(readout_len);
+
+            let rails = rail_layout(real_cols, m, w, offset, rows, &readout);
+            let band_end = m.saturating_add(w).min(real_cols);
+
+            if let Some(left_col) = rails.left_col {
+                prop_assert_eq!(left_col, m - 1);
+                prop_assert!(left_col < m);
+            }
+            if let Some(right_col) = rails.right_col {
+                prop_assert!(right_col >= band_end);
+                prop_assert!(right_col < real_cols);
+            }
+            if let Some(r) = &rails.readout {
+                let len = r.text.chars().count() as u16;
+                prop_assert!(r.col.saturating_add(len) <= real_cols,
+                    "readout col {} + len {} exceeds real_cols {}", r.col, len, real_cols);
+                prop_assert!(rails.row_start <= r.row && r.row < rails.row_end,
+                    "readout row {} outside span [{}, {})", r.row, rails.row_start, rails.row_end);
+                // In-gutter placement never lands inside the band; the documented
+                // in-band fallback is the only exception, and it only fires when the
+                // right gutter is too narrow for the text.
+                let right_gutter = real_cols.saturating_sub(band_end);
+                if right_gutter >= len && len > 0 {
+                    prop_assert!(r.col >= band_end, "gutter placement must not land in the band");
+                }
+            }
         }
     }
 }

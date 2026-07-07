@@ -10,6 +10,8 @@
 
 use std::io::{self, Write};
 
+use crate::geometry::Rails;
+
 /// The outer-terminal side effects the setup, render and teardown paths perform.
 ///
 /// [`CrosstermTerminal`] wraps crossterm against stdout; [`mock::MockTerminal`]
@@ -56,18 +58,26 @@ pub trait OuterTerminal {
     /// keeps vt100 at `scrollback=0` and lets the real terminal be the store
     /// (ADR-013).
     fn newline(&mut self) -> io::Result<()>;
-    /// Clear the gutter columns outside the band `[margin, margin + width)` across
-    /// every row. Called only on an alt-screen resize (ADR-008 step 5 is alt-screen
-    /// only): a shrink or centred→narrower transition can strand painted cells where
-    /// the gutter now is, and the `rows_diff` repaint only touches the band — so the
-    /// stranded cells must be cleared explicitly.
+    /// Clear the gutter columns outside the band `[margin, margin + width)` across rows
+    /// `[row_start, row_end)`. The row span is what makes this safe on the primary
+    /// screen: the caller passes `base_row..rows`, so shell history above the inline
+    /// band is never touched. On the alt screen the caller passes `0..rows`.
+    ///
+    /// Clears to blank: while a child owns the band, the gutter columns on the band's
+    /// rows are gutter-owned and reliably empty, so there is nothing to preserve.
     fn clear_gutter(
         &mut self,
         margin: u16,
         width: u16,
         real_cols: u16,
-        rows: u16,
+        row_start: u16,
+        row_end: u16,
     ) -> io::Result<()>;
+    /// Paint the resize rails + width readout (faint, monochrome). Emitted while in
+    /// resize mode, into gutter columns only (plus the in-band readout fallback). The
+    /// per-frame band repaint never touches these columns, so the rails persist between
+    /// resizes until a mode-exit clear erases them.
+    fn draw_rails(&mut self, rails: &Rails) -> io::Result<()>;
     /// Reposition the real cursor inside the band after the repaint, from the
     /// child's cursor position.
     fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()>;
@@ -186,14 +196,15 @@ impl OuterTerminal for CrosstermTerminal {
         margin: u16,
         width: u16,
         real_cols: u16,
-        rows: u16,
+        row_start: u16,
+        row_end: u16,
     ) -> io::Result<()> {
         use crossterm::{cursor::MoveTo, queue};
         let band_end = margin.saturating_add(width).min(real_cols);
         // Reset SGR first so the blanks are painted with the default background
         // (a leftover colour run would tint the gutter).
         self.out.write_all(b"\x1b[0m")?;
-        for row in 0..rows {
+        for row in row_start..row_end {
             // Left gutter: physical columns [0, margin).
             if margin > 0 {
                 queue!(self.out, MoveTo(0, row))?;
@@ -205,6 +216,27 @@ impl OuterTerminal for CrosstermTerminal {
                 self.out
                     .write_all(&b" ".repeat((real_cols - band_end) as usize))?;
             }
+        }
+        Ok(())
+    }
+
+    fn draw_rails(&mut self, rails: &Rails) -> io::Result<()> {
+        use crossterm::{cursor::MoveTo, queue};
+        self.out.write_all(b"\x1b[0m")?; // drop any leftover attribute run
+        for row in rails.row_start..rails.row_end {
+            if let Some(c) = rails.left_col {
+                queue!(self.out, MoveTo(c, row))?;
+                self.out.write_all("\x1b[2m\u{258f}\x1b[0m".as_bytes())?; // ▏
+            }
+            if let Some(c) = rails.right_col {
+                queue!(self.out, MoveTo(c, row))?;
+                self.out.write_all("\x1b[2m\u{2595}\x1b[0m".as_bytes())?; // ▕
+            }
+        }
+        if let Some(r) = &rails.readout {
+            queue!(self.out, MoveTo(r.col, r.row))?;
+            self.out
+                .write_all(format!("\x1b[2m{}\x1b[0m", r.text).as_bytes())?;
         }
         Ok(())
     }
@@ -302,8 +334,10 @@ pub mod mock {
         /// (ADR-013). The test asserts one `Newline` per departed line, not per
         /// frame.
         Newline,
-        /// `clear_gutter(margin, width, real_cols, rows)`.
-        ClearGutter(u16, u16, u16, u16),
+        /// `clear_gutter(margin, width, real_cols, row_start, row_end)`.
+        ClearGutter(u16, u16, u16, u16, u16),
+        /// `draw_rails(rails)`.
+        DrawRails(crate::geometry::Rails),
         PlaceCursor(u16, u16),
         SetCursorVisible(bool),
         /// `set_cursor_shape(bytes)` — the mirrored `CSI Ps SP q`.
@@ -421,6 +455,16 @@ pub mod mock {
                 .unwrap_or(false)
         }
 
+        /// Whether physical cell `(row, col)` carries the faint attribute — lets the
+        /// rails test assert the glyph landed AND that it is dim.
+        pub fn cell_dim(&self, row: u16, col: u16) -> bool {
+            self.parser
+                .screen()
+                .cell(row, col)
+                .map(|c| c.dim())
+                .unwrap_or(false)
+        }
+
         /// The visible band rows `[0, rows)`, each trimmed to the band columns
         /// `[margin, margin + width)`. Used to assert what stayed on screen.
         pub fn visible_band(&self, margin: u16, width: u16, rows: u16) -> Vec<String> {
@@ -492,13 +536,14 @@ pub mod mock {
             margin: u16,
             width: u16,
             real_cols: u16,
-            rows: u16,
+            row_start: u16,
+            row_end: u16,
         ) -> io::Result<()> {
             // Paint blanks over the physical gutter columns, as the real terminal
             // would, so the readback sees them cleared.
             let band_end = margin.saturating_add(width).min(real_cols);
             self.parser.process(b"\x1b[0m");
-            for row in 0..rows {
+            for row in row_start..row_end {
                 if margin > 0 {
                     let seq = format!("\x1b[{};1H", row + 1);
                     self.parser.process(seq.as_bytes());
@@ -509,6 +554,30 @@ pub mod mock {
                     self.parser.process(seq.as_bytes());
                     self.parser.process(&b" ".repeat((real_cols - band_end) as usize));
                 }
+            }
+            Ok(())
+        }
+        fn draw_rails(&mut self, rails: &super::Rails) -> io::Result<()> {
+            // Replay the same escapes CrosstermTerminal emits, into the physical
+            // parser, so cell readback works.
+            self.parser.process(b"\x1b[0m");
+            for row in rails.row_start..rails.row_end {
+                if let Some(c) = rails.left_col {
+                    let seq = format!("\x1b[{};{}H", row + 1, c + 1);
+                    self.parser.process(seq.as_bytes());
+                    self.parser.process("\x1b[2m\u{258f}\x1b[0m".as_bytes());
+                }
+                if let Some(c) = rails.right_col {
+                    let seq = format!("\x1b[{};{}H", row + 1, c + 1);
+                    self.parser.process(seq.as_bytes());
+                    self.parser.process("\x1b[2m\u{2595}\x1b[0m".as_bytes());
+                }
+            }
+            if let Some(r) = &rails.readout {
+                let seq = format!("\x1b[{};{}H", r.row + 1, r.col + 1);
+                self.parser.process(seq.as_bytes());
+                self.parser
+                    .process(format!("\x1b[2m{}\x1b[0m", r.text).as_bytes());
             }
             Ok(())
         }
@@ -586,10 +655,15 @@ pub mod mock {
             margin: u16,
             width: u16,
             real_cols: u16,
-            rows: u16,
+            row_start: u16,
+            row_end: u16,
         ) -> io::Result<()> {
             self.calls
-                .push(Call::ClearGutter(margin, width, real_cols, rows));
+                .push(Call::ClearGutter(margin, width, real_cols, row_start, row_end));
+            Ok(())
+        }
+        fn draw_rails(&mut self, rails: &super::Rails) -> io::Result<()> {
+            self.calls.push(Call::DrawRails(rails.clone()));
             Ok(())
         }
         fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {
