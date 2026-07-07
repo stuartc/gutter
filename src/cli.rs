@@ -1,6 +1,6 @@
 //! Command-line parsing.
 //!
-//! `gutter [--width <N|Npct>] [--center|--left] [--resize-key <chord>] <cmd>
+//! `gutter [--width <N|Npct|full>] [--center|--left] [--resize-key <chord>] <cmd>
 //! [args...]`. The first non-flag positional is the command, the rest are its
 //! arguments — a hand-rolled split of `std::env::args`, no clap.
 
@@ -11,8 +11,10 @@ use crate::keyboard::{parse_chord, KeyChord};
 /// chord, and the child command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// `None` means a full-width band that tracks the real terminal, so gutter
-    /// is a transparent passthrough.
+    /// The requested band width from `--width`, or `None` when the flag was
+    /// omitted. `None` is resolved to the built-in default in `main::run`
+    /// (currently `Width::Cols(100)`); it is NOT passthrough. Passthrough is an
+    /// explicit `--width full` / `--width 100%` (`Some(Width::Percent(100))`).
     pub width: Option<Width>,
     /// Defaults to [`Layout::Center`].
     pub layout: Layout,
@@ -22,7 +24,7 @@ pub struct Config {
     pub args: Vec<String>,
 }
 
-/// Parses `gutter [--width <N|Npct>] [--center|--left] <cmd> [args...]` from an
+/// Parses `gutter [--width <N|Npct|full>] [--center|--left] <cmd> [args...]` from an
 /// argument iterator (excluding argv[0]).
 ///
 /// Flags are only recognised before the command; once the command is seen,
@@ -81,15 +83,19 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
 }
 
 fn usage() -> String {
-    "usage: gutter [--width <N|Npct>] [--center|--left] [--resize-key <chord>] <cmd> [args...]"
+    "usage: gutter [--width <N|Npct|full>] [--center|--left] [--resize-key <chord>] <cmd> [args...]"
         .to_string()
 }
 
 /// Parses a `--width` value into a [`Width`]: a bare integer is absolute
 /// ([`Width::Cols`]); an integer with a `pct` or `%` suffix is proportional
 /// ([`Width::Percent`]). `pct` is the documented spelling, `%` an accepted
-/// alias. See ADR-011.
+/// alias; the bare word `full` is an alias for `100%` (full-width passthrough).
+/// See ADR-011.
 fn parse_width(s: &str) -> Result<Width, String> {
+    if s == "full" {
+        return Ok(Width::Percent(100));
+    }
     if let Some(digits) = s.strip_suffix("pct").or_else(|| s.strip_suffix('%')) {
         let p: u8 = digits
             .parse()
@@ -251,5 +257,26 @@ mod tests {
         assert_eq!(cfg.resize_key, KeyChord::default());
         assert_eq!(cfg.cmd, "vim");
         assert_eq!(cfg.args, v(&["--resize-key", "ctrl-g"]));
+    }
+
+    #[test]
+    fn parses_full_literal() {
+        let cfg = parse(v(&["--width", "full", "echo"])).unwrap();
+        assert_eq!(cfg.width, Some(Width::Percent(100)));
+        let cfg = parse(v(&["--width=full", "echo"])).unwrap();
+        assert_eq!(cfg.width, Some(Width::Percent(100)));
+    }
+
+    #[test]
+    fn full_equals_percent_100() {
+        let full = parse(v(&["--width", "full", "echo"])).unwrap();
+        let pct = parse(v(&["--width", "100%", "echo"])).unwrap();
+        assert_eq!(full.width, pct.width);
+    }
+
+    #[test]
+    fn rejects_capitalised_full() {
+        assert!(parse(v(&["--width", "Full", "echo"])).is_err());
+        assert!(parse(v(&["--width", "FULL", "echo"])).is_err());
     }
 }

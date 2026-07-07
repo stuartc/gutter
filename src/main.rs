@@ -69,9 +69,11 @@ fn run() -> i32 {
     // below so the child lays out as if it owned a `W`-wide terminal. The real
     // terminal width only positions the band (the margin).
     let (real_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    // `--width` omitted → a full-width band that tracks the terminal. Resolved
-    // here at startup and recomputed on resize (ADR-011).
-    let width_config = config.width.unwrap_or(geometry::Width::Percent(100));
+    // `--width` omitted → a fixed 100-column band, clamped to a narrower terminal
+    // by resolve_width and centred by the default Layout. `--width full` (or 100%)
+    // is the escape hatch back to a terminal-tracking full-width passthrough
+    // (ADR-011).
+    let width_config = config.width.unwrap_or(geometry::Width::Cols(100));
     let width = geometry::resolve_width(width_config, real_cols);
 
     // Spawn the child in a PTY sized `W × real_rows`.

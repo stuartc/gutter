@@ -235,6 +235,23 @@ mod tests {
     }
 
     #[test]
+    fn default_width_absolute_hundred_clamped() {
+        // Wide terminal: the default 100-col band fits untouched.
+        assert_eq!(resolve_width(Width::Cols(100), 200), 100);
+        // Narrower than 100: clamp to the terminal, no panic, no narrowing below it.
+        assert_eq!(resolve_width(Width::Cols(100), 80), 80);
+    }
+
+    #[test]
+    fn full_alias_is_full_width() {
+        // `--width full` resolves to Percent(100), which is always the whole
+        // terminal — including below MIN_W, where Cols(100) would instead clamp.
+        for n in [10, 20, 80, 300] {
+            assert_eq!(resolve_width(Width::Percent(100), n), n);
+        }
+    }
+
+    #[test]
     fn step_width_preserves_unit() {
         assert!(matches!(step_width(Width::Cols(50), 5, 200), Width::Cols(_)));
         assert!(matches!(step_width(Width::Cols(50), -5, 200), Width::Cols(_)));
@@ -399,6 +416,13 @@ mod tests {
             real_cols in 500u16..=2000,
         ) {
             prop_assert_eq!(resolve_width(Width::Cols(n), real_cols), n);
+        }
+
+        /// `full` (`Percent(100)`) is exact passthrough for every terminal width,
+        /// including below `MIN_W` — the `.min(real_cols)` cap wins over the floor.
+        #[test]
+        fn full_alias_is_passthrough_for_any_real_cols(real_cols in 1u16..=2000) {
+            prop_assert_eq!(resolve_width(Width::Percent(100), real_cols), real_cols);
         }
     }
 

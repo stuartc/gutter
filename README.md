@@ -84,14 +84,15 @@ Alternatively, clone the repo and `cargo build --release` to run
 ## Usage
 
 ```
-gutter [--width <N|Npct>] [--center|--left] <cmd> [args...]
+gutter [--width <N|Npct|full>] [--center|--left] <cmd> [args...]
 ```
 
 ```sh
 gutter --width 80 --center claude     # 80-column band, centred
-gutter --width 100 vim notes.md       # absolute width, centred (the default)
+gutter --width 100 vim notes.md       # absolute width, centred
 gutter --width 50pct --left htop      # half the terminal, hugged to the left
-gutter bash                           # no --width: full width, pure passthrough
+gutter bash                           # no --width: 100-column band, centred (the default)
+gutter --width full bash              # full width, pure passthrough
 ```
 
 Flags:
@@ -99,6 +100,8 @@ Flags:
 - `--width N` — absolute band width in columns, fixed for the session.
 - `--width Npct` (or `N%`, or the `--width=N` form) — proportional width,
   recomputed every time you resize the terminal.
+- `--width full` — an alias for `--width 100%`: the band always matches the
+  real terminal width, i.e. a transparent passthrough.
 - `--center` / `--centre` — centre the band. This is the default.
 - `--left` — pin the band to the left edge.
 
@@ -109,8 +112,9 @@ A few things worth knowing:
   not to gutter.
 - There is no `--help`. An unrecognised leading token is taken to be the command
   you want to run.
-- With no `--width`, gutter uses the full terminal width and stays out of the
-  way — a transparent passthrough.
+- With no `--width`, gutter defaults to a 100-column band, centred (clamped to
+  the real width on narrower terminals). Use `--width full` (or `--width 100%`)
+  for a transparent passthrough at the real terminal width.
 
 ## What passes through
 

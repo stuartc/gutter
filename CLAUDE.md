@@ -17,10 +17,11 @@ cargo test --features oracle        # also builds & runs the equivalence gate
 cargo clippy --all-targets
 cargo clippy --all-targets --features oracle
 
-# Run it: gutter [--width <N|Npct>] [--center|--left] <cmd> [args...]
+# Run it: gutter [--width <N|Npct|full>] [--center|--left] <cmd> [args...]
 cargo run -- --width 80 --center bash      # absolute 80-col band, centred
 cargo run -- --width 50pct --left vim      # proportional (recomputed on resize); 50% also works
-cargo run -- bash                          # no --width → full width, transparent passthrough
+cargo run -- bash                          # no --width → 100-column centred band (clamped to narrower terminals)
+cargo run -- --width full bash             # full width, transparent passthrough
 ```
 
 There is no `--help`; an unknown leading token is treated as the command. There is no `cargo fmt`/coverage step in CI — don't invent one.
