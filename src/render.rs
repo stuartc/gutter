@@ -1126,8 +1126,13 @@ where
                     SuspendOutcome::ChildExited(code) => {
                         // Aborted before park (child SIGKILLed right after stopping):
                         // the terminal was never parked, so fall through to the one
-                        // normal teardown in run's tail.
+                        // normal teardown in run's tail. Drain the PTY path first, like
+                        // the Flow::Exit arms, so any trailing bytes still queued behind
+                        // the ChildExited land before teardown reads outer_alt_active
+                        // (ADR-013's teardown race); the child is dead, so PtyEof arrives
+                        // and the drain terminates promptly.
                         exit_code = Some(code);
+                        drain_pty_path(clock, renderer, pty_writer, resizer, term);
                         shutdown = true;
                     }
                 }
@@ -1165,7 +1170,13 @@ where
                                 ) {
                                     SuspendOutcome::Resumed => continue 'frames,
                                     SuspendOutcome::ChildExited(code) => {
+                                        // Abort (as in Phase A): drain the PTY path so
+                                        // trailing bytes behind the ChildExited land
+                                        // before teardown (ADR-013).
                                         exit_code = Some(code);
+                                        drain_pty_path(
+                                            clock, renderer, pty_writer, resizer, term,
+                                        );
                                         shutdown = true;
                                         break;
                                     }
@@ -1289,7 +1300,7 @@ where
     // Step 5 — unpark (resume, inverse order, raw mode FIRST).
     let _ = unpark(renderer, term);
 
-    // Step 7 — missed-resize catch-up. The outer terminal may have resized while
+    // Step 6 — missed-resize catch-up. The outer terminal may have resized while
     // gutter slept; run the full ADR-008 handler so the TIOCSWINSZ queues one
     // SIGWINCH on the still-stopped child, delivered when it is continued in step 8
     // — so the child wakes and repaints once at the right size, not twice. Runs
@@ -1302,7 +1313,7 @@ where
     }
     let rows = renderer.parser.screen().size().0;
 
-    // Step 6 — inline anchor reseed (primary-screen children). The shell scrolled
+    // Step 7 — inline anchor reseed (primary-screen children). The shell scrolled
     // the screen while gutter slept, so base_row is meaningless and CPR is
     // unavailable (the input thread owns the event source). Reseed at the bottom
     // like a fresh launch; render_once's make-room scroll re-lays the band there.
@@ -1315,11 +1326,28 @@ where
     // post-cont repaint bytes land on a raw-mode, correct-screen terminal.
     suspender.continue_child();
 
-    // Step 9 — full repaint, then repaint the gutter margins: the gutter columns on
-    // the band's rows may hold shell text from the suspension, so clear them.
+    // Step 9 — full repaint, then clear the gutter columns: the band's rows may carry
+    // shell text from the suspension in the gutter strip. A gutters-only clear (not
+    // repaint_margins) is deliberate: repaint_margins(.., false) also blanks the width
+    // readout's in-band fallback span as a resize-mode "exit clear", which here — after
+    // the render_once above already synced `prev` — would erase band cells with no
+    // paired repaint to restore them (e.g. `--width full`, where the readout falls
+    // inside the band). Step 0 already cleared any live overlay, so there is no readout
+    // to clear anyway. The clear runs after render_once so it reads the base_row that
+    // render_once's make-room scroll settled on. Flush explicitly: on resume the loop
+    // blocks on recv(), so a child that emits nothing would otherwise leave these
+    // gutter-cleanup bytes unflushed indefinitely.
     renderer.reset_prev_baseline();
     let _ = render_once(renderer, term);
-    let _ = repaint_margins(renderer, term, false);
+    let offset = if renderer.outer_alt_active { 0 } else { renderer.base_row };
+    let _ = term.clear_gutter(
+        renderer.left_margin,
+        renderer.width,
+        renderer.real_cols,
+        offset,
+        rows,
+    );
+    let _ = term.flush();
 
     SuspendOutcome::Resumed
 }
@@ -1335,25 +1363,39 @@ fn park<T: OuterTerminal>(
     term: &mut T,
     rows: u16,
 ) -> std::io::Result<()> {
+    // Best-effort per step (ADR-010's "restore by hand, each step conditional"):
+    // attempt EVERY restore step even if an earlier one errors, so an early failure
+    // (e.g. a flush inside leave_alt_screen) can't short-circuit the rest and strand
+    // the shell in raw mode / mouse / kitty. disable_raw_mode in particular MUST run
+    // before the self-stop. The first error is remembered and returned for logging.
+    let mut first_err: std::io::Result<()> = Ok(());
+    let mut record = |r: std::io::Result<()>| {
+        if let Err(e) = r {
+            if first_err.is_ok() {
+                first_err = Err(e);
+            }
+        }
+    };
+
     if renderer.outer_alt_active {
-        term.leave_alt_screen()?;
+        record(term.leave_alt_screen());
     } else if renderer.ever_painted_inline {
         let bottom = renderer
             .base_row
             .saturating_add(renderer.deepest_live_row())
             .min(rows.saturating_sub(1));
-        term.move_to(0, bottom)?;
-        term.newline()?;
+        record(term.move_to(0, bottom));
+        record(term.newline());
     }
-    term.write_row(b"\x1b[0m")?; // drop any leftover attribute run
-    term.set_cursor_shape(b"\x1b[0 q")?; // hand the shell a default cursor shape
-    term.pop_keyboard_flags()?; // conditional on kitty_pushed
-    term.disable_mouse()?; // conditional on mouse_enabled
-    term.show_cursor()?;
+    record(term.write_row(b"\x1b[0m")); // drop any leftover attribute run
+    record(term.set_cursor_shape(b"\x1b[0 q")); // hand the shell a default cursor shape
+    record(term.pop_keyboard_flags()); // conditional on kitty_pushed
+    record(term.disable_mouse()); // conditional on mouse_enabled
+    record(term.show_cursor());
     renderer.cursor_visible = true;
-    term.disable_raw_mode()?; // LAST (ADR-010)
-    term.flush()?; // the park bytes must land before the self-stop
-    Ok(())
+    record(term.disable_raw_mode()); // LAST (ADR-010) — must run even after an error
+    record(term.flush()); // the park bytes must land before the self-stop
+    first_err
 }
 
 /// Unpark the outer terminal (ADR-0019 step 5): re-take it after the self-stop
@@ -3103,7 +3145,7 @@ line two\r\n\
     /// raw-first-on-resume are one assertable sequence.
     mod suspend_cycle_tests {
         use super::super::{
-            dispatch, render_once, suspend_cycle, Flow, Renderer, ResizeCtl, SuspendOutcome,
+            dispatch, render_once, run, suspend_cycle, Flow, Renderer, ResizeCtl, SuspendOutcome,
         };
         use super::{left_renderer, NoopResizer, VirtualClock};
         use crate::msg::Msg;
@@ -3312,9 +3354,14 @@ line two\r\n\
 
             assert!(!resize.active(), "resize mode is left before parking");
             let calls = log.borrow();
-            let clear_idx = calls.iter().position(|c| matches!(c, Call::ClearGutter(..)));
-            let stop_idx = calls.iter().position(|c| *c == Call::SuspendSelf);
-            assert!(clear_idx.is_some(), "the overlay clear ran");
+            let clear_idx = calls
+                .iter()
+                .position(|c| matches!(c, Call::ClearGutter(..)))
+                .expect("the overlay clear ran");
+            let stop_idx = calls
+                .iter()
+                .position(|c| *c == Call::SuspendSelf)
+                .expect("the cycle self-stopped");
             assert!(clear_idx < stop_idx, "the overlay is cleared before the self-stop");
         }
 
@@ -3354,7 +3401,7 @@ line two\r\n\
         }
 
         /// Missed-resize catch-up: the outer terminal resized while gutter slept.
-        /// Step 7 re-sizes the child PTY (to the band width at the new row count)
+        /// Step 6 re-sizes the child PTY (to the band width at the new row count)
         /// BEFORE continue_child, so the child wakes to one SIGWINCH at the right
         /// size.
         #[test]
@@ -3387,8 +3434,14 @@ line two\r\n\
             assert_eq!(renderer.real_cols, 50, "the new real width is picked up");
             // And that resize ran before the child was continued.
             let calls = log.borrow();
-            let first_clear = calls.iter().position(|c| matches!(c, Call::ClearGutter(..)));
-            let cont = calls.iter().position(|c| *c == Call::ContinueChild);
+            let first_clear = calls
+                .iter()
+                .position(|c| matches!(c, Call::ClearGutter(..)))
+                .expect("the resize cleared the gutter");
+            let cont = calls
+                .iter()
+                .position(|c| *c == Call::ContinueChild)
+                .expect("the child was continued");
             assert!(
                 first_clear < cont,
                 "the resize (TIOCSWINSZ + clear) runs before continue_child"
@@ -3456,6 +3509,60 @@ line two\r\n\
                 vec![b"\x1b[0 q".to_vec(), b"\x1b[6 q".to_vec()],
                 "park resets to the default cursor, resume re-asserts the child's shape"
             );
+        }
+
+        /// End-to-end through `run` (not `suspend_cycle` directly): a scripted
+        /// `ChildStopped` drives the whole cycle (SuspendSelf + ContinueChild fire),
+        /// and a `Pty` message queued behind it — arriving 150ms later, past the 100ms
+        /// pre-stop drain cap — is processed on the frame after resume, proving the
+        /// `continue 'frames` path. Then the child exits cleanly and the code
+        /// propagates.
+        #[test]
+        fn run_drives_suspend_cycle_then_processes_queued_message() {
+            let log: OrderLog = Rc::new(RefCell::new(Vec::new()));
+            let mut term = MockTerminal::with_log(log.clone());
+            // Match the renderer's size so the resume resize-catch-up is a no-op.
+            term.set_terminal_size(40, 10);
+            let mut renderer = left_renderer(40, 10, false);
+            let mut pty: Vec<u8> = Vec::new();
+            let suspender = MockSuspender::new(log.clone());
+
+            let mut clock = VirtualClock::new(vec![
+                (0, Msg::ChildStopped { sig: 18 }),
+                // Beyond SUSPEND_DRAIN_CAP (100ms): delivered post-resume, not in the drain.
+                (150, Msg::Pty(b"hello".to_vec())),
+                (0, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+            ]);
+
+            let code = run(
+                &mut clock,
+                &mut renderer,
+                &mut term,
+                &mut pty,
+                &NoopResizer,
+                &suspender,
+            );
+
+            // The cycle ran end to end.
+            let calls = log.borrow();
+            assert!(
+                calls.contains(&Call::SuspendSelf),
+                "the suspend cycle self-stopped"
+            );
+            assert!(
+                calls.contains(&Call::ContinueChild),
+                "the child was continued on resume"
+            );
+            drop(calls);
+
+            // The queued Pty was processed after resume: its bytes reached the grid.
+            let row0 = renderer.screen().rows(0, 40).next().unwrap();
+            assert!(
+                row0.starts_with("hello"),
+                "the post-resume Pty painted into the grid: {row0:?}"
+            );
+
+            assert_eq!(code, Some(0), "the child's clean exit propagated");
         }
     }
 }

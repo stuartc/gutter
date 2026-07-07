@@ -94,8 +94,8 @@ child's terminal.
 raises SIGTTOU under default disposition — gutter re-stops before touching the
 terminal, and the child was never continued. A later `fg` restarts the call in the
 foreground and the cycle completes normally. This falls out of the ordering for
-free rather than being handled explicitly; verified manually against both `zsh` and
-`bash`.
+free rather than being handled explicitly; expected, and on the manual checklist to
+confirm against both `zsh` and `bash`.
 
 ## Sequence (as built)
 
