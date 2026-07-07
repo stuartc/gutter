@@ -13,10 +13,12 @@
 use std::io::Write;
 use std::time::Duration;
 
+use crossterm::event::{Event, KeyEvent};
+
 use crate::callbacks::GutterCallbacks;
 use crate::clock::{Clock, Recv};
 use crate::geometry::{self, Layout, Width};
-use crate::keyboard;
+use crate::keyboard::{self, KeyChord};
 use crate::mouse::{MouseDecision, MouseGate};
 use crate::msg::Msg;
 use crate::pty::PtyResizer;
@@ -25,6 +27,10 @@ use crate::terminal::OuterTerminal;
 
 /// The 60fps frame budget. One render per `FRAME` of wall (or virtual) time.
 pub const FRAME: Duration = Duration::from_millis(16);
+
+/// Resize-mode idle auto-exit window (~3 s). Uses the injected clock (ADR-007),
+/// so it is unit-testable on virtual time. PRD 0001, Feature 2 ("Exiting").
+pub const RESIZE_IDLE: Duration = Duration::from_secs(3);
 
 /// Upper bound on how long the shutdown path waits for the PTY forwarder's
 /// `Msg::PtyEof` after the child exits (ADR-013). Normally the sentinel arrives at
@@ -94,6 +100,10 @@ pub struct Renderer {
     /// down-filter needs. The child's `(mode, encoding)` is read live from the screen
     /// each `Event::Mouse` dispatch, not cached here.
     mouse_gate: MouseGate,
+    /// The reserved resize-mode enter chord (`--resize-key`, default Ctrl-\). The one
+    /// key gutter ever withholds from the child, and only as the enter chord or while
+    /// in the mode (PRD 0001, Feature 2).
+    resize_key: KeyChord,
 }
 
 impl Renderer {
@@ -152,7 +162,14 @@ impl Renderer {
             ever_painted_inline: false,
             pty_eof_seen: false,
             mouse_gate: MouseGate::default(),
+            resize_key: KeyChord::default(),
         }
+    }
+
+    /// Override the resize-mode enter chord (from `--resize-key`). Called once at
+    /// startup from `main`; tests keep the default.
+    pub fn set_resize_key(&mut self, chord: KeyChord) {
+        self.resize_key = chord;
     }
 
     /// Read-only view of the virtual screen — for the insta snapshot and the
@@ -279,15 +296,76 @@ where
     }
 }
 
+/// What the render loop should do with a decoded key while resize mode is / isn't
+/// active. `PassThrough` is the only variant that reaches `encode_key`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyAction {
+    Enter,        // the chord, not in mode → enter resize mode
+    Exit,         // Esc or the chord, in mode → leave
+    Step(i32),    // in mode → nudge width by this many units (±1 / ±10)
+    Swallow,      // in mode, unrecognised key → consume, stay in mode
+    PassThrough,  // forward to the child (the normal path)
+}
+
+/// Classify a key against the reserved chord and the current mode.
+///
+/// Releases are filtered FIRST: with kitty REPORT_EVENT_TYPES active on the outer
+/// terminal, every press is followed by a release event — without this guard the
+/// chord's own release would match again and instantly toggle the mode back
+/// (enter → exit on key-up). A release is inert: swallowed in mode (without
+/// refreshing idle), passed through otherwise (`encode_key` already returns empty
+/// bytes for releases, so passthrough preserves today's behaviour byte-for-byte).
+///
+/// The chord itself fires on `Press` only — an auto-repeating held chord must not
+/// toggle enter/exit every repeat. Step keys DO act on repeats (hold `h` to keep
+/// shrinking). The chord is checked in BOTH states: not-in-mode it enters, in-mode
+/// it exits — so a chord that happens to be a letter can never collide with an
+/// in-mode command.
+fn classify_key(ev: &KeyEvent, chord: KeyChord, in_mode: bool) -> KeyAction {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    if ev.kind == KeyEventKind::Release {
+        return if in_mode { KeyAction::Swallow } else { KeyAction::PassThrough };
+    }
+    if chord.matches(ev) && ev.kind == KeyEventKind::Press {
+        return if in_mode { KeyAction::Exit } else { KeyAction::Enter };
+    }
+    if !in_mode {
+        return KeyAction::PassThrough;
+    }
+    // In mode: interpret the adjustment keys, swallow everything else. A step key
+    // carrying CONTROL or ALT is NOT a step (Ctrl-h in mode must not resize) —
+    // swallow it like any other stray key.
+    if ev
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return if matches!(ev.code, KeyCode::Esc) { KeyAction::Exit } else { KeyAction::Swallow };
+    }
+    let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
+    match ev.code {
+        KeyCode::Esc => KeyAction::Exit,
+        KeyCode::Left | KeyCode::Char('h') if !shift => KeyAction::Step(-1),
+        KeyCode::Right | KeyCode::Char('l') if !shift => KeyAction::Step(1),
+        KeyCode::Char('-') => KeyAction::Step(-1),
+        KeyCode::Char('+') | KeyCode::Char('=') => KeyAction::Step(1),
+        KeyCode::Char('H') => KeyAction::Step(-10),
+        KeyCode::Char('L') => KeyAction::Step(10),
+        // Shifted forms (kitty reports `Char('H')`+SHIFT; some legacy paths report
+        // SHIFT + lowercase; Shift+arrows mirror H/L for symmetry):
+        KeyCode::Char('h') | KeyCode::Left if shift => KeyAction::Step(-10),
+        KeyCode::Char('l') | KeyCode::Right if shift => KeyAction::Step(10),
+        _ => KeyAction::Swallow,
+    }
+}
+
 /// The resize handler — the ADR-008 ordering plus the ADR-011 proportional-width
 /// recompute, in one render-thread turn. Recompute `W` → resize the PTY → resize the
 /// parser (`set_size(rows, W)` — param order is the trap) → recompute the margin →
-/// reset the diff baseline, clearing the gutter on the alt screen only.
+/// reset the diff baseline, clearing the band's row-span across both screen modes
+/// (ADR-0017, generalising ADR-008 step 5's alt-only clear).
 ///
-/// The gutter clear is alt-screen only (ADR-012/013): there gutter owns the whole
-/// viewport, so it can blank cells a shrink stranded outside the band. On the primary
-/// screen that absolute clear would erase real shell history, so it is skipped — only
-/// the band region repaints.
+/// The clear is uniform now (ADR-0017): alt clears `0..rows`, primary clears
+/// `base_row..rows` so shell history above the inline band is never touched.
 fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     renderer: &mut Renderer,
     resizer: &R,
@@ -315,15 +393,246 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     // scroll finishes pushing any overshoot up.
     renderer.base_row = renderer.base_row.min(rows.saturating_sub(1));
 
-    // Step 4 — gutter clear is alt-screen only (ADR-012/013); on the primary screen
-    // it would reach rows holding real shell history.
-    if renderer.outer_alt_active {
-        let _ = term.clear_gutter(renderer.left_margin, w, cols, rows);
-    }
+    // Step 4 — clear the gutter across the band's row span (uniform margin
+    // management, ADR-0017). Screen-mode aware inside `repaint_margins`: alt clears
+    // `0..rows`, primary clears `base_row..rows` so history above the band survives.
+    //
+    // `resize_active` is hard-coded `false` here rather than threaded from the
+    // resize-mode flag: `ResizeCtl` lives in `run`'s local scope, not on `Renderer`,
+    // so it isn't reachable from this call site without widening `dispatch`'s
+    // signature. Not a gap: `apply_message`'s post-dispatch check
+    // (`was_resize && resize.active()`) already calls `refresh_resize_overlay` right
+    // after this returns, which repaints with the rails when the mode really is
+    // active. Both calls are queued, not flushed (ADR-007), so an in-mode SIGWINCH
+    // costs one redundant queued clear, never a visible flicker.
+    let _ = repaint_margins(renderer, term, /* resize_active: */ false);
 
     // Force a full repaint next frame: reset the diff baseline to a blank grid of the
     // new size so rows_diff re-emits every row into the resized band.
     renderer.reset_prev_baseline();
+}
+
+/// A snapshot of the band's physical geometry, captured before a geometry change so
+/// the vacated rail/readout cells can be blanked afterwards. Growing the band moves
+/// old rail columns (`prev margin - 1`, `prev band_end`) INSIDE the new band, where
+/// the uniform `clear_gutter` (new geometry) and `draw_rails` (new geometry) never
+/// reach them — and `render_once` skips blank rows, so the ghost glyphs would
+/// otherwise survive indefinitely. `refresh_resize_overlay` blanks exactly the cells
+/// this snapshot describes before repainting at the current geometry.
+#[derive(Debug, Clone)]
+pub(crate) struct BandGeom {
+    pub left_margin: u16,
+    pub width: u16,
+    pub real_cols: u16,
+    pub rows: u16,
+    /// Row span offset the rails/readout were drawn at: 0 on the alt screen,
+    /// `base_row` on the primary screen.
+    pub offset: u16,
+    /// The readout text as last drawn, so its exact span can be blanked.
+    pub readout: String,
+}
+impl BandGeom {
+    pub(crate) fn of(r: &Renderer) -> Self {
+        let offset = if r.outer_alt_active { 0 } else { r.base_row };
+        Self {
+            left_margin: r.left_margin,
+            width: r.width,
+            real_cols: r.real_cols,
+            rows: r.parser.screen().size().0,
+            offset,
+            readout: geometry::readout_text(r.width_config, r.width),
+        }
+    }
+}
+
+/// Enter the visual mode: paint the rails + readout for the current geometry.
+/// Geometry is unchanged on enter, so no diff-baseline reset is needed — the
+/// clear-then-draw simply paints the rails over the already-blank gutter.
+pub(crate) fn enter_resize_overlay<T: OuterTerminal>(
+    renderer: &Renderer,
+    term: &mut T,
+) -> std::io::Result<()> {
+    repaint_margins(renderer, term, true)
+}
+
+/// Refresh the overlay after a width change: blank the vacated chrome from `prev`'s
+/// geometry (see [`BandGeom`]), then uniformly clear the band's row span (ADR-0017,
+/// both screen modes) and redraw the rails + readout at the current geometry.
+pub(crate) fn refresh_resize_overlay<T: OuterTerminal>(
+    renderer: &Renderer,
+    term: &mut T,
+    prev: Option<BandGeom>,
+) -> std::io::Result<()> {
+    if let Some(p) = &prev {
+        blank_vacated_chrome(term, p)?;
+    }
+    repaint_margins(renderer, term, true)
+}
+
+/// Blank the rail + readout cells a previous frame painted at `prev`'s geometry.
+/// Only load-bearing on grow: the vacated rail columns land inside the new band,
+/// past the reach of both `clear_gutter` (new geometry) and `draw_rails` (new
+/// geometry). On shrink the old cells already fall in the new gutter, which
+/// `clear_gutter` blanks anyway, so this is a harmless double-clear there.
+fn blank_vacated_chrome<T: OuterTerminal>(term: &mut T, prev: &BandGeom) -> std::io::Result<()> {
+    let rails = geometry::rail_layout(
+        prev.real_cols,
+        prev.left_margin,
+        prev.width,
+        prev.offset,
+        prev.rows,
+        &prev.readout,
+    );
+    for row in rails.row_start..rails.row_end {
+        if let Some(c) = rails.left_col {
+            term.move_to(c, row)?;
+            term.write_row(b" ")?;
+        }
+        if let Some(c) = rails.right_col {
+            term.move_to(c, row)?;
+            term.write_row(b" ")?;
+        }
+    }
+    if let Some(r) = &rails.readout {
+        term.move_to(r.col, r.row)?;
+        term.write_row(" ".repeat(r.text.chars().count()).as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Leave the visual mode: uniformly clear the band's row span, erasing the rails
+/// and readout (and blanking the readout's in-band fallback, see
+/// [`repaint_margins`]). Runs on Esc / chord-exit / idle-exit / shutdown. Callers
+/// pair this with `renderer.reset_prev_baseline()` so the next `render_once` fully
+/// repaints the band, restoring any child content the readout had overwritten.
+pub(crate) fn clear_resize_overlay<T: OuterTerminal>(
+    renderer: &Renderer,
+    term: &mut T,
+) -> std::io::Result<()> {
+    repaint_margins(renderer, term, false)
+}
+
+/// Apply one resize-mode step: change the band width by `delta` units, holding
+/// real_cols fixed, in the ADR-008 order. PRD 0001 §"Resize implementation shape".
+///
+/// Order (load-bearing, ADR-008): step the config → resolve W → `resizer.resize`
+/// (TIOCSWINSZ first) → `set_size(rows, W)` (param-order trap) → update geometry →
+/// clear vacated strip + paint rails → reset the diff baseline.
+fn apply_resize_step<R: PtyResizer, T: OuterTerminal>(
+    renderer: &mut Renderer,
+    resizer: &R,
+    term: &mut T,
+    delta: i32,
+) {
+    let rows = renderer.parser.screen().size().0;
+    let real = renderer.real_cols; // held FIXED (unlike handle_resize)
+    let prev = BandGeom::of(renderer); // capture BEFORE mutating
+
+    // Step 0 — unit-preserving step + clamp.
+    renderer.width_config = geometry::step_width(renderer.width_config, delta, real);
+    let w = geometry::resolve_width(renderer.width_config, real);
+
+    // At a bound the width is unchanged: skip the PTY/parser churn (and the
+    // baseline reset), but still refresh the overlay so the readout stays consistent.
+    let changed = w != renderer.width;
+    if changed {
+        // Step 1 — PTY first, cols = W, never real_cols.
+        let _ = resizer.resize(w, rows);
+        // Step 2 — parser, same turn. (rows, cols).
+        renderer.parser.screen_mut().set_size(rows, w);
+        // Step 3 — live geometry (real_cols unchanged).
+        renderer.width = w;
+        renderer.left_margin = geometry::margin(renderer.layout, real, w);
+    }
+    // Step 4 — clear the vacated strip + (re)paint rails.
+    let _ = refresh_resize_overlay(renderer, term, Some(prev));
+    // Step 5 — force a full band repaint next frame.
+    if changed {
+        renderer.reset_prev_baseline();
+    }
+}
+
+/// Loop-owned resize-mode control. `Some(deadline)` == in mode, holding the instant
+/// idle auto-exit fires; `None` == not in mode. Generic over the clock's `Instant`
+/// so the idle window is virtual-clock testable (ADR-007).
+struct ResizeCtl<I> {
+    idle_deadline: Option<I>,
+}
+impl<I: Copy + Ord> ResizeCtl<I> {
+    fn inactive() -> Self {
+        Self { idle_deadline: None }
+    }
+    fn active(&self) -> bool {
+        self.idle_deadline.is_some()
+    }
+    fn arm(&mut self, deadline: I) {
+        self.idle_deadline = Some(deadline);
+    }
+    fn disarm(&mut self) {
+        self.idle_deadline = None;
+    }
+}
+
+/// Handle one live-loop message: intercept resize-mode keys BEFORE `encode_key`
+/// (PRD 0001, Feature 2), else delegate to `dispatch`. Returns the child exit code
+/// exactly as `dispatch` does.
+fn apply_message<C, T, P, R>(
+    m: Msg,
+    clock: &mut C,
+    renderer: &mut Renderer,
+    resize: &mut ResizeCtl<C::Instant>,
+    term: &mut T,
+    pty_writer: &mut P,
+    resizer: &R,
+) -> Option<i32>
+where
+    C: Clock<Msg = Msg>,
+    T: OuterTerminal,
+    P: Write,
+    R: PtyResizer,
+{
+    if let Msg::Input(Event::Key(key)) = &m {
+        match classify_key(key, renderer.resize_key, resize.active()) {
+            KeyAction::PassThrough => {} // fall through to dispatch (encode + write)
+            KeyAction::Enter => {
+                // Two statements, NOT `clock.deadline(clock.now(), ..)`: `deadline`
+                // takes `&self` and `now` takes `&mut self`, so nesting them in one
+                // expression is an E0502 overlapping borrow.
+                let now = clock.now();
+                resize.arm(clock.deadline(now, RESIZE_IDLE));
+                let _ = enter_resize_overlay(renderer, term);
+                return None; // consumed, no PTY
+            }
+            KeyAction::Step(delta) => {
+                let now = clock.now();
+                resize.arm(clock.deadline(now, RESIZE_IDLE)); // a resize key = activity
+                apply_resize_step(renderer, resizer, term, delta);
+                return None;
+            }
+            KeyAction::Exit => {
+                resize.disarm();
+                let _ = clear_resize_overlay(renderer, term);
+                renderer.reset_prev_baseline();
+                return None;
+            }
+            KeyAction::Swallow => {
+                // Consumed but NOT counted as activity: a swallowed stray key must
+                // not keep the mode alive forever (PRD: idle = "no resize key").
+                return None;
+            }
+        }
+    }
+    // A terminal resize (SIGWINCH) while in mode moved the band — repaint the
+    // overlay after handle_resize has updated the geometry. Capture the geometry
+    // BEFORE dispatch mutates it, so a grow can blank the vacated rail columns
+    // handle_resize's own (rails-blind) clear left behind.
+    let was_resize = matches!(m, Msg::Input(Event::Resize(..)));
+    let prev = (was_resize && resize.active()).then(|| BandGeom::of(renderer));
+    let code = dispatch(m, renderer, pty_writer, resizer, term);
+    if was_resize && resize.active() {
+        let _ = refresh_resize_overlay(renderer, term, prev);
+    }
+    code
 }
 
 /// Paint the current virtual grid to the outer terminal at the band's offset
@@ -555,6 +864,48 @@ fn render_cell_walk<T: OuterTerminal>(
     Ok(())
 }
 
+/// Repaint the band chrome after a geometry change (ADR-008 step 5, generalised).
+/// Clears the vacated gutter strip across the band's row span — `0..rows` on the alt
+/// screen, `base_row..rows` on the primary screen, so shell history above the inline
+/// band is preserved (ADR-012/013) — and, when `resize_active`, draws the faint rails
+/// and width readout over it. When `resize_active` is false it also blanks the
+/// readout's in-band fallback cells (see below). Does NOT reset the diff baseline;
+/// the caller pairs this with `reset_prev_baseline()`.
+fn repaint_margins<T: OuterTerminal>(
+    renderer: &Renderer,
+    term: &mut T,
+    resize_active: bool,
+) -> std::io::Result<()> {
+    let offset = if renderer.outer_alt_active { 0 } else { renderer.base_row };
+    let rows = renderer.parser.screen().size().0;
+    term.clear_gutter(renderer.left_margin, renderer.width, renderer.real_cols, offset, rows)?;
+    let text = geometry::readout_text(renderer.width_config, renderer.width);
+    let rails = geometry::rail_layout(
+        renderer.real_cols,
+        renderer.left_margin,
+        renderer.width,
+        offset,
+        rows,
+        &text,
+    );
+    if resize_active {
+        term.draw_rails(&rails)?;
+    } else if let Some(r) = &rails.readout {
+        // Exit clear. The readout's fallback placement is INSIDE the band, which
+        // `clear_gutter` never touches — and the paired `reset_prev_baseline` full
+        // repaint re-emits only rows that hold content, so a readout sitting on a
+        // blank child row would linger forever. Blank its span explicitly: when the
+        // readout sat in the gutter this is a harmless double-clear, and when child
+        // content occupied those cells the baseline-reset repaint restores it next
+        // frame. Recomputing the layout here finds the same cells the rails last
+        // drew at: mode exit changes no geometry, and a terminal resize while in
+        // mode already redrew the rails at the new geometry.
+        term.move_to(r.col, r.row)?;
+        term.write_row(" ".repeat(r.text.chars().count()).as_bytes())?;
+    }
+    Ok(())
+}
+
 impl Renderer {
     /// Advance the `prev` baseline to match the current screen, so the next
     /// frame's `rows_diff` is against what was just painted. vt100 exposes no
@@ -687,16 +1038,46 @@ where
     R: PtyResizer,
 {
     let mut exit_code: Option<i32> = None;
+    let mut resize = ResizeCtl::inactive();
 
     'frames: loop {
-        // --- Phase A: block for the first message (zero idle CPU) ---
-        let first = match clock.recv() {
-            Some(m) => m,
-            // Backstop only: all senders gone with no ChildExited.
-            None => break 'frames,
+        // Top-of-frame idle check (handles a flooding child that never lets Phase A
+        // block): if the idle deadline has already passed, exit the mode and repaint
+        // before doing anything else this frame.
+        if let Some(dl) = resize.idle_deadline {
+            if clock.now() >= dl {
+                resize.disarm();
+                let _ = clear_resize_overlay(renderer, term);
+                renderer.reset_prev_baseline();
+                let _ = render_once(renderer, term); // erase rails this frame
+                continue 'frames;
+            }
+        }
+
+        // --- Phase A: block for the first message (zero idle CPU when not in mode;
+        // a bounded wait while in mode, so a quiet child still wakes for auto-exit) ---
+        let first = if let Some(dl) = resize.idle_deadline {
+            match clock.recv_until(dl) {
+                Recv::Msg(m) => m,
+                Recv::Timeout => {
+                    // ~3 s idle elapsed.
+                    resize.disarm();
+                    let _ = clear_resize_overlay(renderer, term);
+                    renderer.reset_prev_baseline();
+                    let _ = render_once(renderer, term);
+                    continue 'frames;
+                }
+                Recv::Disconnected => break 'frames,
+            }
+        } else {
+            match clock.recv() {
+                Some(m) => m,
+                // Backstop only: all senders gone with no ChildExited.
+                None => break 'frames,
+            }
         };
         let mut shutdown = false;
-        if let Some(code) = dispatch(first, renderer, pty_writer, resizer, term) {
+        if let Some(code) = apply_message(first, clock, renderer, &mut resize, term, pty_writer, resizer) {
             exit_code = Some(code);
             drain_pty_path(clock, renderer, pty_writer, resizer, term);
             shutdown = true;
@@ -716,7 +1097,9 @@ where
                 }
                 match clock.recv_until(deadline) {
                     Recv::Msg(m) => {
-                        if let Some(code) = dispatch(m, renderer, pty_writer, resizer, term) {
+                        if let Some(code) =
+                            apply_message(m, clock, renderer, &mut resize, term, pty_writer, resizer)
+                        {
                             exit_code = Some(code);
                             drain_pty_path(clock, renderer, pty_writer, resizer, term);
                             shutdown = true;
@@ -738,6 +1121,11 @@ where
         if shutdown {
             break 'frames;
         }
+    }
+
+    // Clear the overlay on shutdown so a child that exits mid-mode leaves no rails.
+    if resize.active() {
+        let _ = clear_resize_overlay(renderer, term);
     }
 
     // Explicit ordered restore BEFORE process::exit (ADR-010): process::exit runs no
@@ -1623,17 +2011,16 @@ mod tests {
         );
     }
 
-    /// Primary-mode resize preserves history above the band (ADR-012/013). A plain
-    /// (non-alt) stream resized mid-run must not emit the absolute `clear_gutter` — that
-    /// would erase the real shell's scrollback above the band. (The band still repaints
-    /// in full at the new margin via `reset_prev_baseline`; this test pins the suppressed
-    /// clear, not the repaint.) An alt stream resized the same way still does the
-    /// absolute `[0, rows)` clear. Pins the `outer_alt_active` gate in `handle_resize`.
+    /// Uniform margin management (ADR-0017): resize clears the gutter across the band's
+    /// row span on BOTH screen modes, but the span's start differs. On the primary screen
+    /// the clear starts at `base_row`, never at 0, so real shell history above the inline
+    /// band is untouched. On the alt screen — where gutter owns the whole viewport — the
+    /// clear starts at 0. Pins the `offset` computation inside `repaint_margins`.
     #[test]
-    fn primary_resize_preserves_history_alt_resize_clears() {
+    fn resize_clears_band_row_span_preserving_history() {
         use crossterm::event::Event;
 
-        // --- Primary (plain) stream resized: NO clear_gutter (the band repaints). ---
+        // --- Primary (plain) stream resized: clear starts at base_row (5), not 0. ---
         let script = vec![
             (0u64, Msg::Pty(b"primary content".to_vec())),
             // A resize arrives mid-run, BEFORE the child exits.
@@ -1642,19 +2029,25 @@ mod tests {
         ];
         let mut clock = VirtualClock::new(script);
         let mut renderer = left_renderer(20, 24, false);
+        // The scripted content sits on grid row 0, so make-room never scrolls and
+        // base_row stays 5 through the resize (5 < 29, the height clamp is a no-op).
+        renderer.base_row = 5;
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
 
-        // The absolute gutter clear must NOT fire on the primary screen — it would
-        // blank rows the real shell drew above the band.
-        assert!(
-            !term.calls.iter().any(|c| matches!(c, Call::ClearGutter(..))),
-            "primary-mode resize must not clear_gutter (would erase history), calls = {:?}",
+        let primary_row_start = term.calls.iter().find_map(|c| {
+            if let Call::ClearGutter(_, _, _, row_start, _) = c { Some(*row_start) } else { None }
+        });
+        assert_eq!(
+            primary_row_start,
+            Some(5),
+            "primary-mode resize must clear from base_row (5), not 0 — rows [0, 5) of \
+             history must be untouched, calls = {:?}",
             term.calls
         );
 
-        // --- Alt stream resized: the absolute clear_gutter STILL fires. ---
+        // --- Alt stream resized: the clear still fires, spanning from row 0. ---
         let script = vec![
             (0u64, Msg::Pty(b"\x1b[?1049h\x1b[1;1Htui".to_vec())),
             (20, Msg::Input(Event::Resize(100, 30))),
@@ -1666,9 +2059,14 @@ mod tests {
         let mut pty: Vec<u8> = Vec::new();
         run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
 
-        assert!(
-            term.calls.iter().any(|c| matches!(c, Call::ClearGutter(..))),
-            "alt-mode resize must still clear_gutter (v1 behaviour), calls = {:?}",
+        let alt_row_start = term.calls.iter().find_map(|c| {
+            if let Call::ClearGutter(_, _, _, row_start, _) = c { Some(*row_start) } else { None }
+        });
+        assert_eq!(
+            alt_row_start,
+            Some(0),
+            "alt-mode resize must clear from row 0 (gutter owns the whole viewport), \
+             calls = {:?}",
             term.calls
         );
     }
@@ -2168,6 +2566,272 @@ line two\r\n\
             vec![b"\x1b[6 q".to_vec(), b"\x1b[4 q".to_vec()],
             "each DECSCUSR change mirrored once, verbatim"
         );
+    }
+
+    /// Modal resize-mode state machine. `VirtualClock`, `MockTerminal`,
+    /// `mode_renderer` and `run_with_resizer` are nested here (rather than a
+    /// top-level sibling module) so the suite can reuse `VirtualClock`/`MockTerminal`,
+    /// which are private to this `mod tests` — a sibling module cannot see them.
+    /// `RecResizer` is a local copy of the one in the (sibling) `mod resize`, which
+    /// is likewise private to that module.
+    mod resize_mode {
+        use super::*;
+        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
+        use std::cell::RefCell;
+
+        /// A recording [`PtyResizer`], local to this module (the sibling `mod
+        /// resize`'s copy is private to it).
+        #[derive(Default)]
+        struct RecResizer {
+            calls: RefCell<Vec<(u16, u16)>>,
+        }
+        impl PtyResizer for RecResizer {
+            fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+                self.calls.borrow_mut().push((cols, rows));
+                Ok(())
+            }
+        }
+
+        fn mode_renderer(width: u16, rows: u16, real_cols: u16, cfg: Width) -> Renderer {
+            Renderer::new(
+                width,
+                rows,
+                real_cols,
+                Layout::Center,
+                cfg,
+                false,
+                Box::new(std::io::sink()),
+                0,
+            )
+        }
+
+        fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+            KeyEvent { code, modifiers: mods, kind: KeyEventKind::Press, state: KeyEventState::NONE }
+        }
+
+        fn release_key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+            KeyEvent { code, modifiers: mods, kind: KeyEventKind::Release, state: KeyEventState::NONE }
+        }
+
+        /// Bundles the state `apply_message` needs so tests read as a script of
+        /// `send`/`enter` calls rather than repeating six `&mut` arguments.
+        struct Ctx {
+            clock: VirtualClock,
+            renderer: Renderer,
+            resize: ResizeCtl<u64>,
+            term: MockTerminal,
+            pty: Vec<u8>,
+            resizer: RecResizer,
+        }
+
+        impl Ctx {
+            fn new(width: u16, rows: u16, real_cols: u16, cfg: Width) -> Self {
+                Self {
+                    clock: VirtualClock::new(vec![]),
+                    renderer: mode_renderer(width, rows, real_cols, cfg),
+                    resize: ResizeCtl::inactive(),
+                    term: MockTerminal::new(),
+                    pty: Vec::new(),
+                    resizer: RecResizer::default(),
+                }
+            }
+
+            fn send(&mut self, ev: KeyEvent) -> Option<i32> {
+                apply_message(
+                    Msg::Input(Event::Key(ev)),
+                    &mut self.clock,
+                    &mut self.renderer,
+                    &mut self.resize,
+                    &mut self.term,
+                    &mut self.pty,
+                    &self.resizer,
+                )
+            }
+
+            fn enter(&mut self) {
+                let c = KeyChord::default();
+                self.send(press(c.code, c.mods));
+            }
+        }
+
+        /// Drive the real loop (needed only by the idle tests, which exercise
+        /// `run`'s Phase-A bounded wait and top-of-frame idle check — behaviour
+        /// `apply_message` alone can't reach).
+        fn run_with_resizer(
+            script: Vec<(u64, Msg)>,
+            width: u16,
+            rows: u16,
+            real_cols: u16,
+            cfg: Width,
+        ) -> (Vec<u8>, Renderer, Option<i32>, RecResizer, MockTerminal) {
+            let mut clock = VirtualClock::new(script);
+            let mut renderer = mode_renderer(width, rows, real_cols, cfg);
+            let mut term = MockTerminal::new();
+            let mut pty: Vec<u8> = Vec::new();
+            let resizer = RecResizer::default();
+            let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &resizer);
+            (pty, renderer, code, resizer, term)
+        }
+
+        #[test]
+        fn enter_chord_consumed_no_pty_write() {
+            let mut ctx = Ctx::new(80, 24, 80, Width::Cols(80));
+            ctx.enter();
+            assert!(ctx.resize.active(), "the chord enters the mode");
+            assert!(ctx.pty.is_empty(), "the chord must never reach the child");
+        }
+
+        #[test]
+        fn enter_then_l_grows_one_column() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+
+            assert_eq!(ctx.renderer.width, 81);
+            assert_eq!(ctx.renderer.width_config, Width::Cols(81));
+            assert_eq!(*ctx.resizer.calls.borrow(), vec![(81, 24)]);
+            assert_eq!(ctx.renderer.parser.screen().size(), (24, 81));
+        }
+
+        #[test]
+        fn h_l_jump_ten() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('L'), KeyModifiers::SHIFT));
+            assert_eq!(ctx.renderer.width, 90, "L jumps by ten");
+            ctx.send(press(KeyCode::Char('H'), KeyModifiers::SHIFT));
+            assert_eq!(ctx.renderer.width, 80, "H jumps back by ten");
+        }
+
+        #[test]
+        fn percent_unit_preserved() {
+            let mut ctx = Ctx::new(100, 24, 200, Width::Percent(50));
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            assert_eq!(ctx.renderer.width_config, Width::Percent(51), "unit stays percentage");
+            assert_eq!(ctx.renderer.width, 102, "51% of 200 = 102");
+        }
+
+        #[test]
+        fn shrink_clamps_at_min_w_silently() {
+            let mut ctx = Ctx::new(20, 24, 200, Width::Cols(20));
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('h'), KeyModifiers::NONE));
+            assert_eq!(ctx.renderer.width, 20, "MIN_W floor holds");
+            assert!(
+                ctx.resizer.calls.borrow().is_empty(),
+                "a clamped (no-op) step must skip the PTY/parser churn"
+            );
+        }
+
+        #[test]
+        fn grow_clamps_at_real_cols_silently() {
+            let mut ctx = Ctx::new(200, 24, 200, Width::Cols(200));
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            assert_eq!(ctx.renderer.width, 200, "real_cols ceiling holds");
+            assert!(ctx.resizer.calls.borrow().is_empty());
+        }
+
+        #[test]
+        fn esc_exits_then_keys_pass_through() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            ctx.send(press(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(!ctx.resize.active(), "Esc exits the mode");
+            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            assert_eq!(ctx.pty, b"l", "once exited, l reaches the child instead of stepping");
+            assert_eq!(ctx.renderer.width, 80, "no step happened after exit");
+        }
+
+        #[test]
+        fn chord_again_exits() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            ctx.enter(); // the chord again, now in mode → exit
+            assert!(!ctx.resize.active());
+        }
+
+        #[test]
+        fn swallow_stays_in_mode_no_pty() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('z'), KeyModifiers::NONE));
+            assert!(ctx.pty.is_empty(), "an unrecognised key must not leak to the child");
+            assert!(ctx.resize.active(), "mode persists after a swallowed key");
+            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            assert_eq!(ctx.renderer.width, 81, "still in mode: l still steps");
+        }
+
+        #[test]
+        fn chord_release_does_not_toggle() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            let c = KeyChord::default();
+            ctx.send(release_key(c.code, c.mods));
+            assert!(ctx.resize.active(), "the chord's own release must not exit the mode");
+            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            assert_eq!(ctx.renderer.width, 81, "l still steps after the release");
+            assert!(ctx.pty.is_empty());
+        }
+
+        /// Mirrors `resize::resize_clears_the_gutter`: an in-mode shrink on the alt
+        /// screen must still clear the gutter across `0..rows`.
+        #[test]
+        fn alt_screen_step_keeps_clear_gutter_parity() {
+            let mut ctx = Ctx::new(100, 6, 120, Width::Cols(100));
+            ctx.renderer.outer_alt_active = true;
+            ctx.enter();
+            ctx.send(press(KeyCode::Char('h'), KeyModifiers::NONE)); // shrink one step
+
+            assert_eq!(ctx.renderer.width, 99);
+            let expected_margin = geometry::margin(ctx.renderer.layout, 120, 99);
+            assert!(
+                ctx.term.calls.contains(&Call::ClearGutter(expected_margin, 99, 120, 0, 6)),
+                "an in-mode shrink on the alt screen must clear the gutter, calls = {:?}",
+                ctx.term.calls
+            );
+        }
+
+        #[test]
+        fn idle_auto_exit_via_virtual_clock() {
+            let c = KeyChord::default();
+            let script = vec![
+                (0, Msg::Input(Event::Key(press(c.code, c.mods)))), // enter at t0
+                // Well past the ~3s idle window: the bounded Phase-A wait times
+                // out at the deadline, exiting the mode, before this is delivered.
+                (5000, Msg::Input(Event::Key(press(KeyCode::Char('l'), KeyModifiers::NONE)))),
+                (0, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+            ];
+            let (pty, renderer, code, resizer, _term) =
+                run_with_resizer(script, 80, 24, 200, Width::Cols(80));
+
+            assert_eq!(code, Some(0));
+            assert!(resizer.calls.borrow().is_empty(), "idle-exit happened before any step");
+            assert_eq!(renderer.width, 80);
+            assert_eq!(pty, b"l", "the delayed key passes through once the mode has exited");
+        }
+
+        #[test]
+        fn idle_refreshes_on_step() {
+            let c = KeyChord::default();
+            let script = vec![
+                (0, Msg::Input(Event::Key(press(c.code, c.mods)))), // enter at t0
+                // A step at t0+2000 re-arms the idle deadline to ~t0+5000, not
+                // ~t0+3000 — so this key, another 5s later, still finds the mode
+                // active until the RE-ARMED deadline.
+                (2000, Msg::Input(Event::Key(press(KeyCode::Char('l'), KeyModifiers::NONE)))),
+                (5000, Msg::Input(Event::Key(press(KeyCode::Char('l'), KeyModifiers::NONE)))),
+                (0, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+            ];
+            let (pty, renderer, code, resizer, _term) =
+                run_with_resizer(script, 80, 24, 200, Width::Cols(80));
+
+            assert_eq!(code, Some(0));
+            assert_eq!(renderer.width, 81, "the in-mode step before idle-exit applied");
+            assert_eq!(*resizer.calls.borrow(), vec![(81, 24)], "exactly one resize, from the step");
+            assert_eq!(pty, b"l", "the delayed key after idle-exit passes through to the child");
+        }
     }
 }
 
@@ -3261,11 +3925,10 @@ mod resize {
     }
 
     /// Mid-burst case C — physical gutter has no stale cells. Paint a wide left-aligned
-    /// frame in the alt screen (where the absolute gutter clear is owned, ADR-012), then
-    /// resize so the band shrinks and the margin moves; after the gutter clear + repaint,
-    /// every physical cell outside the band must be blank. Proves the explicit gutter
-    /// clear (ADR-008 step 4) — the `rows_diff` repaint alone touches only `[margin,
-    /// margin+W)`.
+    /// frame in the alt screen, then resize so the band shrinks and the margin moves;
+    /// after the gutter clear + repaint, every physical cell outside the band must be
+    /// blank. Proves the explicit gutter clear (ADR-008 step 4 / ADR-016) — the
+    /// `rows_diff` repaint alone touches only `[margin, margin+W)`.
     #[test]
     fn mid_burst_case_c_physical_gutter_clear() {
         let (w0, rows, phys) = (100u16, 6u16, 120u16);
@@ -3419,39 +4082,41 @@ mod resize {
         assert!(r.width > 0, "W never collapses to zero");
     }
 
-    /// The gutter clear is invoked with the live band geometry every resize — in the alt
-    /// screen, where gutter owns the whole viewport (ADR-012). Proven on the
+    /// The gutter clear is invoked with the live band geometry every resize (ADR-016:
+    /// uniform across screen modes, only the row span differs). In the alt screen the
+    /// span is `0..rows`, since gutter owns the whole viewport there. Proven on the
     /// `MockTerminal` call record.
     #[test]
     fn resize_clears_the_gutter() {
         let mut r = renderer(80, 24, 200, Layout::Center, Width::Cols(80));
-        // The child is in the alt screen at the resize (a TUI). The absolute
-        // gutter clear is gated on this (ADR-012); see the primary-mode guard test
-        // for the suppressed case.
+        // The child is in the alt screen at the resize (a TUI): the clear spans
+        // `0..rows`; see `resize_clears_band_row_span_preserving_history` for the
+        // primary-screen span (`base_row..rows`).
         r.outer_alt_active = true;
         let resizer = RecResizer::default();
         let mut term = MockTerminal::new();
         handle_resize(&mut r, &resizer, &mut term, 120, 30);
 
-        // (margin, width, real_cols, rows) for the new geometry: margin =
-        // (120-80)/2 = 20, W = 80, real_cols = 120, rows = 30.
+        // (margin, width, real_cols, row_start, row_end) for the new geometry: margin =
+        // (120-80)/2 = 20, W = 80, real_cols = 120, span 0..30 (alt screen).
         assert!(
-            term.calls.contains(&Call::ClearGutter(20, 80, 120, 30)),
+            term.calls.contains(&Call::ClearGutter(20, 80, 120, 0, 30)),
             "gutter clear must run with the recomputed geometry, calls = {:?}",
             term.calls
         );
     }
 
-    /// Primary-aware resize clears only the live band region (ADR-013). On the primary
-    /// screen a resize must not emit the absolute `[0, rows)` `clear_gutter` (that would
-    /// blank rows holding real shell history), but it must still force a full band repaint
-    /// so the band tracks the new margin/width. Driving `handle_resize` then one
-    /// `render_once`: no `ClearGutter`, yet the band content is repainted in full at the
-    /// new margin.
+    /// Primary-aware resize clears the live band's row span only (ADR-013/ADR-0017). On
+    /// the primary screen a resize must clear the gutter starting at `base_row`, never at
+    /// 0 (that would blank rows holding real shell history), and must still force a full
+    /// band repaint so the band tracks the new margin/width. Driving `handle_resize` then
+    /// one `render_once`: `ClearGutter` fires with `row_start == base_row`, and the band
+    /// content is repainted in full at the new margin.
     #[test]
-    fn primary_resize_repaints_band_without_absolute_clear() {
+    fn primary_resize_clears_band_span_and_repaints() {
         // A primary-screen renderer (never entered the alt screen) with content.
         let mut r = renderer(40, 6, 100, Layout::Center, Width::Cols(40));
+        r.base_row = 2; // 2 < 9, so the height clamp (min(rows - 1)) is a no-op.
         r.parser.process(b"\x1b[1;1Hbanded primary content");
         // Settle `prev` to the current grid so a plain re-render would diff to
         // nothing — the resize must be what forces the repaint below.
@@ -3462,10 +4127,11 @@ mod resize {
         let mut term = MockTerminal::new();
         handle_resize(&mut r, &resizer, &mut term, 120, 10);
 
-        // No absolute gutter clear on the primary screen — real history is safe.
+        // The gutter clear fires, but only across the band's row span: row_start ==
+        // base_row (2), never 0 — rows [0, 2) of real history are untouched.
         assert!(
-            !term.calls.iter().any(|c| matches!(c, Call::ClearGutter(..))),
-            "primary resize must not clear_gutter (would erase history), calls = {:?}",
+            term.calls.contains(&Call::ClearGutter(40, 40, 120, 2, 10)),
+            "primary resize must clear the gutter from base_row, not 0, calls = {:?}",
             term.calls
         );
 
@@ -3482,10 +4148,12 @@ mod resize {
              calls = {:?}",
             term2.calls
         );
-        let repainted_at_margin = term2.calls.contains(&Call::MoveTo(40, 0));
+        // The primary paint targets base_row + grid_row, so row 2 (not 0).
+        let repainted_at_margin = term2.calls.contains(&Call::MoveTo(40, 2));
         assert!(
             repainted_at_margin,
-            "the repainted band row must land at the recomputed margin 40, calls = {:?}",
+            "the repainted band row must land at the recomputed margin 40, row base_row=2, \
+             calls = {:?}",
             term2.calls
         );
     }
@@ -3512,5 +4180,142 @@ mod resize {
         // Height grow back to 30: base_row is already on-screen, so it is kept.
         handle_resize(&mut r, &resizer, &mut term, 120, 30);
         assert_eq!(r.base_row, 9, "a height grow keeps the (already on-screen) base_row");
+    }
+}
+
+/// `repaint_margins` unit tests (uniform margin management, ADR-0017): the row-span
+/// clear on both screen modes, the rails/readout paint, and the exit-clear gap the
+/// in-band readout fallback needs. Mock/`RecordingGrid`, no threads, no real PTY.
+#[cfg(test)]
+mod margins {
+    use super::*;
+    use crate::geometry::{Layout, Width};
+    use crate::terminal::mock::{Call, MockTerminal, RecordingGrid};
+
+    /// Build a renderer for the margins tests with an explicit layout + width
+    /// config, sized to `width × rows` in a `real_cols`-wide terminal.
+    fn renderer(width: u16, rows: u16, real_cols: u16, layout: Layout, cfg: Width) -> Renderer {
+        Renderer::new(width, rows, real_cols, layout, cfg, false, Box::new(std::io::sink()), 0)
+    }
+
+    /// Alt screen: the clear spans the whole grid, `0..rows` (gutter owns the whole
+    /// viewport there).
+    #[test]
+    fn repaint_margins_alt_clears_full_span() {
+        let mut r = renderer(80, 24, 120, Layout::Center, Width::Cols(80));
+        r.outer_alt_active = true;
+        let mut term = MockTerminal::new();
+
+        repaint_margins(&r, &mut term, false).unwrap();
+
+        // margin = (120-80)/2 = 20.
+        assert!(
+            term.calls.contains(&Call::ClearGutter(20, 80, 120, 0, 24)),
+            "alt clear must span [0, rows), calls = {:?}",
+            term.calls
+        );
+    }
+
+    /// Primary screen: the clear starts at `base_row`, never at 0, so rows above the
+    /// inline band (real shell history) are untouched.
+    #[test]
+    fn repaint_margins_primary_clears_from_base_row() {
+        let mut r = renderer(80, 24, 120, Layout::Center, Width::Cols(80));
+        r.base_row = 5;
+        let mut term = MockTerminal::new();
+
+        repaint_margins(&r, &mut term, false).unwrap();
+
+        assert!(
+            term.calls.contains(&Call::ClearGutter(20, 80, 120, 5, 24)),
+            "primary clear must span [base_row, rows), calls = {:?}",
+            term.calls
+        );
+    }
+
+    /// Active resize mode draws the faint rails at the gutter columns adjoining the
+    /// band, plus the width readout in the right gutter's bottom row.
+    #[test]
+    fn repaint_margins_draws_rails_when_active() {
+        let r = renderer(80, 24, 120, Layout::Center, Width::Cols(80));
+        let mut grid = RecordingGrid::new(120, 24);
+
+        repaint_margins(&r, &mut grid, true).unwrap();
+
+        // margin = 20, band_end = 100.
+        assert_eq!(grid.cell_contents(0, 19), "\u{258f}", "left rail at margin - 1");
+        assert_eq!(grid.cell_contents(0, 100), "\u{2595}", "right rail at band_end");
+        assert!(grid.cell_dim(0, 19), "left rail must be faint");
+        assert!(grid.cell_dim(0, 100), "right rail must be faint");
+
+        // The readout ("80") right-aligns in the 20-wide right gutter, at row 23.
+        assert_eq!(grid.cell_contents(23, 118), "8");
+        assert_eq!(grid.cell_contents(23, 119), "0");
+    }
+
+    /// A `--left` band has no left gutter, so no left rail — only the right rail.
+    #[test]
+    fn repaint_margins_left_band_no_left_rail() {
+        let r = renderer(80, 24, 100, Layout::Left, Width::Cols(80));
+        let mut grid = RecordingGrid::new(100, 24);
+
+        repaint_margins(&r, &mut grid, true).unwrap();
+
+        assert_ne!(grid.cell_contents(0, 0), "\u{258f}", "no left rail on a left-aligned band");
+        assert_eq!(grid.cell_contents(0, 80), "\u{2595}", "right rail still drawn at band_end");
+    }
+
+    /// The exit-clear gap (2c): a full-width band leaves the readout in its in-band
+    /// fallback position, over the child's blank bottom row. `clear_gutter` never
+    /// touches in-band cells, and a diff-based repaint against an unchanged child
+    /// screen would never re-emit that row — so the exit clear must blank the
+    /// readout's cells explicitly.
+    #[test]
+    fn repaint_margins_exit_blanks_in_band_readout() {
+        let r = renderer(80, 24, 80, Layout::Center, Width::Cols(80));
+        let mut grid = RecordingGrid::new(80, 24);
+
+        // Enter: the readout falls back inside the band's bottom-right (no gutter).
+        repaint_margins(&r, &mut grid, true).unwrap();
+        assert_eq!(grid.cell_contents(23, 78), "8");
+        assert_eq!(grid.cell_contents(23, 79), "0");
+
+        // Exit: the readout span must be blanked explicitly (an actual space
+        // character, not the digit — `cell_contents` reports exactly what's there).
+        repaint_margins(&r, &mut grid, false).unwrap();
+        assert_eq!(grid.cell_contents(23, 78), " ", "readout must be blanked on exit");
+        assert_eq!(grid.cell_contents(23, 79), " ", "readout must be blanked on exit");
+    }
+
+    /// Growing the band while in mode must not strand the old rail glyphs inside
+    /// the new band: a centred W=80 band in a 120-col terminal has rails at columns
+    /// 19/100; growing to W=82 moves the band to `[19, 101)`, so both old rail
+    /// columns land INSIDE the new band, past the reach of the new-geometry
+    /// `clear_gutter`/`draw_rails`. `refresh_resize_overlay` must blank them via the
+    /// `prev` snapshot.
+    #[test]
+    fn refresh_resize_overlay_grow_clears_stranded_rails() {
+        let mut r = renderer(80, 24, 120, Layout::Center, Width::Cols(80));
+        let mut grid = RecordingGrid::new(120, 24);
+
+        // Enter at W=80: margin 20, rails at 19 (left) and 100 (right).
+        repaint_margins(&r, &mut grid, true).unwrap();
+        assert_eq!(grid.cell_contents(0, 19), "\u{258f}");
+        assert_eq!(grid.cell_contents(0, 100), "\u{2595}");
+
+        // Grow to W=82: new margin 19, new band [19, 101). Both old rail columns
+        // are now inside the band.
+        let prev = BandGeom::of(&r);
+        r.width = 82;
+        r.width_config = Width::Cols(82);
+        r.left_margin = geometry::margin(r.layout, r.real_cols, r.width);
+
+        refresh_resize_overlay(&r, &mut grid, Some(prev)).unwrap();
+
+        assert_eq!(grid.cell_contents(0, 19), " ", "old left rail must not strand inside the new band");
+        assert_eq!(grid.cell_contents(0, 100), " ", "old right rail must not strand inside the new band");
+        // The new rails land at the new edges: margin - 1 = 18, band_end = 101.
+        assert_eq!(grid.cell_contents(0, 18), "\u{258f}", "new left rail");
+        assert_eq!(grid.cell_contents(0, 101), "\u{2595}", "new right rail");
     }
 }
