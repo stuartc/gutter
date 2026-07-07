@@ -43,6 +43,11 @@ pub trait OuterTerminal {
     /// gutter never forces the alt screen at setup; called mid-run only when the
     /// child enters it.
     fn enter_alt_screen(&mut self) -> io::Result<()>;
+    /// The outer terminal's current size as `(cols, rows)`. Read on resume to catch
+    /// a resize that happened while gutter was suspended (ADR-0019): crossterm's
+    /// pending SIGWINCH can coalesce a resize-and-back to a stale event, so the
+    /// cycle queries the real size explicitly.
+    fn terminal_size(&mut self) -> io::Result<(u16, u16)>;
 
     // --- Render output (per frame) ---
     /// Move the cursor to physical `(col, row)`, emitted before each repainted
@@ -174,6 +179,10 @@ impl OuterTerminal for CrosstermTerminal {
         use crossterm::{queue, terminal::EnterAlternateScreen};
         queue!(self.out, EnterAlternateScreen)?;
         self.out.flush()
+    }
+
+    fn terminal_size(&mut self) -> io::Result<(u16, u16)> {
+        crossterm::terminal::size()
     }
 
     fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
@@ -374,6 +383,10 @@ pub mod mock {
         /// land in one interleaved sequence (ADR-0019). Every recorded call is
         /// pushed here too when present.
         log: Option<std::rc::Rc<std::cell::RefCell<Vec<Call>>>>,
+        /// The `(cols, rows)` [`OuterTerminal::terminal_size`] reports, behind a
+        /// shared cell so a test (or the mock suspender's on-suspend hook) can flip
+        /// it mid-cycle to model a resize while gutter was suspended (ADR-0019).
+        size: std::rc::Rc<std::cell::Cell<(u16, u16)>>,
     }
 
     impl MockTerminal {
@@ -396,6 +409,16 @@ pub mod mock {
                 supports_kitty: true,
                 ..Self::default()
             }
+        }
+
+        /// The `(cols, rows)` this mock reports from `terminal_size`, and the shared
+        /// cell backing it — hand the cell to a `MockSuspender` so its on-suspend
+        /// hook can flip the size mid-cycle.
+        pub fn set_terminal_size(&self, cols: u16, rows: u16) {
+            self.size.set((cols, rows));
+        }
+        pub fn size_cell(&self) -> std::rc::Rc<std::cell::Cell<(u16, u16)>> {
+            self.size.clone()
         }
 
         /// Record one call: into `calls`, and into the shared order log if one is
@@ -545,6 +568,10 @@ pub mod mock {
         fn enter_alt_screen(&mut self) -> io::Result<()> {
             Ok(())
         }
+        fn terminal_size(&mut self) -> io::Result<(u16, u16)> {
+            let (rows, cols) = self.parser.screen().size();
+            Ok((cols, rows))
+        }
         fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
             // CSI row+1 ; col+1 H — vt100 is 1-based, gutter's API 0-based.
             let seq = format!("\x1b[{};{}H", row + 1, col + 1);
@@ -667,6 +694,9 @@ pub mod mock {
         fn enter_alt_screen(&mut self) -> io::Result<()> {
             self.record(Call::EnterAltScreen);
             Ok(())
+        }
+        fn terminal_size(&mut self) -> io::Result<(u16, u16)> {
+            Ok(self.size.get())
         }
         fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
             self.record(Call::MoveTo(col, row));

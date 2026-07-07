@@ -59,12 +59,19 @@ pub mod mock {
 
     pub struct MockSuspender {
         log: OrderLog,
+        /// A side effect run inside `suspend_self` (before it records), modelling the
+        /// world changing while gutter is stopped — the missed-resize test flips the
+        /// mock terminal's reported size here.
+        on_suspend: Option<Box<dyn Fn()>>,
     }
 
     impl MockSuspender {
         /// A suspender that shares `log` with a `MockTerminal::with_log(log)`.
         pub fn new(log: OrderLog) -> Self {
-            Self { log }
+            Self {
+                log,
+                on_suspend: None,
+            }
         }
 
         /// A standalone suspender with its own throwaway log — for tests that only
@@ -72,10 +79,20 @@ pub mod mock {
         pub fn disconnected() -> Self {
             Self::new(Rc::new(RefCell::new(Vec::new())))
         }
+
+        /// Register a side effect fired inside `suspend_self`, modelling the world
+        /// changing while gutter is stopped (e.g. an outer-terminal resize).
+        pub fn on_suspend(mut self, f: impl Fn() + 'static) -> Self {
+            self.on_suspend = Some(Box::new(f));
+            self
+        }
     }
 
     impl Suspender for MockSuspender {
         fn suspend_self(&self) {
+            if let Some(f) = &self.on_suspend {
+                f();
+            }
             self.log.borrow_mut().push(Call::SuspendSelf);
         }
 

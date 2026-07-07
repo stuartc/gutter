@@ -1289,6 +1289,19 @@ where
     // Step 5 — unpark (resume, inverse order, raw mode FIRST).
     let _ = unpark(renderer, term);
 
+    // Step 7 — missed-resize catch-up. The outer terminal may have resized while
+    // gutter slept; run the full ADR-008 handler so the TIOCSWINSZ queues one
+    // SIGWINCH on the still-stopped child, delivered when it is continued in step 8
+    // — so the child wakes and repaints once at the right size, not twice. Runs
+    // before the base_row reseed so the reseed uses the post-resize row count.
+    if let Ok((cols, rows_now)) = term.terminal_size() {
+        let cur_rows = renderer.parser.screen().size().0;
+        if cols != renderer.real_cols || rows_now != cur_rows {
+            handle_resize(renderer, resizer, term, cols, rows_now);
+        }
+    }
+    let rows = renderer.parser.screen().size().0;
+
     // Step 6 — inline anchor reseed (primary-screen children). The shell scrolled
     // the screen while gutter slept, so base_row is meaningless and CPR is
     // unavailable (the input thread owns the event source). Reseed at the bottom
@@ -1302,9 +1315,11 @@ where
     // post-cont repaint bytes land on a raw-mode, correct-screen terminal.
     suspender.continue_child();
 
-    // Step 9 — full repaint.
+    // Step 9 — full repaint, then repaint the gutter margins: the gutter columns on
+    // the band's rows may hold shell text from the suspension, so clear them.
     renderer.reset_prev_baseline();
     let _ = render_once(renderer, term);
+    let _ = repaint_margins(renderer, term, false);
 
     SuspendOutcome::Resumed
 }
@@ -1361,6 +1376,9 @@ fn unpark<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::R
     renderer.outer_alt_active = child_alt;
     // Reality after restore; render_once re-hides on the next repaint if needed.
     renderer.cursor_visible = true;
+    // Re-assert the child's cursor shape on the next repaint: park reset the outer
+    // cursor to the default, so the watcher's mirrored state is stale.
+    renderer.parser.callbacks_mut().cursor_shape.rearm();
     Ok(())
 }
 
@@ -3085,16 +3103,30 @@ line two\r\n\
     /// raw-first-on-resume are one assertable sequence.
     mod suspend_cycle_tests {
         use super::super::{
-            dispatch, suspend_cycle, Flow, Renderer, ResizeCtl, SuspendOutcome,
+            dispatch, render_once, suspend_cycle, Flow, Renderer, ResizeCtl, SuspendOutcome,
         };
         use super::{left_renderer, NoopResizer, VirtualClock};
         use crate::msg::Msg;
+        use crate::pty::PtyResizer;
         use crate::suspend::mock::{MockSuspender, OrderLog};
         use crate::terminal::mock::{Call, MockTerminal};
         use crate::terminal::OuterTerminal;
         use portable_pty::ExitStatus;
         use std::cell::RefCell;
         use std::rc::Rc;
+
+        /// A recording resizer that captures the `(cols, rows)` the resume
+        /// resize-catch-up drives into the child PTY.
+        #[derive(Default)]
+        struct RecResizer {
+            calls: RefCell<Vec<(u16, u16)>>,
+        }
+        impl PtyResizer for RecResizer {
+            fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+                self.calls.borrow_mut().push((cols, rows));
+                Ok(())
+            }
+        }
 
         /// The lifecycle + suspend markers that carry the ordering; render-output
         /// noise (MoveTo/WriteRow/Flush/PlaceCursor/…) is filtered out.
@@ -3126,6 +3158,9 @@ line two\r\n\
         fn harness(kitty: bool) -> (OrderLog, MockTerminal, Renderer) {
             let log: OrderLog = Rc::new(RefCell::new(Vec::new()));
             let mut term = MockTerminal::with_log(log.clone());
+            // Report the renderer's own size so the resume resize-catch-up is a no-op
+            // unless a test deliberately flips it.
+            term.set_terminal_size(40, 10);
             term.enable_mouse().unwrap();
             if kitty {
                 term.push_keyboard_flags().unwrap();
@@ -3315,6 +3350,111 @@ line two\r\n\
             assert!(
                 !term.calls.contains(&Call::DisableRawMode),
                 "the terminal was never parked, so raw mode was never dropped"
+            );
+        }
+
+        /// Missed-resize catch-up: the outer terminal resized while gutter slept.
+        /// Step 7 re-sizes the child PTY (to the band width at the new row count)
+        /// BEFORE continue_child, so the child wakes to one SIGWINCH at the right
+        /// size.
+        #[test]
+        fn missed_resize_catch_up_before_continue() {
+            let (log, mut term, mut renderer) = harness(false);
+            renderer.ever_painted_inline = true;
+
+            // The shell resized the terminal to 50x12 while gutter was stopped.
+            let size = term.size_cell();
+            let suspender =
+                MockSuspender::new(log.clone()).on_suspend(move || size.set((50, 12)));
+            let resizer = RecResizer::default();
+            let mut clock = VirtualClock::new(vec![]);
+            let mut resize = ResizeCtl::inactive();
+            let mut pty: Vec<u8> = Vec::new();
+            let outcome = suspend_cycle(
+                &mut clock,
+                &mut renderer,
+                &mut resize,
+                &mut term,
+                &mut pty,
+                &resizer,
+                &suspender,
+            );
+            assert!(matches!(outcome, SuspendOutcome::Resumed));
+
+            // The PTY was resized once — to the band width W (40, unchanged for this
+            // absolute width) at the new 12 rows.
+            assert_eq!(*resizer.calls.borrow(), vec![(40, 12)]);
+            assert_eq!(renderer.real_cols, 50, "the new real width is picked up");
+            // And that resize ran before the child was continued.
+            let calls = log.borrow();
+            let first_clear = calls.iter().position(|c| matches!(c, Call::ClearGutter(..)));
+            let cont = calls.iter().position(|c| *c == Call::ContinueChild);
+            assert!(
+                first_clear < cont,
+                "the resize (TIOCSWINSZ + clear) runs before continue_child"
+            );
+        }
+
+        /// `ChildContinued` alone (external `kill -CONT`, or gutter's own SIGCONT on
+        /// a non-macOS box): a repaint hint only — it never self-stops, and it forces
+        /// the next frame to fully repaint.
+        #[test]
+        fn child_continued_forces_repaint_no_suspend() {
+            let mut renderer = left_renderer(40, 3, false);
+            let mut term = MockTerminal::new();
+            let mut pty: Vec<u8> = Vec::new();
+
+            // Paint "hi" and sync the baseline, so an unchanged frame would repaint
+            // nothing.
+            renderer.parser.process(b"hi");
+            render_once(&mut renderer, &mut term).unwrap();
+            term.calls.clear();
+
+            let flow = dispatch(
+                Msg::ChildContinued,
+                &mut renderer,
+                &mut pty,
+                &NoopResizer,
+                &mut term,
+            );
+            assert_eq!(flow, Flow::Continue, "a continue never suspends");
+
+            // The baseline was reset, so the next frame re-emits the row.
+            render_once(&mut renderer, &mut term).unwrap();
+            assert!(
+                term.calls.iter().any(|c| matches!(c, Call::WriteRow(_))),
+                "ChildContinued forces a full repaint next frame"
+            );
+        }
+
+        /// Cursor-shape rearm: park hands the shell a default cursor, and resume
+        /// re-asserts the child's last requested shape (the watcher's mirrored state
+        /// is stale after park).
+        #[test]
+        fn cursor_shape_reasserted_on_resume() {
+            let (log, mut term, mut renderer) = harness(false);
+            renderer.ever_painted_inline = true;
+
+            // Child requested a steady bar (CSI 6 SP q); mirror it once, then isolate.
+            renderer.parser.process(b"\x1b[6 q");
+            render_once(&mut renderer, &mut term).unwrap();
+            log.borrow_mut().clear();
+            term.calls.clear();
+
+            drive(&log, &mut term, &mut renderer);
+
+            let shapes: Vec<Vec<u8>> = term
+                .calls
+                .iter()
+                .filter_map(|c| match c {
+                    Call::SetCursorShape(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                shapes,
+                vec![b"\x1b[0 q".to_vec(), b"\x1b[6 q".to_vec()],
+                "park resets to the default cursor, resume re-asserts the child's shape"
             );
         }
     }
