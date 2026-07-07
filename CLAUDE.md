@@ -44,7 +44,7 @@ Integration tests drive a **real PTY** via `expectrl` and assert on what the out
 - **Thread 1 — PTY reader (`src/pty.rs`):** dumb byte pump. Reads the child's output in bounded chunks through a backpressure seam (`sync_channel(STAGING_DEPTH=64)`), forwards as `Msg::Pty`. Never writes the PTY, never scans bytes, stops on EOF.
 - **Thread 2 — render loop (`src/render.rs`):** owns the `vt100::Parser`, the outer terminal handle, and the PTY master writer — **exclusively, no mutex**. It is the only thread that writes output. Dispatches every message; runs the coalescing loop (see *Invariants to respect*).
 - **Thread 3 — input reader (`src/input.rs`):** owns crossterm's event source exclusively (crossterm 0.29 requires same-thread reads). Forwards each decoded `Event` as `Msg::Input`. Detached at spawn (`event::read()` is un-interruptible), reaped by `process::exit`.
-- **Thread 4 — waiter (`src/waiter.rs`):** blocks on `child.wait()`. This — not PTY EOF — is the authoritative shutdown trigger; it sends `Msg::ChildExited`.
+- **Thread 4 — waiter (`src/waiter.rs`):** on unix, loops on raw `waitpid(pid, …, WUNTRACED|WCONTINUED)`, surviving the child's stop/continue events and only ending the thread on real death. This — not PTY EOF — is the authoritative shutdown trigger; it sends `Msg::ChildExited` on death, and `Msg::ChildStopped`/`Msg::ChildContinued` on stop/continue (see *Invariants to respect*).
 
 **Channel topology:** the PTY path is throttled upstream (bounded `sync_channel`) but the merged channel is unbounded, so a keystroke `send()` never blocks under a multi-MB PTY flood. Because Thread 2 alone owns the parser, there is no shared mutable state and no parser mutex.
 
@@ -87,6 +87,8 @@ the one-liners below are the quick reference.
 - **Mouse: eager capture.** One enable at startup, one disable at teardown; a per-frame poll-diff gate translates and re-encodes SGR-1006. See [ADR-005](docs/adr/0005-mouse-eager-capture-poll-gate.md).
 - **Width.** `--width N` is absolute, `--width Npct`/`N%` proportional; the child is always told it owns `W` columns. See [ADR-011](docs/adr/0011-width-resolution.md).
 - **Outer screen mirrors the child.** Mirror the child's alt-screen on its edges; the band anchors at `base_row` and flows inline on the primary screen. See [ADR-012](docs/adr/0012-screen-mode-mirroring.md) and [ADR-013](docs/adr/0013-inline-anchor-scroll-paint.md).
+- **Child stop is detected via `waitpid(WUNTRACED)`, never a signal handler.** Raw mode strips `ISIG` on the outer tty and the child's SIGTSTP is scoped to its own session — gutter's process can never receive it directly. See [ADR-018](docs/adr/0018-stop-aware-waiter.md).
+- **Suspend/resume is straight-line code on the render thread.** Park the outer terminal (ADR-010 order) → `kill(0, SIGTSTP)` → the process freezes until `fg` → unpark (raw mode first) → continue the child's group. No SIGCONT handler. See [ADR-019](docs/adr/0019-suspend-resume-cycle-ordering.md).
 
 The full set (including the equivalence gate, clipboard fd, margin rule, channel
 topology, and row clipping) is indexed in [docs/adr/README.md](docs/adr/README.md).

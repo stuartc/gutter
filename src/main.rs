@@ -15,8 +15,9 @@
 //!   handle and the sole PTY-master writer; runs the coalescing loop and the
 //!   offset repaint.
 //! - Thread 3 (`input::run`)   — owns crossterm's event source exclusively.
-//! - Thread 4 (`waiter::run`)  — blocks on `child.wait()`, the authoritative
-//!   child-death signal.
+//! - Thread 4 (`waiter::run`)  — on unix, loops on raw `waitpid(WUNTRACED|
+//!   WCONTINUED)`, the authoritative child-state signal (exit AND stop/continue,
+//!   ADR-0018).
 
 mod callbacks;
 mod cli;
