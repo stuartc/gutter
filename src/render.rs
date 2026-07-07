@@ -412,27 +412,35 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     renderer.reset_prev_baseline();
 }
 
-/// A snapshot of the band's physical geometry, captured before a manual step so a
-/// future incremental design could diff against it. `repaint_margins`'s uniform
-/// clear re-derives the row span fresh from the CURRENT geometry on every call, so
-/// it never actually needs the prior snapshot — the field stays genuinely unread
-/// (hence `dead_code`), and `refresh_resize_overlay` keeps accepting it only so its
-/// two call sites (a manual step, a SIGWINCH-driven move while in mode) don't churn.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
+/// A snapshot of the band's physical geometry, captured before a geometry change so
+/// the vacated rail/readout cells can be blanked afterwards. Growing the band moves
+/// old rail columns (`prev margin - 1`, `prev band_end`) INSIDE the new band, where
+/// the uniform `clear_gutter` (new geometry) and `draw_rails` (new geometry) never
+/// reach them — and `render_once` skips blank rows, so the ghost glyphs would
+/// otherwise survive indefinitely. `refresh_resize_overlay` blanks exactly the cells
+/// this snapshot describes before repainting at the current geometry.
+#[derive(Debug, Clone)]
 pub(crate) struct BandGeom {
     pub left_margin: u16,
     pub width: u16,
     pub real_cols: u16,
     pub rows: u16,
+    /// Row span offset the rails/readout were drawn at: 0 on the alt screen,
+    /// `base_row` on the primary screen.
+    pub offset: u16,
+    /// The readout text as last drawn, so its exact span can be blanked.
+    pub readout: String,
 }
 impl BandGeom {
     pub(crate) fn of(r: &Renderer) -> Self {
+        let offset = if r.outer_alt_active { 0 } else { r.base_row };
         Self {
             left_margin: r.left_margin,
             width: r.width,
             real_cols: r.real_cols,
             rows: r.parser.screen().size().0,
+            offset,
+            readout: geometry::readout_text(r.width_config, r.width),
         }
     }
 }
@@ -447,17 +455,49 @@ pub(crate) fn enter_resize_overlay<T: OuterTerminal>(
     repaint_margins(renderer, term, true)
 }
 
-/// Refresh the overlay after a width change: uniformly clear the band's row span
-/// (ADR-0016, both screen modes) and redraw the rails + readout at the current
-/// geometry. `prev` is unused (see [`BandGeom`]) — the uniform clear needs no
-/// memory of the band's prior shape.
+/// Refresh the overlay after a width change: blank the vacated chrome from `prev`'s
+/// geometry (see [`BandGeom`]), then uniformly clear the band's row span (ADR-0016,
+/// both screen modes) and redraw the rails + readout at the current geometry.
 pub(crate) fn refresh_resize_overlay<T: OuterTerminal>(
     renderer: &Renderer,
     term: &mut T,
     prev: Option<BandGeom>,
 ) -> std::io::Result<()> {
-    let _ = prev;
+    if let Some(p) = &prev {
+        blank_vacated_chrome(term, p)?;
+    }
     repaint_margins(renderer, term, true)
+}
+
+/// Blank the rail + readout cells a previous frame painted at `prev`'s geometry.
+/// Only load-bearing on grow: the vacated rail columns land inside the new band,
+/// past the reach of both `clear_gutter` (new geometry) and `draw_rails` (new
+/// geometry). On shrink the old cells already fall in the new gutter, which
+/// `clear_gutter` blanks anyway, so this is a harmless double-clear there.
+fn blank_vacated_chrome<T: OuterTerminal>(term: &mut T, prev: &BandGeom) -> std::io::Result<()> {
+    let rails = geometry::rail_layout(
+        prev.real_cols,
+        prev.left_margin,
+        prev.width,
+        prev.offset,
+        prev.rows,
+        &prev.readout,
+    );
+    for row in rails.row_start..rails.row_end {
+        if let Some(c) = rails.left_col {
+            term.move_to(c, row)?;
+            term.write_row(b" ")?;
+        }
+        if let Some(c) = rails.right_col {
+            term.move_to(c, row)?;
+            term.write_row(b" ")?;
+        }
+    }
+    if let Some(r) = &rails.readout {
+        term.move_to(r.col, r.row)?;
+        term.write_row(" ".repeat(r.text.chars().count()).as_bytes())?;
+    }
+    Ok(())
 }
 
 /// Leave the visual mode: uniformly clear the band's row span, erasing the rails
@@ -582,11 +622,14 @@ where
         }
     }
     // A terminal resize (SIGWINCH) while in mode moved the band — repaint the
-    // overlay after handle_resize has updated the geometry.
+    // overlay after handle_resize has updated the geometry. Capture the geometry
+    // BEFORE dispatch mutates it, so a grow can blank the vacated rail columns
+    // handle_resize's own (rails-blind) clear left behind.
     let was_resize = matches!(m, Msg::Input(Event::Resize(..)));
+    let prev = (was_resize && resize.active()).then(|| BandGeom::of(renderer));
     let code = dispatch(m, renderer, pty_writer, resizer, term);
     if was_resize && resize.active() {
-        let _ = refresh_resize_overlay(renderer, term, None);
+        let _ = refresh_resize_overlay(renderer, term, prev);
     }
     code
 }
@@ -4241,5 +4284,37 @@ mod margins {
         repaint_margins(&r, &mut grid, false).unwrap();
         assert_eq!(grid.cell_contents(23, 78), " ", "readout must be blanked on exit");
         assert_eq!(grid.cell_contents(23, 79), " ", "readout must be blanked on exit");
+    }
+
+    /// Growing the band while in mode must not strand the old rail glyphs inside
+    /// the new band: a centred W=80 band in a 120-col terminal has rails at columns
+    /// 19/100; growing to W=82 moves the band to `[19, 101)`, so both old rail
+    /// columns land INSIDE the new band, past the reach of the new-geometry
+    /// `clear_gutter`/`draw_rails`. `refresh_resize_overlay` must blank them via the
+    /// `prev` snapshot.
+    #[test]
+    fn refresh_resize_overlay_grow_clears_stranded_rails() {
+        let mut r = renderer(80, 24, 120, Layout::Center, Width::Cols(80));
+        let mut grid = RecordingGrid::new(120, 24);
+
+        // Enter at W=80: margin 20, rails at 19 (left) and 100 (right).
+        repaint_margins(&r, &mut grid, true).unwrap();
+        assert_eq!(grid.cell_contents(0, 19), "\u{258f}");
+        assert_eq!(grid.cell_contents(0, 100), "\u{2595}");
+
+        // Grow to W=82: new margin 19, new band [19, 101). Both old rail columns
+        // are now inside the band.
+        let prev = BandGeom::of(&r);
+        r.width = 82;
+        r.width_config = Width::Cols(82);
+        r.left_margin = geometry::margin(r.layout, r.real_cols, r.width);
+
+        refresh_resize_overlay(&r, &mut grid, Some(prev)).unwrap();
+
+        assert_eq!(grid.cell_contents(0, 19), " ", "old left rail must not strand inside the new band");
+        assert_eq!(grid.cell_contents(0, 100), " ", "old right rail must not strand inside the new band");
+        // The new rails land at the new edges: margin - 1 = 18, band_end = 101.
+        assert_eq!(grid.cell_contents(0, 18), "\u{258f}", "new left rail");
+        assert_eq!(grid.cell_contents(0, 101), "\u{2595}", "new right rail");
     }
 }

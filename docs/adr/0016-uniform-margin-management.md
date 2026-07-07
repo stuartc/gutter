@@ -55,6 +55,16 @@ the current layout places a readout — a harmless double-clear when it sat in t
 gutter, and restored by the paired `reset_prev_baseline` repaint when it overlapped
 live child content.
 
+**The grow-strands-old-rails gap.** Growing the band while resize mode is active
+moves the old rail columns (`prev margin - 1`, `prev band_end`) INSIDE the new,
+wider band — past the reach of both the new-geometry `clear_gutter` and
+`draw_rails`, and `render_once` never repaints a blank child row, so the stale
+glyphs would otherwise survive indefinitely, even past mode exit. `refresh_resize_overlay`
+takes a `BandGeom` snapshot of the geometry as it stood before the change and
+blanks exactly the cells it describes (rail columns, readout span) before
+repainting at the current geometry — a harmless double-clear on shrink, where the
+old cells already fall in the new gutter.
+
 ## Consequences
 
 - `OuterTerminal::clear_gutter` gained two parameters (`row_start`, `row_end`); all
