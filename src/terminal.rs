@@ -348,6 +348,12 @@ pub mod mock {
         DisableMouse,
         ShowCursor,
         DisableRawMode,
+        /// `Suspender::suspend_self` — `kill(0, SIGTSTP)`. Recorded by the mock
+        /// suspender into the shared order log, so the suspend cycle's restore /
+        /// self-stop / re-setup ordering is one assertable sequence (ADR-0019).
+        SuspendSelf,
+        /// `Suspender::continue_child` — `kill(-pgid, SIGCONT)`.
+        ContinueChild,
     }
 
     /// Records the ordered sequence of [`OuterTerminal`] calls.
@@ -363,11 +369,25 @@ pub mod mock {
         /// Tracks whether [`OuterTerminal::enable_mouse`] was called, so the mock
         /// disables only when capture was enabled — mirroring the real rule.
         mouse_enabled: bool,
+        /// An optional shared order log the mock suspender also writes to, so the
+        /// suspend cycle's terminal calls and the SuspendSelf/ContinueChild markers
+        /// land in one interleaved sequence (ADR-0019). Every recorded call is
+        /// pushed here too when present.
+        log: Option<std::rc::Rc<std::cell::RefCell<Vec<Call>>>>,
     }
 
     impl MockTerminal {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// A mock sharing `log` with a `MockSuspender::new(log)`, so both mocks
+        /// record into one interleaved sequence.
+        pub fn with_log(log: std::rc::Rc<std::cell::RefCell<Vec<Call>>>) -> Self {
+            Self {
+                log: Some(log),
+                ..Self::default()
+            }
         }
 
         /// A mock that reports the outer terminal as kitty-capable.
@@ -376,6 +396,16 @@ pub mod mock {
                 supports_kitty: true,
                 ..Self::default()
             }
+        }
+
+        /// Record one call: into `calls`, and into the shared order log if one is
+        /// attached. The single choke point every `OuterTerminal` method funnels
+        /// through, so nothing bypasses the interleaved log.
+        fn record(&mut self, c: Call) {
+            if let Some(log) = &self.log {
+                log.borrow_mut().push(c.clone());
+            }
+            self.calls.push(c);
         }
 
         /// The restore subsequence only, for the ADR-010 order assertion —
@@ -617,37 +647,37 @@ pub mod mock {
 
     impl OuterTerminal for MockTerminal {
         fn enable_raw_mode(&mut self) -> io::Result<()> {
-            self.calls.push(Call::EnableRawMode);
+            self.record(Call::EnableRawMode);
             Ok(())
         }
         fn supports_keyboard_enhancement(&mut self) -> io::Result<bool> {
-            self.calls.push(Call::SupportsKeyboardEnhancement);
+            self.record(Call::SupportsKeyboardEnhancement);
             Ok(self.supports_kitty)
         }
         fn push_keyboard_flags(&mut self) -> io::Result<()> {
-            self.calls.push(Call::PushKeyboardFlags);
+            self.record(Call::PushKeyboardFlags);
             self.kitty_pushed = true;
             Ok(())
         }
         fn enable_mouse(&mut self) -> io::Result<()> {
-            self.calls.push(Call::EnableMouse);
+            self.record(Call::EnableMouse);
             self.mouse_enabled = true;
             Ok(())
         }
         fn enter_alt_screen(&mut self) -> io::Result<()> {
-            self.calls.push(Call::EnterAltScreen);
+            self.record(Call::EnterAltScreen);
             Ok(())
         }
         fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
-            self.calls.push(Call::MoveTo(col, row));
+            self.record(Call::MoveTo(col, row));
             Ok(())
         }
         fn write_row(&mut self, bytes: &[u8]) -> io::Result<()> {
-            self.calls.push(Call::WriteRow(bytes.to_vec()));
+            self.record(Call::WriteRow(bytes.to_vec()));
             Ok(())
         }
         fn newline(&mut self) -> io::Result<()> {
-            self.calls.push(Call::Newline);
+            self.record(Call::Newline);
             Ok(())
         }
         fn clear_gutter(
@@ -658,38 +688,37 @@ pub mod mock {
             row_start: u16,
             row_end: u16,
         ) -> io::Result<()> {
-            self.calls
-                .push(Call::ClearGutter(margin, width, real_cols, row_start, row_end));
+            self.record(Call::ClearGutter(margin, width, real_cols, row_start, row_end));
             Ok(())
         }
         fn draw_rails(&mut self, rails: &super::Rails) -> io::Result<()> {
-            self.calls.push(Call::DrawRails(rails.clone()));
+            self.record(Call::DrawRails(rails.clone()));
             Ok(())
         }
         fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {
-            self.calls.push(Call::PlaceCursor(col, row));
+            self.record(Call::PlaceCursor(col, row));
             Ok(())
         }
         fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
-            self.calls.push(Call::SetCursorVisible(visible));
+            self.record(Call::SetCursorVisible(visible));
             Ok(())
         }
         fn set_cursor_shape(&mut self, bytes: &[u8]) -> io::Result<()> {
-            self.calls.push(Call::SetCursorShape(bytes.to_vec()));
+            self.record(Call::SetCursorShape(bytes.to_vec()));
             Ok(())
         }
         fn flush(&mut self) -> io::Result<()> {
-            self.calls.push(Call::Flush);
+            self.record(Call::Flush);
             Ok(())
         }
         fn leave_alt_screen(&mut self) -> io::Result<()> {
-            self.calls.push(Call::LeaveAltScreen);
+            self.record(Call::LeaveAltScreen);
             Ok(())
         }
         fn pop_keyboard_flags(&mut self) -> io::Result<()> {
             // Mirror the real impl: only pop what was actually pushed.
             if self.kitty_pushed {
-                self.calls.push(Call::PopKeyboardFlags);
+                self.record(Call::PopKeyboardFlags);
                 self.kitty_pushed = false;
             }
             Ok(())
@@ -697,17 +726,17 @@ pub mod mock {
         fn disable_mouse(&mut self) -> io::Result<()> {
             // Mirror the real impl: only disable what was actually enabled.
             if self.mouse_enabled {
-                self.calls.push(Call::DisableMouse);
+                self.record(Call::DisableMouse);
                 self.mouse_enabled = false;
             }
             Ok(())
         }
         fn show_cursor(&mut self) -> io::Result<()> {
-            self.calls.push(Call::ShowCursor);
+            self.record(Call::ShowCursor);
             Ok(())
         }
         fn disable_raw_mode(&mut self) -> io::Result<()> {
-            self.calls.push(Call::DisableRawMode);
+            self.record(Call::DisableRawMode);
             Ok(())
         }
     }

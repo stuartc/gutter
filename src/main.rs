@@ -31,6 +31,7 @@ mod msg;
 mod pty;
 mod render;
 mod rowclip;
+mod suspend;
 mod terminal;
 mod waiter;
 
@@ -214,6 +215,10 @@ fn run() -> i32 {
     );
     renderer.set_resize_key(config.resize_key);
 
+    // The job-control seam for the suspend/resume cycle (ADR-0019): continues the
+    // child's group by pid on resume, stops gutter's own group on suspend.
+    let suspender = suspend::RealSuspender { child_pid };
+
     let mut clock = RealClock::new(merged_rx);
     let code = render::run(
         &mut clock,
@@ -221,6 +226,7 @@ fn run() -> i32 {
         &mut terminal,
         &mut pty_writer,
         &resizer,
+        &suspender,
     );
 
     // The render loop already ran the ordered restore before returning. A None
