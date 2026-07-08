@@ -53,7 +53,7 @@ positioning, scrollback — simply works.
 ### Prebuilt binary
 
 Grab the archive for your platform from the
-[v0.2.0 release](https://github.com/stuartc/gutter/releases/tag/v0.2.0) — Linux
+[latest release](https://github.com/stuartc/gutter/releases/latest) — Linux
 x86_64 and a universal macOS binary (Apple Silicon + Intel) are published, each
 with a SHA-256 checksum. Unpack it and drop `gutter` somewhere on your `$PATH`.
 
