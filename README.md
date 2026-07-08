@@ -53,7 +53,7 @@ positioning, scrollback — simply works.
 ### Prebuilt binary
 
 Grab the archive for your platform from the
-[latest release](https://github.com/stuartc/gutter/releases/latest) — Linux
+[v0.2.0 release](https://github.com/stuartc/gutter/releases/tag/v0.2.0) — Linux
 x86_64 and a universal macOS binary (Apple Silicon + Intel) are published, each
 with a SHA-256 checksum. Unpack it and drop `gutter` somewhere on your `$PATH`.
 
@@ -156,7 +156,7 @@ teardown ordering — see [`CLAUDE.md`](./CLAUDE.md).
 
 ## Status
 
-Early days (`0.1.0`). The core works and has been used to wrap Claude Code
+Early days (`0.2.0`). The core works and has been used to wrap Claude Code
 daily, but expect rough edges and a moving target.
 
 ## Licence
