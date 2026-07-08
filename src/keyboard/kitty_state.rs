@@ -30,6 +30,12 @@ impl KittyState {
         }
     }
 
+    /// Whether the outer terminal can source kitty. The resume path reads this to
+    /// re-push the enhancement flags without re-probing (ADR-0019).
+    pub fn outer_supports(&self) -> bool {
+        self.outer_supports
+    }
+
     /// The child's current level: top of the stack, or `Legacy` when empty. Read
     /// lock-free at encode time — state and parser both live on the render thread
     /// (ADR-003).

@@ -22,6 +22,8 @@ The decisions behind gutter's design. Code comments reference these by number
 | [015](0015-default-width.md) | Default width |
 | [016](0016-modal-resize.md) | Modal resize |
 | [017](0017-uniform-margin-management.md) | Uniform margin management |
+| [018](0018-stop-aware-waiter.md) | Stop-aware waiter (`waitpid` + `WUNTRACED`/`WCONTINUED`) |
+| [019](0019-suspend-resume-cycle-ordering.md) | Suspend/resume cycle ordering |
 
 ## Format
 

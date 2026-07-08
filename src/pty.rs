@@ -62,7 +62,9 @@ pub struct Pty {
     pub master: Box<dyn MasterPty + Send>,
     /// Read handle for Thread 1, the byte pump.
     pub reader: Box<dyn Read + Send>,
-    /// The child, handed to Thread 4 (the waiter) for `child.wait()`.
+    /// The child, handed to Thread 4 (the waiter), which loops on raw
+    /// `waitpid(WUNTRACED | WCONTINUED)` to observe stops/continues as well as exit
+    /// (ADR-018), rather than a plain `child.wait()`.
     pub child: Box<dyn Child + Send + Sync>,
 }
 

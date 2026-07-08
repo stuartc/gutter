@@ -15,8 +15,9 @@
 //!   handle and the sole PTY-master writer; runs the coalescing loop and the
 //!   offset repaint.
 //! - Thread 3 (`input::run`)   — owns crossterm's event source exclusively.
-//! - Thread 4 (`waiter::run`)  — blocks on `child.wait()`, the authoritative
-//!   child-death signal.
+//! - Thread 4 (`waiter::run`)  — on unix, loops on raw `waitpid(WUNTRACED|
+//!   WCONTINUED)`, the authoritative child-state signal (exit AND stop/continue,
+//!   ADR-0018).
 
 mod callbacks;
 mod cli;
@@ -31,6 +32,7 @@ mod msg;
 mod pty;
 mod render;
 mod rowclip;
+mod suspend;
 mod terminal;
 mod waiter;
 
@@ -115,10 +117,15 @@ fn run() -> i32 {
         thread::spawn(move || pty::forward_to_merge(staging_rx, merged_tx));
     }
 
-    // Thread 4: the waiter, the authoritative child-death signal.
+    // Capture the child's pid BEFORE moving it into the waiter: the waiter reaps by
+    // raw `waitpid` on unix (ADR-0018), and the suspender continues the child's group
+    // by pid (ADR-0019). `None` → the waiter falls back to legacy `child.wait()`.
+    let child_pid = child.process_id();
+
+    // Thread 4: the waiter, the authoritative child-state signal (exit AND stop).
     {
         let merged_tx = merged_tx.clone();
-        thread::spawn(move || waiter::run(child, merged_tx));
+        thread::spawn(move || waiter::run(child_pid, child, merged_tx));
     }
 
     // Outer terminal setup: raw mode, kitty probe, eager mouse capture. No forced
@@ -209,6 +216,10 @@ fn run() -> i32 {
     );
     renderer.set_resize_key(config.resize_key);
 
+    // The job-control seam for the suspend/resume cycle (ADR-0019): continues the
+    // child's group by pid on resume, stops gutter's own group on suspend.
+    let suspender = suspend::RealSuspender { child_pid };
+
     let mut clock = RealClock::new(merged_rx);
     let code = render::run(
         &mut clock,
@@ -216,6 +227,7 @@ fn run() -> i32 {
         &mut terminal,
         &mut pty_writer,
         &resizer,
+        &suspender,
     );
 
     // The render loop already ran the ordered restore before returning. A None

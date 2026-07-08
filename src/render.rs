@@ -23,6 +23,7 @@ use crate::mouse::{MouseDecision, MouseGate};
 use crate::msg::Msg;
 use crate::pty::PtyResizer;
 use crate::rowclip::clip_row_to_width_into;
+use crate::suspend::Suspender;
 use crate::terminal::OuterTerminal;
 
 /// The 60fps frame budget. One render per `FRAME` of wall (or virtual) time.
@@ -200,8 +201,20 @@ impl Renderer {
     }
 }
 
-/// Apply one message to the render state. Returns the child's exit code when the
-/// message is `ChildExited` (the loop then tears down and stops), else `None`.
+/// What one dispatched message tells the render loop to do next. Replaces the old
+/// `Option<i32>` return so a stopped child (`ChildStopped`) is distinct from an
+/// exited one: `Exit(code)` tears down, `Suspend` runs the suspend/resume cycle,
+/// `Continue` is the ordinary path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Exit(i32),
+    Suspend,
+}
+
+/// Apply one message to the render state, returning the [`Flow`] the loop should
+/// take. `ChildExited` → `Exit`; `ChildStopped` → `Suspend`; `ChildContinued`
+/// forces a full repaint and continues; everything else continues.
 ///
 /// The PTY writer is injected as a `Write` sink so the input-liveness test can
 /// assert "key bytes reached the PTY-master mock within one frame" against a
@@ -214,7 +227,7 @@ fn dispatch<P, R, T>(
     pty_writer: &mut P,
     resizer: &R,
     term: &mut T,
-) -> Option<i32>
+) -> Flow
 where
     P: Write,
     R: PtyResizer,
@@ -236,7 +249,7 @@ where
             // frame. Robust to a burst that turns the screen over in one frame, where
             // a grid-vs-grid diff sees no surviving overlap and would report zero.
             renderer.scroll_tracker.process(&bytes);
-            None
+            Flow::Continue
         }
         Msg::Input(crossterm::event::Event::Key(key)) => {
             // Re-encode at the child's current kitty level (ADR-002/003). The level
@@ -247,13 +260,13 @@ where
                 let _ = pty_writer.write_all(&bytes);
                 let _ = pty_writer.flush();
             }
-            None
+            Flow::Continue
         }
         Msg::Input(crossterm::event::Event::Resize(cols, rows)) => {
             // The resize handler (ADR-008/011) runs on THIS thread, the only parser
             // owner. Param-order trap: (cols, rows) here, set_size(rows, cols) inside.
             handle_resize(renderer, resizer, term, cols, rows);
-            None
+            Flow::Continue
         }
         Msg::Input(crossterm::event::Event::Mouse(ev)) => {
             // The mouse forwarding gate (ADR-005). Read the child's (mode, encoding)
@@ -282,16 +295,25 @@ where
                     );
                 }
             }
-            None
+            Flow::Continue
         }
         // Other input events (focus/paste) are swallowed here.
-        Msg::Input(_) => None,
-        Msg::ChildExited(status) => Some(status.exit_code() as i32),
+        Msg::Input(_) => Flow::Continue,
+        Msg::ChildExited(status) => Flow::Exit(status.exit_code() as i32),
+        // The child stopped (ADR-0018): drive the suspend/resume cycle. `sig` is
+        // carried for tests/logging; v1 reacts to every stop signal identically.
+        Msg::ChildStopped { .. } => Flow::Suspend,
+        // The child was continued out from under gutter (or by our own SIGCONT):
+        // force a full repaint. A hint only — never triggers suspend.
+        Msg::ChildContinued => {
+            renderer.reset_prev_baseline();
+            Flow::Continue
+        }
         // PTY path reached EOF — record it so the shutdown drain knows the child's
         // final bytes have all landed (ADR-013). Never triggers shutdown.
         Msg::PtyEof => {
             renderer.pty_eof_seen = true;
-            None
+            Flow::Continue
         }
     }
 }
@@ -584,7 +606,7 @@ fn apply_message<C, T, P, R>(
     term: &mut T,
     pty_writer: &mut P,
     resizer: &R,
-) -> Option<i32>
+) -> Flow
 where
     C: Clock<Msg = Msg>,
     T: OuterTerminal,
@@ -601,24 +623,24 @@ where
                 let now = clock.now();
                 resize.arm(clock.deadline(now, RESIZE_IDLE));
                 let _ = enter_resize_overlay(renderer, term);
-                return None; // consumed, no PTY
+                return Flow::Continue; // consumed, no PTY
             }
             KeyAction::Step(delta) => {
                 let now = clock.now();
                 resize.arm(clock.deadline(now, RESIZE_IDLE)); // a resize key = activity
                 apply_resize_step(renderer, resizer, term, delta);
-                return None;
+                return Flow::Continue;
             }
             KeyAction::Exit => {
                 resize.disarm();
                 let _ = clear_resize_overlay(renderer, term);
                 renderer.reset_prev_baseline();
-                return None;
+                return Flow::Continue;
             }
             KeyAction::Swallow => {
                 // Consumed but NOT counted as activity: a swallowed stray key must
                 // not keep the mode alive forever (PRD: idle = "no resize key").
-                return None;
+                return Flow::Continue;
             }
         }
     }
@@ -1024,18 +1046,20 @@ fn cell_is_live(cell: &vt100::Cell) -> bool {
 /// Returns the exit code to propagate. `None` means the channel disconnected
 /// without a `ChildExited` (the backstop path) — `main` treats that as a clean
 /// exit but it is not the normal shutdown route.
-pub fn run<C, T, P, R>(
+pub fn run<C, T, P, R, S>(
     clock: &mut C,
     renderer: &mut Renderer,
     term: &mut T,
     pty_writer: &mut P,
     resizer: &R,
+    suspender: &S,
 ) -> Option<i32>
 where
     C: Clock<Msg = Msg>,
     T: OuterTerminal,
     P: Write,
     R: PtyResizer,
+    S: Suspender,
 {
     let mut exit_code: Option<i32> = None;
     let mut resize = ResizeCtl::inactive();
@@ -1077,10 +1101,36 @@ where
             }
         };
         let mut shutdown = false;
-        if let Some(code) = apply_message(first, clock, renderer, &mut resize, term, pty_writer, resizer) {
-            exit_code = Some(code);
-            drain_pty_path(clock, renderer, pty_writer, resizer, term);
-            shutdown = true;
+        match apply_message(first, clock, renderer, &mut resize, term, pty_writer, resizer) {
+            Flow::Continue => {}
+            Flow::Exit(code) => {
+                exit_code = Some(code);
+                drain_pty_path(clock, renderer, pty_writer, resizer, term);
+                shutdown = true;
+            }
+            // The child stopped (ADR-0019): run the reversible park → self-stop →
+            // unpark → continue cycle. `continue 'frames` on resume so the next
+            // frame captures a fresh deadline — no stale pre-stop deadline survives
+            // the (arbitrarily long) suspension.
+            Flow::Suspend => {
+                match suspend_cycle(
+                    clock, renderer, &mut resize, term, pty_writer, resizer, suspender,
+                ) {
+                    SuspendOutcome::Resumed => continue 'frames,
+                    SuspendOutcome::ChildExited(code) => {
+                        // Aborted before park (child SIGKILLed right after stopping):
+                        // the terminal was never parked, so fall through to the one
+                        // normal teardown in run's tail. Drain the PTY path first, like
+                        // the Flow::Exit arms, so any trailing bytes still queued behind
+                        // the ChildExited land before teardown reads outer_alt_active
+                        // (ADR-013's teardown race); the child is dead, so PtyEof arrives
+                        // and the drain terminates promptly.
+                        exit_code = Some(code);
+                        drain_pty_path(clock, renderer, pty_writer, resizer, term);
+                        shutdown = true;
+                    }
+                }
+            }
         }
 
         let frame_start = clock.now();
@@ -1097,13 +1147,35 @@ where
                 }
                 match clock.recv_until(deadline) {
                     Recv::Msg(m) => {
-                        if let Some(code) =
-                            apply_message(m, clock, renderer, &mut resize, term, pty_writer, resizer)
-                        {
-                            exit_code = Some(code);
-                            drain_pty_path(clock, renderer, pty_writer, resizer, term);
-                            shutdown = true;
-                            break;
+                        match apply_message(
+                            m, clock, renderer, &mut resize, term, pty_writer, resizer,
+                        ) {
+                            Flow::Continue => {}
+                            Flow::Exit(code) => {
+                                exit_code = Some(code);
+                                drain_pty_path(clock, renderer, pty_writer, resizer, term);
+                                shutdown = true;
+                                break;
+                            }
+                            Flow::Suspend => {
+                                match suspend_cycle(
+                                    clock, renderer, &mut resize, term, pty_writer, resizer,
+                                    suspender,
+                                ) {
+                                    SuspendOutcome::Resumed => continue 'frames,
+                                    SuspendOutcome::ChildExited(code) => {
+                                        // Abort (as in Phase A): drain the PTY path so
+                                        // trailing bytes behind the ChildExited land
+                                        // before teardown (ADR-013).
+                                        exit_code = Some(code);
+                                        drain_pty_path(
+                                            clock, renderer, pty_writer, resizer, term,
+                                        );
+                                        shutdown = true;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                     Recv::Timeout => break, // idle-gap exit
@@ -1134,6 +1206,220 @@ where
     // renderer is read for the alt state and the inline anchor (ADR-012/013).
     let _ = run_teardown(renderer, term, exit_code.unwrap_or(0));
     exit_code
+}
+
+/// How the suspend/resume cycle ended.
+enum SuspendOutcome {
+    /// The shell `fg`'d gutter; the terminal is re-set-up and the band repainted.
+    Resumed,
+    /// The child died before gutter self-stopped (SIGKILL on the just-stopped
+    /// proc), caught in the pre-stop drain — the terminal was never parked, so
+    /// `run` tears down normally.
+    ChildExited(i32),
+}
+
+/// Quiet-gap and hard cap for the pre-stop drain (step 1). The child emitted its
+/// terminal-restore bytes *before* stopping, but nothing guarantees they beat
+/// `Msg::ChildStopped` through the two channels — and no `Msg::PtyEof` will ever
+/// come (the PTY is not at EOF, the child is merely stopped). So drain each queued
+/// message until a quiet gap or the cap.
+const SUSPEND_QUIET_GAP: Duration = Duration::from_millis(20);
+const SUSPEND_DRAIN_CAP: Duration = Duration::from_millis(100);
+
+/// The suspend/resume cycle (ADR-0019), run entirely on Thread 2 — still the sole
+/// owner of the parser, the outer terminal and the PTY writer, so the whole thing
+/// is lock-free straight-line code. Park the outer terminal to a sane state, stop
+/// gutter's own process group (`suspend_self` returns only once the shell `fg`s
+/// us), then unpark, wake the child, and repaint.
+#[allow(clippy::too_many_arguments)]
+fn suspend_cycle<C, T, P, R, S>(
+    clock: &mut C,
+    renderer: &mut Renderer,
+    resize: &mut ResizeCtl<C::Instant>,
+    term: &mut T,
+    pty_writer: &mut P,
+    resizer: &R,
+    suspender: &S,
+) -> SuspendOutcome
+where
+    C: Clock<Msg = Msg>,
+    T: OuterTerminal,
+    P: Write,
+    R: PtyResizer,
+    S: Suspender,
+{
+    // Step 0 — resize-mode teardown (same as run's shutdown tail).
+    if resize.active() {
+        resize.disarm();
+        let _ = clear_resize_overlay(renderer, term);
+        renderer.reset_prev_baseline();
+    }
+
+    // Step 1 — pre-stop drain: bounded quiet-gap drain of the child's terminal-
+    // restore bytes. Aborts to a normal shutdown if the child died right after
+    // stopping (before any park), so the terminal is never parked/double-restored.
+    let start = clock.now();
+    let cap = clock.deadline(start, SUSPEND_DRAIN_CAP);
+    loop {
+        let now = clock.now();
+        if now >= cap {
+            break;
+        }
+        let gap = clock.deadline(now, SUSPEND_QUIET_GAP);
+        let deadline = if gap < cap { gap } else { cap };
+        match clock.recv_until(deadline) {
+            Recv::Msg(m) => {
+                if let Flow::Exit(code) = dispatch(m, renderer, pty_writer, resizer, term) {
+                    return SuspendOutcome::ChildExited(code);
+                }
+                // Any other Flow (including a second Suspend) is ignored here.
+            }
+            Recv::Timeout | Recv::Disconnected => break,
+        }
+    }
+
+    // Step 2 — flush the drained state. The child's alt→primary edge (if it left the
+    // alt screen before stopping) fires here, keeping `outer_alt_active` truthful.
+    let _ = render_once(renderer, term);
+
+    // Step 3 — park (restore, ADR-010 order, minus the exit-status line).
+    let _ = park(renderer, term);
+
+    // Step 4 — stop gutter's own process group. THE WHOLE PROCESS STOPS HERE until
+    // the shell `fg`s it; all four threads freeze at this call site.
+    suspender.suspend_self();
+
+    // Step 5 — unpark (resume, inverse order, raw mode FIRST).
+    let _ = unpark(renderer, term);
+
+    // Step 6 — missed-resize catch-up. The outer terminal may have resized while
+    // gutter slept; run the full ADR-008 handler so the TIOCSWINSZ queues one
+    // SIGWINCH on the still-stopped child, delivered when it is continued in step 8
+    // — so the child wakes and repaints once at the right size, not twice. Runs
+    // before the base_row reseed so the reseed uses the post-resize row count.
+    if let Ok((cols, rows_now)) = term.terminal_size() {
+        let cur_rows = renderer.parser.screen().size().0;
+        if cols != renderer.real_cols || rows_now != cur_rows {
+            handle_resize(renderer, resizer, term, cols, rows_now);
+        }
+    }
+    let rows = renderer.parser.screen().size().0;
+
+    // Step 7 — inline anchor reseed (primary-screen children). The shell scrolled
+    // the screen while gutter slept, so base_row is meaningless and CPR is
+    // unavailable (the input thread owns the event source). Reseed at the bottom
+    // like a fresh launch; render_once's make-room scroll re-lays the band there.
+    let child_alt = renderer.parser.screen().alternate_screen();
+    if !child_alt {
+        renderer.base_row = rows.saturating_sub(1);
+    }
+
+    // Step 8 — wake the child, AFTER the outer terminal is fully re-set-up, so its
+    // post-cont repaint bytes land on a raw-mode, correct-screen terminal.
+    suspender.continue_child();
+
+    // Step 9 — full repaint, then clear the gutter columns: the band's rows may carry
+    // shell text from the suspension in the gutter strip. A gutters-only clear (not
+    // repaint_margins) is deliberate: repaint_margins(.., false) also blanks the width
+    // readout's in-band fallback span as a resize-mode "exit clear", which here — after
+    // the render_once above already synced `prev` — would erase band cells with no
+    // paired repaint to restore them (e.g. `--width full`, where the readout falls
+    // inside the band). Step 0 already cleared any live overlay, so there is no readout
+    // to clear anyway. The clear runs after render_once so it reads the base_row that
+    // render_once's make-room scroll settled on. Flush explicitly: on resume the loop
+    // blocks on recv(), so a child that emits nothing would otherwise leave these
+    // gutter-cleanup bytes unflushed indefinitely.
+    renderer.reset_prev_baseline();
+    let _ = render_once(renderer, term);
+    let offset = if renderer.outer_alt_active { 0 } else { renderer.base_row };
+    let _ = term.clear_gutter(
+        renderer.left_margin,
+        renderer.width,
+        renderer.real_cols,
+        offset,
+        rows,
+    );
+    let _ = term.flush();
+
+    SuspendOutcome::Resumed
+}
+
+/// Park the outer terminal (ADR-0019 step 3): leave alt (or hand the shell a fresh
+/// line below the inline band), reset attributes and cursor shape, pop kitty,
+/// disable mouse, show the cursor, and drop raw mode LAST — then flush so it all
+/// lands before the self-stop. Deliberately does NOT clear `outer_alt_active`: it
+/// stays as "the child's screen is alt" for the resume re-derivation (the
+/// double-meaning note in ADR-0019).
+fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
+    // Best-effort per step (ADR-010's "restore by hand, each step conditional"):
+    // attempt EVERY restore step even if an earlier one errors, so an early failure
+    // (e.g. a flush inside leave_alt_screen) can't short-circuit the rest and strand
+    // the shell in raw mode / mouse / kitty. disable_raw_mode in particular MUST run
+    // before the self-stop. The first error is remembered and returned for logging.
+    let mut first_err: std::io::Result<()> = Ok(());
+    let mut record = |r: std::io::Result<()>| {
+        if let Err(e) = r {
+            if first_err.is_ok() {
+                first_err = Err(e);
+            }
+        }
+    };
+
+    if renderer.outer_alt_active {
+        record(term.leave_alt_screen());
+    } else if renderer.ever_painted_inline {
+        // Same hand-back as run_teardown's exit-0 path: a fresh line below the band.
+        record(hand_back_inline(renderer, term, 0));
+    }
+    record(term.write_row(b"\x1b[0m")); // drop any leftover attribute run
+    record(term.set_cursor_shape(b"\x1b[0 q")); // hand the shell a default cursor shape
+    record(term.pop_keyboard_flags()); // conditional on kitty_pushed
+    record(term.disable_mouse()); // conditional on mouse_enabled
+    record(term.show_cursor());
+    renderer.cursor_visible = true;
+    record(term.disable_raw_mode()); // LAST (ADR-010) — must run even after an error
+    record(term.flush()); // the park bytes must land before the self-stop
+    first_err
+}
+
+/// Unpark the outer terminal (ADR-0019 step 5): re-take it after the self-stop
+/// returns, in inverse order — raw mode FIRST, shrinking the cooked-mode window the
+/// already-running input thread could read canonical input in. No kitty re-probe: a
+/// `CSI ? u` round-trip would be eaten by Thread 3, which now owns crossterm's event
+/// source, so re-push from the stored startup capability instead.
+fn unpark<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
+    retry_enable_raw(term)?;
+    if renderer.parser.callbacks().kitty_state.outer_supports() {
+        let _ = term.push_keyboard_flags();
+    }
+    term.enable_mouse()?;
+    let child_alt = renderer.parser.screen().alternate_screen();
+    if child_alt {
+        term.enter_alt_screen()?;
+    }
+    // Re-derive the outer alt state from the parser (the double meaning resolves
+    // here — see ADR-0019).
+    renderer.outer_alt_active = child_alt;
+    // Reality after restore; render_once re-hides on the next repaint if needed.
+    renderer.cursor_visible = true;
+    // Re-assert the child's cursor shape on the next repaint: park reset the outer
+    // cursor to the default, so the watcher's mirrored state is stale.
+    renderer.parser.callbacks_mut().cursor_shape.rearm();
+    Ok(())
+}
+
+/// Re-enter raw mode on resume, retrying a bounded number of times on `EINTR`: the
+/// `tcsetattr` inside `enable_raw_mode` can be interrupted by the SIGCONT that woke
+/// gutter (open question #3, ADR-0019).
+fn retry_enable_raw<T: OuterTerminal>(term: &mut T) -> std::io::Result<()> {
+    for _ in 0..4 {
+        match term.enable_raw_mode() {
+            Ok(()) => return Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    term.enable_raw_mode()
 }
 
 /// On a child-exit shutdown, give the PTY path a bounded chance to deliver its final
@@ -1249,6 +1535,7 @@ fn write_exit_status<T: OuterTerminal>(term: &mut T, exit_code: i32) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::suspend::mock::MockSuspender;
     use crate::terminal::mock::{Call, MockTerminal};
     use portable_pty::ExitStatus;
 
@@ -1355,7 +1642,8 @@ mod tests {
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         let resizer = NoopResizer;
-        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &resizer);
+        let suspender = MockSuspender::disconnected();
+        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &resizer, &suspender);
         let flushes = term.calls.iter().filter(|c| **c == Call::Flush).count();
         (flushes, term, pty, renderer, code)
     }
@@ -1439,7 +1727,7 @@ mod tests {
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
 
-        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         let flushes = term.calls.iter().filter(|c| **c == Call::Flush).count();
         assert_eq!(flushes, 0, "an idle loop must render ZERO times");
@@ -1481,7 +1769,7 @@ mod tests {
         let mut renderer = left_renderer(80, 24, false);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
-        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         // Enter → \r reaches the PTY writer.
         assert_eq!(pty, b"\r", "the mid-burst keystroke must reach the PTY master");
@@ -1513,7 +1801,7 @@ mod tests {
         term.enable_mouse().unwrap();
         let mut pty: Vec<u8> = Vec::new();
 
-        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         assert_eq!(code, Some(42), "exit code must equal status.exit_code()");
         // EnableMouse fired exactly once at startup (acceptance criterion).
@@ -1589,7 +1877,7 @@ mod tests {
         term.enable_mouse().unwrap();
         let mut pty: Vec<u8> = Vec::new();
 
-        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         assert_eq!(code, Some(0));
         assert_eq!(
@@ -1650,7 +1938,7 @@ mod tests {
         term.enable_mouse().unwrap();
         let mut pty: Vec<u8> = Vec::new();
 
-        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         assert_eq!(code, Some(7), "the child's exit code still propagates");
         assert!(
@@ -1684,7 +1972,7 @@ mod tests {
         term.push_keyboard_flags().unwrap();
         let mut pty: Vec<u8> = Vec::new();
 
-        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         assert_eq!(code, Some(0), "teardown completes and returns the exit code");
         assert!(
@@ -1714,7 +2002,7 @@ mod tests {
         term.push_keyboard_flags().unwrap();
         let mut pty: Vec<u8> = Vec::new();
 
-        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         assert_eq!(code, Some(0), "the child's exit code propagates");
         assert!(renderer.pty_eof_seen, "the early PtyEof was recorded");
@@ -1991,7 +2279,7 @@ mod tests {
         let mut renderer = left_renderer(20, 5, false);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
-        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         // The child's cursor after "gamma" (no trailing newline) is on row 2.
         let (crow, _ccol) = renderer.screen().cursor_position();
@@ -2034,7 +2322,7 @@ mod tests {
         renderer.base_row = 5;
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
-        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         let primary_row_start = term.calls.iter().find_map(|c| {
             if let Call::ClearGutter(_, _, _, row_start, _) = c { Some(*row_start) } else { None }
@@ -2057,7 +2345,7 @@ mod tests {
         let mut renderer = left_renderer(20, 24, false);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
-        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         let alt_row_start = term.calls.iter().find_map(|c| {
             if let Call::ClearGutter(_, _, _, row_start, _) = c { Some(*row_start) } else { None }
@@ -2098,7 +2386,7 @@ mod tests {
         let mut renderer = left_renderer(80, 24, true);
         let mut term = MockTerminal::kitty_capable();
         let mut pty: Vec<u8> = Vec::new();
-        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         assert_eq!(
             pty, b"\x1b[13u\x1b[13;2u",
@@ -2130,7 +2418,7 @@ mod tests {
         let mut renderer = left_renderer(80, 24, false);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
-        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         assert_eq!(
             pty, b"\r\r",
@@ -2192,7 +2480,7 @@ mod tests {
         let mut renderer = Renderer::at_margin(width, 24, margin);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
-        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
         pty
     }
 
@@ -2392,7 +2680,7 @@ mod tests {
         let mut renderer = Renderer::at_margin(20, 5, 7); // margin 7
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
-        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         let first_move = term.calls.iter().find_map(|c| {
             if let Call::MoveTo(col, row) = c { Some((*col, *row)) } else { None }
@@ -2498,7 +2786,7 @@ line two\r\n\
         let mut renderer = left_renderer(width, 5, false);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
-        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer);
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
         for call in &term.calls {
             match call {
@@ -2636,7 +2924,7 @@ line two\r\n\
                 }
             }
 
-            fn send(&mut self, ev: KeyEvent) -> Option<i32> {
+            fn send(&mut self, ev: KeyEvent) -> Flow {
                 apply_message(
                     Msg::Input(Event::Key(ev)),
                     &mut self.clock,
@@ -2669,7 +2957,8 @@ line two\r\n\
             let mut term = MockTerminal::new();
             let mut pty: Vec<u8> = Vec::new();
             let resizer = RecResizer::default();
-            let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &resizer);
+            let suspender = MockSuspender::disconnected();
+            let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &resizer, &suspender);
             (pty, renderer, code, resizer, term)
         }
 
@@ -2831,6 +3120,433 @@ line two\r\n\
             assert_eq!(renderer.width, 81, "the in-mode step before idle-exit applied");
             assert_eq!(*resizer.calls.borrow(), vec![(81, 24)], "exactly one resize, from the step");
             assert_eq!(pty, b"l", "the delayed key after idle-exit passes through to the child");
+        }
+    }
+
+    /// The suspend/resume cycle (ADR-0019): park → self-stop → unpark →
+    /// continue-child ordering, driven against a `MockTerminal` and `MockSuspender`
+    /// that share one interleaved order log, so restore-before-self-stop and
+    /// raw-first-on-resume are one assertable sequence.
+    mod suspend_cycle_tests {
+        use super::super::{
+            dispatch, render_once, run, suspend_cycle, Flow, Renderer, ResizeCtl, SuspendOutcome,
+        };
+        use super::{left_renderer, NoopResizer, VirtualClock};
+        use crate::msg::Msg;
+        use crate::pty::PtyResizer;
+        use crate::suspend::mock::{MockSuspender, OrderLog};
+        use crate::terminal::mock::{Call, MockTerminal};
+        use crate::terminal::OuterTerminal;
+        use portable_pty::ExitStatus;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        /// A recording resizer that captures the `(cols, rows)` the resume
+        /// resize-catch-up drives into the child PTY.
+        #[derive(Default)]
+        struct RecResizer {
+            calls: RefCell<Vec<(u16, u16)>>,
+        }
+        impl PtyResizer for RecResizer {
+            fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+                self.calls.borrow_mut().push((cols, rows));
+                Ok(())
+            }
+        }
+
+        /// The lifecycle + suspend markers that carry the ordering; render-output
+        /// noise (MoveTo/WriteRow/Flush/PlaceCursor/…) is filtered out.
+        fn significant(log: &[Call]) -> Vec<Call> {
+            log.iter()
+                .filter(|c| {
+                    matches!(
+                        c,
+                        Call::EnterAltScreen
+                            | Call::LeaveAltScreen
+                            | Call::PushKeyboardFlags
+                            | Call::PopKeyboardFlags
+                            | Call::EnableMouse
+                            | Call::DisableMouse
+                            | Call::EnableRawMode
+                            | Call::DisableRawMode
+                            | Call::ShowCursor
+                            | Call::SuspendSelf
+                            | Call::ContinueChild
+                    )
+                })
+                .cloned()
+                .collect()
+        }
+
+        /// Build a shared-log terminal + renderer, simulate main.rs's eager setup
+        /// (mouse capture, and kitty flags when capable) so park has something to
+        /// pop/disable, then clear the log so only the cycle is recorded.
+        fn harness(kitty: bool) -> (OrderLog, MockTerminal, Renderer) {
+            let log: OrderLog = Rc::new(RefCell::new(Vec::new()));
+            let mut term = MockTerminal::with_log(log.clone());
+            // Report the renderer's own size so the resume resize-catch-up is a no-op
+            // unless a test deliberately flips it.
+            term.set_terminal_size(40, 10);
+            term.enable_mouse().unwrap();
+            if kitty {
+                term.push_keyboard_flags().unwrap();
+            }
+            let renderer = left_renderer(40, 10, kitty);
+            log.borrow_mut().clear();
+            term.calls.clear();
+            (log, term, renderer)
+        }
+
+        fn drive(
+            log: &OrderLog,
+            term: &mut MockTerminal,
+            renderer: &mut Renderer,
+        ) -> SuspendOutcome {
+            let mut clock = VirtualClock::new(vec![]);
+            let mut resize = ResizeCtl::inactive();
+            let mut pty: Vec<u8> = Vec::new();
+            let suspender = MockSuspender::new(log.clone());
+            suspend_cycle(
+                &mut clock,
+                renderer,
+                &mut resize,
+                term,
+                &mut pty,
+                &NoopResizer,
+                &suspender,
+            )
+        }
+
+        /// `dispatch(ChildStopped)` maps to `Flow::Suspend`.
+        #[test]
+        fn child_stopped_dispatches_to_suspend() {
+            let mut renderer = left_renderer(40, 10, false);
+            let mut term = MockTerminal::new();
+            let mut pty: Vec<u8> = Vec::new();
+            let flow = dispatch(
+                Msg::ChildStopped { sig: 18 },
+                &mut renderer,
+                &mut pty,
+                &NoopResizer,
+                &mut term,
+            );
+            assert_eq!(flow, Flow::Suspend);
+        }
+
+        /// Child in the alt screen: outer leaves alt at park and re-enters at resume,
+        /// with the full restore-before-self-stop / raw-first-on-resume ordering.
+        #[test]
+        fn ordering_child_in_alt() {
+            let (log, mut term, mut renderer) = harness(true);
+            // Child (and outer) already in the alt screen — no step-2 enter edge.
+            renderer.parser.process(b"\x1b[?1049h");
+            renderer.outer_alt_active = true;
+
+            let outcome = drive(&log, &mut term, &mut renderer);
+            assert!(matches!(outcome, SuspendOutcome::Resumed));
+
+            assert_eq!(
+                significant(&log.borrow()),
+                vec![
+                    Call::LeaveAltScreen,
+                    Call::PopKeyboardFlags,
+                    Call::DisableMouse,
+                    Call::ShowCursor,
+                    Call::DisableRawMode,
+                    Call::SuspendSelf,
+                    Call::EnableRawMode,
+                    Call::PushKeyboardFlags,
+                    Call::EnableMouse,
+                    Call::EnterAltScreen,
+                    Call::ContinueChild,
+                ]
+            );
+        }
+
+        /// Primary/inline child: no alt enter/leave; a Newline hand-back parks the
+        /// shell below the band; base_row reseeds to the bottom; continue after
+        /// re-setup.
+        #[test]
+        fn ordering_primary_inline() {
+            let (log, mut term, mut renderer) = harness(true);
+            renderer.ever_painted_inline = true;
+
+            let outcome = drive(&log, &mut term, &mut renderer);
+            assert!(matches!(outcome, SuspendOutcome::Resumed));
+
+            assert_eq!(
+                significant(&log.borrow()),
+                vec![
+                    Call::PopKeyboardFlags,
+                    Call::DisableMouse,
+                    Call::ShowCursor,
+                    Call::DisableRawMode,
+                    Call::SuspendSelf,
+                    Call::EnableRawMode,
+                    Call::PushKeyboardFlags,
+                    Call::EnableMouse,
+                    Call::ContinueChild,
+                ],
+                "no alt enter/leave on the primary screen"
+            );
+            assert!(
+                term.calls.contains(&Call::Newline),
+                "the inline hand-back drops the shell a fresh line below the band"
+            );
+            assert_eq!(
+                renderer.base_row, 9,
+                "base_row reseeds to the bottom row (rows - 1) on resume"
+            );
+        }
+
+        /// Non-kitty outer terminal: no keyboard-flag push/pop anywhere in the cycle.
+        #[test]
+        fn ordering_non_kitty_skips_keyboard_flags() {
+            let (log, mut term, mut renderer) = harness(false);
+            renderer.ever_painted_inline = true;
+
+            drive(&log, &mut term, &mut renderer);
+
+            let sig = significant(&log.borrow());
+            assert!(
+                !sig.contains(&Call::PushKeyboardFlags) && !sig.contains(&Call::PopKeyboardFlags),
+                "a non-kitty outer terminal never pushes/pops keyboard flags: {sig:?}"
+            );
+        }
+
+        /// Suspend while resize mode is active: the overlay is cleared (step 0)
+        /// before the terminal is parked, and the mode is left.
+        #[test]
+        fn resize_mode_overlay_cleared_before_park() {
+            let (log, mut term, mut renderer) = harness(false);
+            renderer.ever_painted_inline = true;
+
+            let mut clock = VirtualClock::new(vec![]);
+            let mut resize = ResizeCtl::inactive();
+            resize.arm(1_000); // in resize mode
+            let mut pty: Vec<u8> = Vec::new();
+            let suspender = MockSuspender::new(log.clone());
+            suspend_cycle(
+                &mut clock,
+                &mut renderer,
+                &mut resize,
+                &mut term,
+                &mut pty,
+                &NoopResizer,
+                &suspender,
+            );
+
+            assert!(!resize.active(), "resize mode is left before parking");
+            let calls = log.borrow();
+            let clear_idx = calls
+                .iter()
+                .position(|c| matches!(c, Call::ClearGutter(..)))
+                .expect("the overlay clear ran");
+            let stop_idx = calls
+                .iter()
+                .position(|c| *c == Call::SuspendSelf)
+                .expect("the cycle self-stopped");
+            assert!(clear_idx < stop_idx, "the overlay is cleared before the self-stop");
+        }
+
+        /// Abort: the child is SIGKILLed right after stopping, surfacing as a
+        /// `ChildExited` in the pre-stop drain. The cycle returns `ChildExited`
+        /// without ever self-stopping or parking the terminal (no double restore).
+        #[test]
+        fn abort_when_child_dies_in_drain() {
+            let (log, mut term, mut renderer) = harness(false);
+            renderer.ever_painted_inline = true;
+
+            let mut clock =
+                VirtualClock::new(vec![(0, Msg::ChildExited(ExitStatus::with_exit_code(7)))]);
+            let mut resize = ResizeCtl::inactive();
+            let mut pty: Vec<u8> = Vec::new();
+            let suspender = MockSuspender::new(log.clone());
+            let outcome = suspend_cycle(
+                &mut clock,
+                &mut renderer,
+                &mut resize,
+                &mut term,
+                &mut pty,
+                &NoopResizer,
+                &suspender,
+            );
+
+            assert!(matches!(outcome, SuspendOutcome::ChildExited(7)));
+            let calls = log.borrow();
+            assert!(
+                !calls.contains(&Call::SuspendSelf),
+                "the abort must never self-stop"
+            );
+            assert!(
+                !term.calls.contains(&Call::DisableRawMode),
+                "the terminal was never parked, so raw mode was never dropped"
+            );
+        }
+
+        /// Missed-resize catch-up: the outer terminal resized while gutter slept.
+        /// Step 6 re-sizes the child PTY (to the band width at the new row count)
+        /// BEFORE continue_child, so the child wakes to one SIGWINCH at the right
+        /// size.
+        #[test]
+        fn missed_resize_catch_up_before_continue() {
+            let (log, mut term, mut renderer) = harness(false);
+            renderer.ever_painted_inline = true;
+
+            // The shell resized the terminal to 50x12 while gutter was stopped.
+            let size = term.size_cell();
+            let suspender =
+                MockSuspender::new(log.clone()).on_suspend(move || size.set((50, 12)));
+            let resizer = RecResizer::default();
+            let mut clock = VirtualClock::new(vec![]);
+            let mut resize = ResizeCtl::inactive();
+            let mut pty: Vec<u8> = Vec::new();
+            let outcome = suspend_cycle(
+                &mut clock,
+                &mut renderer,
+                &mut resize,
+                &mut term,
+                &mut pty,
+                &resizer,
+                &suspender,
+            );
+            assert!(matches!(outcome, SuspendOutcome::Resumed));
+
+            // The PTY was resized once — to the band width W (40, unchanged for this
+            // absolute width) at the new 12 rows.
+            assert_eq!(*resizer.calls.borrow(), vec![(40, 12)]);
+            assert_eq!(renderer.real_cols, 50, "the new real width is picked up");
+            // And that resize ran before the child was continued.
+            let calls = log.borrow();
+            let first_clear = calls
+                .iter()
+                .position(|c| matches!(c, Call::ClearGutter(..)))
+                .expect("the resize cleared the gutter");
+            let cont = calls
+                .iter()
+                .position(|c| *c == Call::ContinueChild)
+                .expect("the child was continued");
+            assert!(
+                first_clear < cont,
+                "the resize (TIOCSWINSZ + clear) runs before continue_child"
+            );
+        }
+
+        /// `ChildContinued` alone (external `kill -CONT`, or gutter's own SIGCONT on
+        /// a non-macOS box): a repaint hint only — it never self-stops, and it forces
+        /// the next frame to fully repaint.
+        #[test]
+        fn child_continued_forces_repaint_no_suspend() {
+            let mut renderer = left_renderer(40, 3, false);
+            let mut term = MockTerminal::new();
+            let mut pty: Vec<u8> = Vec::new();
+
+            // Paint "hi" and sync the baseline, so an unchanged frame would repaint
+            // nothing.
+            renderer.parser.process(b"hi");
+            render_once(&mut renderer, &mut term).unwrap();
+            term.calls.clear();
+
+            let flow = dispatch(
+                Msg::ChildContinued,
+                &mut renderer,
+                &mut pty,
+                &NoopResizer,
+                &mut term,
+            );
+            assert_eq!(flow, Flow::Continue, "a continue never suspends");
+
+            // The baseline was reset, so the next frame re-emits the row.
+            render_once(&mut renderer, &mut term).unwrap();
+            assert!(
+                term.calls.iter().any(|c| matches!(c, Call::WriteRow(_))),
+                "ChildContinued forces a full repaint next frame"
+            );
+        }
+
+        /// Cursor-shape rearm: park hands the shell a default cursor, and resume
+        /// re-asserts the child's last requested shape (the watcher's mirrored state
+        /// is stale after park).
+        #[test]
+        fn cursor_shape_reasserted_on_resume() {
+            let (log, mut term, mut renderer) = harness(false);
+            renderer.ever_painted_inline = true;
+
+            // Child requested a steady bar (CSI 6 SP q); mirror it once, then isolate.
+            renderer.parser.process(b"\x1b[6 q");
+            render_once(&mut renderer, &mut term).unwrap();
+            log.borrow_mut().clear();
+            term.calls.clear();
+
+            drive(&log, &mut term, &mut renderer);
+
+            let shapes: Vec<Vec<u8>> = term
+                .calls
+                .iter()
+                .filter_map(|c| match c {
+                    Call::SetCursorShape(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                shapes,
+                vec![b"\x1b[0 q".to_vec(), b"\x1b[6 q".to_vec()],
+                "park resets to the default cursor, resume re-asserts the child's shape"
+            );
+        }
+
+        /// End-to-end through `run` (not `suspend_cycle` directly): a scripted
+        /// `ChildStopped` drives the whole cycle (SuspendSelf + ContinueChild fire),
+        /// and a `Pty` message queued behind it — arriving 150ms later, past the 100ms
+        /// pre-stop drain cap — is processed on the frame after resume, proving the
+        /// `continue 'frames` path. Then the child exits cleanly and the code
+        /// propagates.
+        #[test]
+        fn run_drives_suspend_cycle_then_processes_queued_message() {
+            let log: OrderLog = Rc::new(RefCell::new(Vec::new()));
+            let mut term = MockTerminal::with_log(log.clone());
+            // Match the renderer's size so the resume resize-catch-up is a no-op.
+            term.set_terminal_size(40, 10);
+            let mut renderer = left_renderer(40, 10, false);
+            let mut pty: Vec<u8> = Vec::new();
+            let suspender = MockSuspender::new(log.clone());
+
+            let mut clock = VirtualClock::new(vec![
+                (0, Msg::ChildStopped { sig: 18 }),
+                // Beyond SUSPEND_DRAIN_CAP (100ms): delivered post-resume, not in the drain.
+                (150, Msg::Pty(b"hello".to_vec())),
+                (0, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+            ]);
+
+            let code = run(
+                &mut clock,
+                &mut renderer,
+                &mut term,
+                &mut pty,
+                &NoopResizer,
+                &suspender,
+            );
+
+            // The cycle ran end to end.
+            let calls = log.borrow();
+            assert!(
+                calls.contains(&Call::SuspendSelf),
+                "the suspend cycle self-stopped"
+            );
+            assert!(
+                calls.contains(&Call::ContinueChild),
+                "the child was continued on resume"
+            );
+            drop(calls);
+
+            // The queued Pty was processed after resume: its bytes reached the grid.
+            let row0 = renderer.screen().rows(0, 40).next().unwrap();
+            assert!(
+                row0.starts_with("hello"),
+                "the post-resume Pty painted into the grid: {row0:?}"
+            );
+
+            assert_eq!(code, Some(0), "the child's clean exit propagated");
         }
     }
 }
@@ -3493,6 +4209,7 @@ mod primary_scroll {
             );
         }
     }
+
 }
 
 /// Inline primary-screen anchor (ADR-013): the `base_row` offset paint, the per-frame

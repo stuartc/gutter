@@ -48,6 +48,16 @@ impl CursorShape {
         self.requested = Some(ps);
     }
 
+    /// Forget what was last mirrored, so the next [`take_pending`] re-emits the
+    /// child's last requested shape even though it did not change. Used on resume
+    /// (ADR-0019): park reset the outer terminal's cursor to the default, so the
+    /// mirrored state is stale and the child's shape must be re-asserted.
+    ///
+    /// [`take_pending`]: CursorShape::take_pending
+    pub fn rearm(&mut self) {
+        self.mirrored = None;
+    }
+
     /// Returns the `CSI Ps SP q` bytes to emit when the requested shape differs
     /// from what was last mirrored, marking it mirrored. `None` when there's
     /// nothing new (no request yet, or unchanged), so the render loop emits a
@@ -94,6 +104,35 @@ mod tests {
         // Child changes to steady underline (Ps = 4).
         s.apply_csi(&[&[4]]);
         assert_eq!(s.take_pending(), Some(b"\x1b[4 q".to_vec()));
+    }
+
+    #[test]
+    fn rearm_re_emits_last_shape_after_a_reset() {
+        let mut s = CursorShape::new();
+        s.apply_csi(&[&[6]]);
+        assert_eq!(s.take_pending(), Some(b"\x1b[6 q".to_vec()));
+        // Nothing changed → nothing to emit.
+        assert_eq!(s.take_pending(), None);
+        // Park reset the outer cursor to default; rearm makes resume re-assert it.
+        s.rearm();
+        assert_eq!(
+            s.take_pending(),
+            Some(b"\x1b[6 q".to_vec()),
+            "rearm re-emits the child's last shape even though it did not change"
+        );
+        // And it is one-shot again.
+        assert_eq!(s.take_pending(), None);
+    }
+
+    #[test]
+    fn rearm_with_no_request_is_a_noop() {
+        let mut s = CursorShape::new();
+        s.rearm();
+        assert_eq!(
+            s.take_pending(),
+            None,
+            "a child that never set a shape has nothing to re-assert"
+        );
     }
 
     #[test]

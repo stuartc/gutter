@@ -705,6 +705,7 @@ dependencies = [
  "crossterm",
  "expectrl",
  "insta",
+ "libc",
  "portable-pty",
  "proptest",
  "signal-hook 0.4.4",

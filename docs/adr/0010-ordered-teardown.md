@@ -31,3 +31,7 @@ step is conditional on what was actually set up.
 The inline hand-back is [ADR-013](0013-inline-anchor-scroll-paint.md); the
 screen-mode mirroring it depends on is
 [ADR-012](0012-screen-mode-mirroring.md).
+
+The suspend/resume cycle's park path ([ADR-019](0019-suspend-resume-cycle-ordering.md))
+reuses this exact order — minus the exit-status line — to hand the terminal back to
+the shell on Ctrl-Z, and its resume path runs the order in reverse to take it back.
