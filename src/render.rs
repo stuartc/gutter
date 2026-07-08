@@ -105,6 +105,10 @@ pub struct Renderer {
     /// key gutter ever withholds from the child, and only as the enter chord or while
     /// in the mode (PRD 0001, Feature 2).
     resize_key: KeyChord,
+    /// Whether resize mode is currently active. Mirrors the loop-owned `ResizeCtl`
+    /// (which `render_once` can't see) so the per-frame cursor tail knows to suppress
+    /// the mirrored child cursor while the resize overlay owns the band.
+    resize_active: bool,
 }
 
 impl Renderer {
@@ -164,6 +168,7 @@ impl Renderer {
             pty_eof_seen: false,
             mouse_gate: MouseGate::default(),
             resize_key: KeyChord::default(),
+            resize_active: false,
         }
     }
 
@@ -505,6 +510,9 @@ fn blank_vacated_chrome<T: OuterTerminal>(term: &mut T, prev: &BandGeom) -> std:
         prev.rows,
         &prev.readout,
     );
+    // Reset SGR first so the blanks are painted with the default background
+    // (a leftover attribute run would paint the vacated cells as a coloured block).
+    term.write_row(b"\x1b[0m")?;
     for row in rails.row_start..rails.row_end {
         if let Some(c) = rails.left_col {
             term.move_to(c, row)?;
@@ -622,6 +630,7 @@ where
                 // expression is an E0502 overlapping borrow.
                 let now = clock.now();
                 resize.arm(clock.deadline(now, RESIZE_IDLE));
+                let _ = renderer.begin_resize(term);
                 let _ = enter_resize_overlay(renderer, term);
                 return Flow::Continue; // consumed, no PTY
             }
@@ -633,6 +642,7 @@ where
             }
             KeyAction::Exit => {
                 resize.disarm();
+                renderer.end_resize();
                 let _ = clear_resize_overlay(renderer, term);
                 renderer.reset_prev_baseline();
                 return Flow::Continue;
@@ -759,28 +769,34 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
         renderer.ever_painted_inline = true;
     }
 
-    // Capture the cursor state from the live screen for the tail below.
-    let screen = renderer.parser.screen();
-    let visible = !screen.hide_cursor();
-    let (crow, ccol) = screen.cursor_position();
+    // Mirror the child's cursor — unless resize mode owns the band, where the block
+    // cursor would flicker at the band edge as the child re-homes during redraws. The
+    // outer cursor is hidden on mode enter and re-asserted from the child's live state
+    // on exit (see `Renderer::end_resize`), so the whole tail is skipped while active.
+    if !renderer.resize_active {
+        // Capture the cursor state from the live screen for the tail below.
+        let screen = renderer.parser.screen();
+        let visible = !screen.hide_cursor();
+        let (crow, ccol) = screen.cursor_position();
 
-    // Mirror DECTCEM: only emit a show/hide when the state actually changed.
-    if visible != renderer.cursor_visible {
-        term.set_cursor_visible(visible)?;
-        renderer.cursor_visible = visible;
+        // Mirror DECTCEM: only emit a show/hide when the state actually changed.
+        if visible != renderer.cursor_visible {
+            term.set_cursor_visible(visible)?;
+            renderer.cursor_visible = visible;
+        }
+
+        // Mirror DECSCUSR cursor shape: the callbacks watcher recorded any CSI Ps SP q
+        // the child emitted; emit it to the outer terminal, de-duped by the watcher.
+        if let Some(shape) = renderer.parser.callbacks_mut().cursor_shape.take_pending() {
+            term.set_cursor_shape(&shape)?;
+        }
+
+        // Reposition the real cursor inside the band at `offset + grid_cursor_row`.
+        term.place_cursor(
+            geometry::physical_col(renderer.left_margin, ccol),
+            offset.saturating_add(crow),
+        )?;
     }
-
-    // Mirror DECSCUSR cursor shape: the callbacks watcher recorded any CSI Ps SP q the
-    // child emitted; emit it to the outer terminal, de-duped by the watcher.
-    if let Some(shape) = renderer.parser.callbacks_mut().cursor_shape.take_pending() {
-        term.set_cursor_shape(&shape)?;
-    }
-
-    // Reposition the real cursor inside the band at `offset + grid_cursor_row`.
-    term.place_cursor(
-        geometry::physical_col(renderer.left_margin, ccol),
-        offset.saturating_add(crow),
-    )?;
 
     term.flush()?;
 
@@ -929,6 +945,28 @@ fn repaint_margins<T: OuterTerminal>(
 }
 
 impl Renderer {
+    /// Enter resize mode: suppress the mirrored child cursor. Hides the outer cursor
+    /// once and records it hidden, so the cursor tail in `render_once` (skipped while
+    /// active) leaves it hidden for the mode's duration.
+    fn begin_resize<T: OuterTerminal>(&mut self, term: &mut T) -> std::io::Result<()> {
+        self.resize_active = true;
+        // Track the outer cursor as hidden: this is what makes `end_resize`'s guard
+        // reset re-show only a child whose cursor is actually visible.
+        self.cursor_visible = false;
+        term.set_cursor_visible(false)
+    }
+
+    /// Leave resize mode: re-assert the child's REAL cursor rather than force it
+    /// visible. `rearm` re-arms the DECSCUSR shape, and leaving `cursor_visible`
+    /// false (the outer cursor's actual hidden state) makes the next `render_once`
+    /// re-evaluate DECTCEM from the child's live screen — so a child-hidden cursor
+    /// stays hidden while a child-visible one is re-shown.
+    fn end_resize(&mut self) {
+        self.resize_active = false;
+        self.parser.callbacks_mut().cursor_shape.rearm();
+        self.cursor_visible = false;
+    }
+
     /// Advance the `prev` baseline to match the current screen, so the next
     /// frame's `rows_diff` is against what was just painted. vt100 exposes no
     /// `clone`, so feed `prev` the current screen's `contents_formatted()` —
@@ -1071,6 +1109,7 @@ where
         if let Some(dl) = resize.idle_deadline {
             if clock.now() >= dl {
                 resize.disarm();
+                renderer.end_resize();
                 let _ = clear_resize_overlay(renderer, term);
                 renderer.reset_prev_baseline();
                 let _ = render_once(renderer, term); // erase rails this frame
@@ -1086,6 +1125,7 @@ where
                 Recv::Timeout => {
                     // ~3 s idle elapsed.
                     resize.disarm();
+                    renderer.end_resize();
                     let _ = clear_resize_overlay(renderer, term);
                     renderer.reset_prev_baseline();
                     let _ = render_once(renderer, term);
@@ -1248,9 +1288,12 @@ where
     R: PtyResizer,
     S: Suspender,
 {
-    // Step 0 — resize-mode teardown (same as run's shutdown tail).
+    // Step 0 — resize-mode teardown (same as run's shutdown tail). `end_resize`
+    // clears `resize_active`, or the cursor tail would stay suppressed after resume;
+    // park/unpark re-mirror the cursor themselves from there.
     if resize.active() {
         resize.disarm();
+        renderer.end_resize();
         let _ = clear_resize_overlay(renderer, term);
         renderer.reset_prev_baseline();
     }
@@ -2738,6 +2781,89 @@ mod tests {
             visible,
             Some(false),
             "the fixture's CSI ?25l must hide the outer cursor"
+        );
+    }
+
+    /// Resize mode enter hides the outer cursor once, and while active the
+    /// per-frame cursor tail is suppressed: a frame that would normally mirror
+    /// the child cursor emits neither a `PlaceCursor` nor a visibility change.
+    #[test]
+    fn resize_active_suppresses_cursor_mirror() {
+        let mut r = Renderer::at_margin(20, 5, 7);
+        let mut term = MockTerminal::new();
+
+        r.begin_resize(&mut term).unwrap();
+        assert!(
+            term.calls.contains(&Call::SetCursorVisible(false)),
+            "begin_resize must hide the outer cursor once, calls = {:?}",
+            term.calls
+        );
+
+        // Give the grid a live cursor position, then drive a frame while active.
+        r.parser.process(b"hi");
+        term.calls.clear();
+        render_once(&mut r, &mut term).unwrap();
+
+        assert!(
+            !term.calls.iter().any(|c| matches!(c, Call::PlaceCursor(..))),
+            "no cursor placement while resize is active, calls = {:?}",
+            term.calls
+        );
+        assert!(
+            !term.calls.iter().any(|c| matches!(c, Call::SetCursorVisible(_))),
+            "no cursor-visibility change while resize is active, calls = {:?}",
+            term.calls
+        );
+    }
+
+    /// Leaving resize mode re-mirrors the child cursor on the next frame: the
+    /// position is re-placed, and a child whose cursor is visible is re-shown.
+    #[test]
+    fn resize_exit_remirrors_visible_child_cursor() {
+        let mut r = Renderer::at_margin(20, 5, 7);
+        let mut term = MockTerminal::new();
+
+        r.parser.process(b"visible");
+        r.begin_resize(&mut term).unwrap();
+        r.end_resize();
+        term.calls.clear();
+        render_once(&mut r, &mut term).unwrap();
+
+        assert!(
+            term.calls.iter().any(|c| matches!(c, Call::PlaceCursor(..))),
+            "exit must re-place the cursor, calls = {:?}",
+            term.calls
+        );
+        assert!(
+            term.calls.contains(&Call::SetCursorVisible(true)),
+            "a visible child cursor must be re-shown on exit, calls = {:?}",
+            term.calls
+        );
+    }
+
+    /// Leaving resize mode re-mirrors the child's REAL state, not a force-show:
+    /// if the child hid its cursor (DECTCEM off) the exit frame re-places it but
+    /// never emits a show, so it stays hidden.
+    #[test]
+    fn resize_exit_keeps_hidden_child_cursor_hidden() {
+        let mut r = Renderer::at_margin(20, 5, 7);
+        let mut term = MockTerminal::new();
+
+        r.parser.process(b"\x1b[?25lhi");
+        r.begin_resize(&mut term).unwrap();
+        r.end_resize();
+        term.calls.clear();
+        render_once(&mut r, &mut term).unwrap();
+
+        assert!(
+            !term.calls.contains(&Call::SetCursorVisible(true)),
+            "a hidden child cursor must not be re-shown on exit, calls = {:?}",
+            term.calls
+        );
+        assert!(
+            term.calls.iter().any(|c| matches!(c, Call::PlaceCursor(..))),
+            "exit must still re-place the cursor, calls = {:?}",
+            term.calls
         );
     }
 
@@ -5034,5 +5160,35 @@ mod margins {
         // The new rails land at the new edges: margin - 1 = 18, band_end = 101.
         assert_eq!(grid.cell_contents(0, 18), "\u{258f}", "new left rail");
         assert_eq!(grid.cell_contents(0, 101), "\u{2595}", "new right rail");
+    }
+
+    /// `blank_vacated_chrome` must neutralise SGR before it paints its blanks. If a
+    /// previous band frame left a reverse-video run dangling (nvim does), the blank
+    /// spaces would otherwise land as an inverse block at the vacated rail columns.
+    #[test]
+    fn refresh_resize_overlay_grow_resets_sgr_before_blanking() {
+        let mut r = renderer(80, 24, 120, Layout::Center, Width::Cols(80));
+        let mut grid = RecordingGrid::new(120, 24);
+
+        repaint_margins(&r, &mut grid, true).unwrap();
+
+        // Simulate the prior band paint leaving reverse-video active.
+        grid.write_row(b"\x1b[7m").unwrap();
+
+        let prev = BandGeom::of(&r);
+        r.width = 82;
+        r.width_config = Width::Cols(82);
+        r.left_margin = geometry::margin(r.layout, r.real_cols, r.width);
+
+        refresh_resize_overlay(&r, &mut grid, Some(prev)).unwrap();
+
+        assert!(
+            !grid.cell_inverse(0, 19),
+            "vacated left rail must not carry a leftover reverse-video run"
+        );
+        assert!(
+            !grid.cell_inverse(0, 100),
+            "vacated right rail must not carry a leftover reverse-video run"
+        );
     }
 }
