@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-07-08
+
+### Fixed
+
+- Remove flickering block artifacts at resize band edges
+
 ## [0.2.0] - 2026-07-08
 
 ### Added
@@ -92,6 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stop vim integration test leaking swap files
 - Fix loose ADR cites and width-default wording in comments
 
+[0.2.1]: https://github.com/stuartc/gutter/compare/v0.2.0..v0.2.1
 [0.2.0]: https://github.com/stuartc/gutter/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/stuartc/gutter/tree/v0.1.0
 
