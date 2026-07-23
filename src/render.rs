@@ -185,6 +185,16 @@ impl Renderer {
         self.parser.screen()
     }
 
+    /// Row where the band's span starts (ADR-0017): 0 on the alt screen, `base_row`
+    /// on the primary screen so shell history above the inline band stays untouched.
+    fn span_offset(&self) -> u16 {
+        if self.outer_alt_active {
+            0
+        } else {
+            self.base_row
+        }
+    }
+
     /// Test-only constructor at an explicit `left_margin`, so the cell-walk / CJK
     /// edge-of-band tests can pin a margin directly and inspect physical columns
     /// without routing through a [`Layout`]/`real_cols` pair.
@@ -432,6 +442,11 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     // after this returns, which repaints with the rails when the mode really is
     // active. Both calls are queued, not flushed (ADR-007), so an in-mode SIGWINCH
     // costs one redundant queued clear, never a visible flicker.
+    //
+    // Interior clear (see `clear_row_span`) across the band span first: the baseline
+    // reset below makes rows_diff skip cells the new frame leaves blank, so any glyph
+    // the old geometry left there would survive. `repaint_margins` redraws on top.
+    let _ = term.clear_row_span(renderer.span_offset(), rows);
     let _ = repaint_margins(renderer, term, /* resize_active: */ false);
 
     // Force a full repaint next frame: reset the diff baseline to a blank grid of the
@@ -460,7 +475,7 @@ pub(crate) struct BandGeom {
 }
 impl BandGeom {
     pub(crate) fn of(r: &Renderer) -> Self {
-        let offset = if r.outer_alt_active { 0 } else { r.base_row };
+        let offset = r.span_offset();
         Self {
             left_margin: r.left_margin,
             width: r.width,
@@ -573,6 +588,10 @@ fn apply_resize_step<R: PtyResizer, T: OuterTerminal>(
         // Step 3 — live geometry (real_cols unchanged).
         renderer.width = w;
         renderer.left_margin = geometry::margin(renderer.layout, real, w);
+        // Interior clear (see `clear_row_span`): the baseline reset below makes rows_diff
+        // skip cells the new frame leaves blank, so stale glyphs from the old geometry
+        // would survive. A resize step never changes `rows`, so one clear covers the span.
+        let _ = term.clear_row_span(renderer.span_offset(), rows);
     }
     // Step 4 — clear the vacated strip + (re)paint rails.
     let _ = refresh_resize_overlay(renderer, term, Some(prev));
@@ -737,8 +756,7 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
         }
     }
 
-    // The primary band is offset by `base_row`; the alt screen always paints at 0.
-    let offset = if renderer.outer_alt_active { 0 } else { renderer.base_row };
+    let offset = renderer.span_offset();
 
     if departed.is_empty() {
         // No scroll: the ordinary per-row diff paint. Only rows changed since the last
@@ -914,7 +932,7 @@ fn repaint_margins<T: OuterTerminal>(
     term: &mut T,
     resize_active: bool,
 ) -> std::io::Result<()> {
-    let offset = if renderer.outer_alt_active { 0 } else { renderer.base_row };
+    let offset = renderer.span_offset();
     let rows = renderer.parser.screen().size().0;
     term.clear_gutter(renderer.left_margin, renderer.width, renderer.real_cols, offset, rows)?;
     let text = geometry::readout_text(renderer.width_config, renderer.width);
@@ -1335,27 +1353,37 @@ where
     // Step 5 — unpark (resume, inverse order, raw mode FIRST).
     let _ = unpark(renderer, term);
 
-    // Step 6 — missed-resize catch-up. The outer terminal may have resized while
+    // Step 6 — inline anchor reseed (primary-screen children). The shell scrolled the
+    // screen while gutter slept, so base_row is meaningless and CPR is unavailable (the
+    // input thread owns the event source). Reseed at the bottom like a fresh launch;
+    // render_once's make-room scroll re-lays the band there.
+    //
+    // This runs BEFORE the step-7 catch-up (which normally settles base_row first) so
+    // that handle_resize's interior clear reads a bottom-anchored base_row, not the
+    // stale one: on the primary screen the pre-resize base_row still points into the
+    // shell output the child left on screen, and clearing [stale_base_row, rows) would
+    // wipe that history. Seed from the post-resize row count (terminal_size, the source
+    // handle_resize itself resizes to) so the two agree.
+    let outer_size = term.terminal_size();
+    if !renderer.parser.screen().alternate_screen() {
+        let seed_rows = match outer_size {
+            Ok((_, rows_now)) => rows_now,
+            Err(_) => renderer.parser.screen().size().0,
+        };
+        renderer.base_row = seed_rows.saturating_sub(1);
+    }
+
+    // Step 7 — missed-resize catch-up. The outer terminal may have resized while
     // gutter slept; run the full ADR-008 handler so the TIOCSWINSZ queues one
     // SIGWINCH on the still-stopped child, delivered when it is continued in step 8
-    // — so the child wakes and repaints once at the right size, not twice. Runs
-    // before the base_row reseed so the reseed uses the post-resize row count.
-    if let Ok((cols, rows_now)) = term.terminal_size() {
+    // — so the child wakes and repaints once at the right size, not twice.
+    if let Ok((cols, rows_now)) = outer_size {
         let cur_rows = renderer.parser.screen().size().0;
         if cols != renderer.real_cols || rows_now != cur_rows {
             handle_resize(renderer, resizer, term, cols, rows_now);
         }
     }
     let rows = renderer.parser.screen().size().0;
-
-    // Step 7 — inline anchor reseed (primary-screen children). The shell scrolled
-    // the screen while gutter slept, so base_row is meaningless and CPR is
-    // unavailable (the input thread owns the event source). Reseed at the bottom
-    // like a fresh launch; render_once's make-room scroll re-lays the band there.
-    let child_alt = renderer.parser.screen().alternate_screen();
-    if !child_alt {
-        renderer.base_row = rows.saturating_sub(1);
-    }
 
     // Step 8 — wake the child, AFTER the outer terminal is fully re-set-up, so its
     // post-cont repaint bytes land on a raw-mode, correct-screen terminal.
@@ -1374,7 +1402,7 @@ where
     // gutter-cleanup bytes unflushed indefinitely.
     renderer.reset_prev_baseline();
     let _ = render_once(renderer, term);
-    let offset = if renderer.outer_alt_active { 0 } else { renderer.base_row };
+    let offset = renderer.span_offset();
     let _ = term.clear_gutter(
         renderer.left_margin,
         renderer.width,
@@ -3511,7 +3539,7 @@ line two\r\n\
         }
 
         /// Missed-resize catch-up: the outer terminal resized while gutter slept.
-        /// Step 6 re-sizes the child PTY (to the band width at the new row count)
+        /// Step 7 re-sizes the child PTY (to the band width at the new row count)
         /// BEFORE continue_child, so the child wakes to one SIGWINCH at the right
         /// size.
         #[test]
@@ -3555,6 +3583,60 @@ line two\r\n\
             assert!(
                 first_clear < cont,
                 "the resize (TIOCSWINSZ + clear) runs before continue_child"
+            );
+        }
+
+        /// Regression: a terminal resized while gutter slept must not let the resume
+        /// catch-up blank shell history. On the primary screen `base_row` is stale after
+        /// suspension (the shell scrolled under the band), so the interior clear must run
+        /// only after base_row is reseeded to the bottom — a single row, never the
+        /// `[stale_base_row, rows)` span that still holds the user's shell output.
+        #[test]
+        fn resume_resize_interior_clear_spares_shell_history() {
+            let (log, mut term, mut renderer) = harness(false);
+            renderer.ever_painted_inline = true;
+            // The band was anchored mid-screen before the stop; the shell then scrolled
+            // under it, leaving base_row pointing into live shell output.
+            renderer.base_row = 5;
+
+            // The shell widened the terminal to 50 cols (same 10 rows) while gutter slept.
+            let size = term.size_cell();
+            let suspender =
+                MockSuspender::new(log.clone()).on_suspend(move || size.set((50, 10)));
+            let resizer = RecResizer::default();
+            let mut clock = VirtualClock::new(vec![]);
+            let mut resize = ResizeCtl::inactive();
+            let mut pty: Vec<u8> = Vec::new();
+            let outcome = suspend_cycle(
+                &mut clock,
+                &mut renderer,
+                &mut resize,
+                &mut term,
+                &mut pty,
+                &resizer,
+                &suspender,
+            );
+            assert!(matches!(outcome, SuspendOutcome::Resumed));
+            assert_eq!(
+                renderer.base_row, 9,
+                "base_row reseeds to the bottom before the catch-up interior clear"
+            );
+
+            // Every interior clear the resume emitted is confined to the reseeded bottom
+            // row — never a span starting at the stale mid-screen anchor (which would
+            // erase the shell history above the band).
+            for c in term.calls.iter() {
+                if let Call::ClearRowSpan(start, end) = c {
+                    assert_eq!(
+                        (*start, *end),
+                        (9, 10),
+                        "interior clear must stay at the reseeded bottom row, got ({start}, {end})"
+                    );
+                }
+            }
+            assert!(
+                term.calls.iter().any(|c| matches!(c, Call::ClearRowSpan(..))),
+                "the widen catch-up did run an interior clear"
             );
         }
 
@@ -5023,6 +5105,115 @@ mod resize {
         // Height grow back to 30: base_row is already on-screen, so it is kept.
         handle_resize(&mut r, &resizer, &mut term, 120, 30);
         assert_eq!(r.base_row, 9, "a height grow keeps the (already on-screen) base_row");
+    }
+
+    /// A resize that WIDENS the band must physically clear the band INTERIOR, not just
+    /// the gutters. The old, narrower band's glyphs now sit inside the new band's
+    /// columns, where `clear_gutter` never reaches and the blank diff baseline never
+    /// repaints over (a now-blank cell yields no diff run) — so without the interior
+    /// clear the stale glyphs would survive forever. Left-aligned + proportional so
+    /// widening `real_cols` widens W.
+    #[test]
+    fn resize_widen_clears_band_interior() {
+        // Old geometry: W = 50% of 80 = 40, left band [0, 40).
+        let mut r = renderer(40, 24, 80, Layout::Left, Width::Percent(50));
+        let resizer = RecResizer::default();
+        let mut grid = RecordingGrid::new(120, 24);
+
+        // Stale glyph a prior frame left at an interior column of the OLD band. Column
+        // 25 is inside [0, 40) now and inside the widened band [0, 60) after — so
+        // `clear_gutter` (only ever [W, real_cols)) can never reach it.
+        grid.move_to(25, 0).unwrap();
+        grid.write_row(b"X").unwrap();
+        assert_eq!(grid.cell_contents(0, 25), "X");
+
+        // Widen the terminal to 120 cols: W = 50% = 60, band [0, 60).
+        handle_resize(&mut r, &resizer, &mut grid, 120, 24);
+
+        assert_eq!(
+            grid.cell_contents(0, 25),
+            "",
+            "widen must blank the band interior — a stale glyph inside the new band \
+             would otherwise survive the gutter-only clear"
+        );
+    }
+
+    /// The interior clear honours the ADR-017 row span: on the primary screen it starts
+    /// at `base_row`, never 0, so shell history above the inline band is untouched; on
+    /// the alt screen it spans the whole viewport from 0.
+    #[test]
+    fn resize_interior_clear_respects_screen_span() {
+        let mut r = renderer(40, 24, 80, Layout::Center, Width::Cols(40));
+        r.base_row = 4;
+        let resizer = RecResizer::default();
+
+        let mut term = MockTerminal::new();
+        handle_resize(&mut r, &resizer, &mut term, 120, 24);
+        assert!(
+            term.calls.contains(&Call::ClearRowSpan(4, 24)),
+            "primary interior clear must span [base_row, rows), calls = {:?}",
+            term.calls
+        );
+
+        r.outer_alt_active = true;
+        let mut term = MockTerminal::new();
+        handle_resize(&mut r, &resizer, &mut term, 120, 24);
+        assert!(
+            term.calls.contains(&Call::ClearRowSpan(0, 24)),
+            "alt interior clear must span the whole viewport, calls = {:?}",
+            term.calls
+        );
+    }
+
+    /// The in-mode grow path (`apply_resize_step`) has the same stale-inside-new-band
+    /// exposure as a SIGWINCH widen, so it must clear the band interior too.
+    #[test]
+    fn resize_step_grow_clears_band_interior() {
+        // Left band, W = 40 in a 120-col terminal; band [0, 40).
+        let mut r = renderer(40, 24, 120, Layout::Left, Width::Cols(40));
+        let resizer = RecResizer::default();
+        let mut grid = RecordingGrid::new(120, 24);
+
+        // Stale glyph at col 25 — inside [0, 40) now and inside the grown band [0, 60).
+        grid.move_to(25, 0).unwrap();
+        grid.write_row(b"X").unwrap();
+        assert_eq!(grid.cell_contents(0, 25), "X");
+
+        // Grow the band by 20 columns → W = 60, band [0, 60).
+        apply_resize_step(&mut r, &resizer, &mut grid, 20);
+        assert_eq!(r.width, 60, "the step grew W by 20");
+        assert_eq!(
+            grid.cell_contents(0, 25),
+            "",
+            "an in-mode grow must blank the band interior, like a SIGWINCH widen"
+        );
+    }
+
+    /// The interior clear must run BEFORE `repaint_margins`'s gutter clear (and, in
+    /// resize mode, the rails) — otherwise it would wipe the freshly drawn chrome.
+    #[test]
+    fn interior_clear_precedes_gutter_clear() {
+        let mut r = renderer(40, 24, 80, Layout::Center, Width::Cols(40));
+        let resizer = RecResizer::default();
+        let mut term = MockTerminal::new();
+
+        handle_resize(&mut r, &resizer, &mut term, 120, 24);
+
+        let span = term
+            .calls
+            .iter()
+            .position(|c| matches!(c, Call::ClearRowSpan(..)))
+            .expect("the interior clear ran");
+        let gutter = term
+            .calls
+            .iter()
+            .position(|c| matches!(c, Call::ClearGutter(..)))
+            .expect("the gutter clear ran");
+        assert!(
+            span < gutter,
+            "interior clear must precede the gutter clear, calls = {:?}",
+            term.calls
+        );
     }
 }
 

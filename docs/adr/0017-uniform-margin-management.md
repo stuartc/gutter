@@ -85,11 +85,24 @@ old cells already fall in the new gutter.
   inside the same coalescing frame (ADR-007), so this costs one redundant queued
   clear on that path, never a visible flicker.
 
+## Amendment — band-interior clear on a widen
+
+`clear_gutter` only ever blanks the columns *outside* the band. That leaves a twin of
+the "grow strands old rails inside the new band" gap this ADR closes: on a widen the
+old, narrower band's *content* now sits inside the new band's columns, where the gutter
+clear never reaches and the blank diff baseline never repaints over it (a blank cell
+yields no diff run), so the stale glyphs survive indefinitely. `OuterTerminal::clear_row_span(row_start, row_end)`
+blanks whole physical rows (band interior included) across the same ADR-017 span —
+`0..rows` on the alt screen, `base_row..rows` on the primary — and is called just before
+`repaint_margins` in both `handle_resize` and `apply_resize_step`'s grow branch. On the
+suspend/resume catch-up the primary-screen anchor is reseeded to the bottom *before* that
+clear, so it never wipes the shell history the stale `base_row` still points into.
+
 ## Code anchors
 
 - `src/geometry.rs` — `Rails`, `Readout`, `readout_text`, `rail_layout`
-- `src/terminal.rs` — `OuterTerminal::clear_gutter` (row-span), `draw_rails`, and the
-  `MockTerminal`/`RecordingGrid` implementations
+- `src/terminal.rs` — `OuterTerminal::clear_gutter` (row-span), `clear_row_span`,
+  `draw_rails`, and the `MockTerminal`/`RecordingGrid` implementations
 - `src/render.rs` — `repaint_margins`, `handle_resize`'s step 5, and the
   `enter_resize_overlay` / `refresh_resize_overlay` / `clear_resize_overlay` seam
 

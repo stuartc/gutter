@@ -116,20 +116,25 @@ confirm against both `zsh` and `bash`.
 5. **Unpark** (`unpark()`) — raw mode first, then kitty/mouse/alt, cursor shape
    `rearm()`ed for the next repaint (park reset the outer cursor to default,
    staling the cursor-shape watcher's dedup state).
-6. **Missed-resize catch-up** — `term.terminal_size()` vs. the parser's current
-   size; if different, run `handle_resize` (ADR-008).
-7. **Inline anchor reseed** — `base_row` reset to the bottom for primary-screen
-   children, computed *after* step 6 so it uses the post-resize row count.
+6. **Inline anchor reseed** — `base_row` reset to the bottom for primary-screen
+   children, seeded from the post-resize row count read via `term.terminal_size()`.
+7. **Missed-resize catch-up** — `term.terminal_size()` vs. the parser's current
+   size; if different, run `handle_resize` (ADR-008), reusing the step-6 size query.
 8. **`suspender.continue_child()`**.
 9. **Repaint** — `reset_prev_baseline()`, `render_once`, then
    `repaint_margins(.., false)` to clear any shell text the suspension left in the
    gutter columns.
 
-**Deviations from the original plan, as built:** the missed-resize catch-up (step
-6 above) runs *before* the inline anchor reseed (step 7) — the reseed needs the
-post-resize row count, so it has to come second, the reverse of the plan's original
-numbering. `OuterTerminal` gained a `terminal_size()` seam specifically for step 6
-(query the real outer size without going through `Event::Resize`). There is no
+**Deviations from the original plan, as built:** the inline anchor reseed (step 6
+above) runs *before* the missed-resize catch-up (step 7), sourcing its row count from
+`term.terminal_size()` directly rather than from the parser's post-resize size. This
+ordering is load-bearing: `handle_resize` now physically clears the band interior
+(ADR-017), and on the primary screen the pre-resize `base_row` still points into the
+shell output the child left on screen — clearing from a stale mid-screen anchor would
+wipe that history. Reseeding to the bottom row first means the catch-up's interior
+clear only touches the band's own rows. `OuterTerminal` gained a `terminal_size()`
+seam specifically for these two steps (query the real outer size without going through
+`Event::Resize`); the single query is reused by both. There is no
 explicit `teardown_done` flag: the abort path (step 1) returns
 `SuspendOutcome::ChildExited` *before* park ever runs, so it falls straight through
 to `run`'s own single call to `run_teardown` — there is only ever one call site, so

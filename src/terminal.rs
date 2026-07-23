@@ -78,6 +78,15 @@ pub trait OuterTerminal {
         row_start: u16,
         row_end: u16,
     ) -> io::Result<()>;
+    /// Clear whole physical rows `[row_start, row_end)`, band interior included —
+    /// unlike [`clear_gutter`], which spares the band columns. Used after a resize
+    /// widens the band: the old, narrower band's glyphs now sit inside the new band's
+    /// columns, where neither the gutter clear nor the diff repaint (baseline is blank)
+    /// reaches them. The caller supplies the ADR-017 span (`0..rows` on the alt screen,
+    /// `base_row..rows` on the primary screen) so shell history above the band survives.
+    ///
+    /// [`clear_gutter`]: OuterTerminal::clear_gutter
+    fn clear_row_span(&mut self, row_start: u16, row_end: u16) -> io::Result<()>;
     /// Paint the resize rails + width readout (faint, monochrome). Emitted while in
     /// resize mode, into gutter columns only (plus the in-band readout fallback). The
     /// per-frame band repaint never touches these columns, so the rails persist between
@@ -229,6 +238,21 @@ impl OuterTerminal for CrosstermTerminal {
         Ok(())
     }
 
+    fn clear_row_span(&mut self, row_start: u16, row_end: u16) -> io::Result<()> {
+        use crossterm::{
+            cursor::MoveTo,
+            queue,
+            terminal::{Clear, ClearType},
+        };
+        // Reset SGR first so the cleared rows carry the default background (a leftover
+        // colour run would tint them), matching clear_gutter.
+        self.out.write_all(b"\x1b[0m")?;
+        for row in row_start..row_end {
+            queue!(self.out, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+        }
+        Ok(())
+    }
+
     fn draw_rails(&mut self, rails: &Rails) -> io::Result<()> {
         use crossterm::{cursor::MoveTo, queue};
         self.out.write_all(b"\x1b[0m")?; // drop any leftover attribute run
@@ -345,6 +369,8 @@ pub mod mock {
         Newline,
         /// `clear_gutter(margin, width, real_cols, row_start, row_end)`.
         ClearGutter(u16, u16, u16, u16, u16),
+        /// `clear_row_span(row_start, row_end)`.
+        ClearRowSpan(u16, u16),
         /// `draw_rails(rails)`.
         DrawRails(crate::geometry::Rails),
         PlaceCursor(u16, u16),
@@ -614,6 +640,16 @@ pub mod mock {
             }
             Ok(())
         }
+        fn clear_row_span(&mut self, row_start: u16, row_end: u16) -> io::Result<()> {
+            // Blank whole physical rows via ESC[2K, as the real terminal would, so the
+            // readback sees the band interior cleared.
+            self.parser.process(b"\x1b[0m");
+            for row in row_start..row_end {
+                let seq = format!("\x1b[{};1H\x1b[2K", row + 1);
+                self.parser.process(seq.as_bytes());
+            }
+            Ok(())
+        }
         fn draw_rails(&mut self, rails: &super::Rails) -> io::Result<()> {
             // Replay the same escapes CrosstermTerminal emits, into the physical
             // parser, so cell readback works.
@@ -719,6 +755,10 @@ pub mod mock {
             row_end: u16,
         ) -> io::Result<()> {
             self.record(Call::ClearGutter(margin, width, real_cols, row_start, row_end));
+            Ok(())
+        }
+        fn clear_row_span(&mut self, row_start: u16, row_end: u16) -> io::Result<()> {
+            self.record(Call::ClearRowSpan(row_start, row_end));
             Ok(())
         }
         fn draw_rails(&mut self, rails: &super::Rails) -> io::Result<()> {
