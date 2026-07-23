@@ -33,3 +33,9 @@ Session.vim
 # Added by cargo
 
 /target
+.agents
+.claude/skills
+.scratch
+docs/agents
+docs/prd
+skills-lock.json
