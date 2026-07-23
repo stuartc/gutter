@@ -5,9 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.1] - 2026-07-08
+## [0.2.2] - 2026-07-23
+
+### Changed
+
+- Ignore dev files
 
 ### Fixed
+
+- Clear band interior on resize to stop stale-cell corruption
+
+## [0.2.1] - 2026-07-08
+
+### Changed
+
+- Point README install section at v0.2.0
+- Link install section at /releases/latest
+- Merge pull request #7 from stuartc/fix/resize-cursor-artifacts
+- Release gutter version 0.2.1
+
+### Removed
 
 - Remove flickering block artifacts at resize band edges
 
@@ -37,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ADRs + cross-links
 - Simplify suspend cycle after review
 - Merge pull request #6 from stuartc/fix/ctrl-z-suspend
+- Release gutter version 0.2.0
 
 ### Fixed
 
@@ -98,6 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stop vim integration test leaking swap files
 - Fix loose ADR cites and width-default wording in comments
 
+[0.2.2]: https://github.com/stuartc/gutter/compare/v0.2.1..v0.2.2
 [0.2.1]: https://github.com/stuartc/gutter/compare/v0.2.0..v0.2.1
 [0.2.0]: https://github.com/stuartc/gutter/compare/v0.1.0..v0.2.0
 [0.1.0]: https://github.com/stuartc/gutter/tree/v0.1.0
