@@ -675,9 +675,9 @@ fn walk_tokens<C, T, P, R>(
 {
     for token in tokens {
         match token {
-            // Pasted text and string-sequence payloads are data, not input
-            // protocol: nothing is extracted, nothing is matched, nothing is
-            // dropped.
+            // A paste — guards included — and a string-sequence payload are data,
+            // not input protocol: nothing is extracted, nothing is matched,
+            // nothing is dropped, in resize mode or out of it.
             Token::Paste(bytes) | Token::Str(bytes) => forward_to_child(pty_writer, bytes),
             Token::Mouse(report) => {
                 // The mouse forwarding gate (ADR-005). Read the child's
@@ -4059,6 +4059,21 @@ line two\r\n\
                 "the mouse report was extracted, not forwarded: {:?}",
                 ctx.pty
             );
+        }
+
+        /// A paste that arrives while the resize overlay is up. The mode swallows
+        /// keystrokes, but a paste is not keystrokes: it reaches the child whole,
+        /// guards and all, and leaves the mode where it found it.
+        #[test]
+        fn a_paste_arriving_in_resize_mode_still_reaches_the_child_whole() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            mirror_paste_on(&mut ctx);
+            ctx.enter();
+            ctx.send(&paste_span());
+
+            assert_eq!(ctx.pty, paste_span(), "every pasted byte, verbatim");
+            assert!(ctx.resize.active(), "the paste is the child's, not the mode's");
+            assert_eq!(ctx.renderer.width, 80, "and it stepped nothing");
         }
 
         /// The child disabling paste mode mid-paste re-arms normal scanning at once.

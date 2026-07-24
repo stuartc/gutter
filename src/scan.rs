@@ -44,8 +44,11 @@ pub enum Token {
     /// Exactly one complete escape sequence. Atomic — matched as a whole against
     /// the chord and in-mode tables, or forwarded whole. Never split.
     Seq(Vec<u8>),
-    /// Bytes between bracketed-paste guards. Forwarded verbatim and never
-    /// inspected — not for the chord, not for the in-mode table, not for mouse.
+    /// A bracketed paste: the guards and everything between them. Forwarded
+    /// verbatim and never inspected — not for the chord, not for the in-mode
+    /// table, not for mouse. The guards carry no meaning for the child that
+    /// asked for them unless they arrive with their content, so they are
+    /// forwarded on the same terms rather than offered to the classifier.
     Paste(Vec<u8>),
     /// Bytes of an OSC/DCS/APC/PM/SOS string sequence, guards included. Forwarded
     /// verbatim and never inspected: a payload is arbitrary data (base64, a
@@ -302,15 +305,13 @@ impl Scanner {
         if self.in_paste {
             if final_byte == b'~' && body == b"201" {
                 self.in_paste = false;
-                out.push(Token::Seq(seq));
-            } else {
-                out.push(Token::Paste(seq));
             }
+            out.push(Token::Paste(seq));
             return;
         }
         if self.paste_guards && final_byte == b'~' && body == b"200" {
             self.in_paste = true;
-            out.push(Token::Seq(seq));
+            out.push(Token::Paste(seq));
             return;
         }
         if body.first() == Some(&b'<') && (final_byte == b'M' || final_byte == b'm') {
@@ -571,10 +572,12 @@ mod tests {
         // After the close guard, extraction resumes.
         s.feed(b"\x1b[<0;10;5M", &mut out);
 
+        let (after, guarded) = out.split_last().unwrap();
         assert!(
-            !out.iter().any(|t| matches!(t, Token::Text(_))),
-            "everything between the guards is Paste, not Text: {out:?}"
+            guarded.iter().all(|t| matches!(t, Token::Paste(_))),
+            "the guards and their content are all Paste, classifier-invisible: {out:?}"
         );
+        assert!(matches!(after, Token::Mouse(_)), "{out:?}");
         assert_eq!(
             payloads(&out),
             b"\x1b[200~\x1b[<0;10;5M\x1b[<99Ma\x1cb\x1b[201~".to_vec(),
@@ -694,6 +697,53 @@ mod tests {
                 let whole_mice: Vec<&Token> =
                     whole.iter().filter(|t| matches!(t, Token::Mouse(_))).collect();
                 assert_eq!(mice, whole_mice, "fixture {fixture:?} split at {cut}");
+            }
+        }
+    }
+
+    /// The same sweep with the gate on. A fresh `Scanner` has the gate off, so the
+    /// sweep above never opens a paste; this one does, and pins that a guard cut in
+    /// two still opens and closes paste state — a split guard that failed to open one
+    /// would leave the mouse report inside it extractable.
+    #[test]
+    fn chunk_boundary_sweep_holds_inside_a_paste() {
+        // (fed, what reaches the child, how many reports are extracted — all of them
+        // from outside the guards).
+        let fixtures: [(&[u8], &[u8], usize); 3] = [
+            (
+                b"\x1b[200~pasted \x1c text\x1b[201~",
+                b"\x1b[200~pasted \x1c text\x1b[201~",
+                0,
+            ),
+            (
+                b"\x1b[200~\x1b[<0;10;5M\x1b[<99M\x1b[201~",
+                b"\x1b[200~\x1b[<0;10;5M\x1b[<99M\x1b[201~",
+                0,
+            ),
+            (
+                b"\x1b[200~in\x1b[201~\x1b[<0;9;2M",
+                b"\x1b[200~in\x1b[201~",
+                1,
+            ),
+        ];
+        for (fixture, forwarded, mice) in fixtures {
+            for cut in 0..=fixture.len() {
+                let mut s = Scanner::new();
+                s.set_paste_guards(true);
+                let mut out = Vec::new();
+                s.feed(&fixture[..cut], &mut out);
+                s.feed(&fixture[cut..], &mut out);
+                s.flush(&mut out);
+                assert_eq!(
+                    payloads(&out),
+                    forwarded.to_vec(),
+                    "fixture {fixture:?} split at {cut} changed the forwarded bytes"
+                );
+                assert_eq!(
+                    out.iter().filter(|t| matches!(t, Token::Mouse(_))).count(),
+                    mice,
+                    "fixture {fixture:?} split at {cut} extracted the wrong reports: {out:?}"
+                );
             }
         }
     }
