@@ -68,7 +68,8 @@ Most files map one-to-one onto a concern; the non-obvious split:
 
 | File | Responsibility |
 |------|----------------|
-| `src/main.rs` | Orchestration: spawn PTY, read the startup CPR anchor by hand, eager mouse capture, open `/dev/tty` clipboard sink, start threads, run Thread 2. |
+| `src/main.rs` | Orchestration: spawn PTY, eager mouse capture, open `/dev/tty` clipboard sink, start threads, run Thread 2. |
+| `src/anchor.rs` | The input tty, and the startup CPR probe behind the inline anchor: hand-rolled so keystrokes typed during startup survive as leftover rather than vanishing into crossterm's event queue. |
 | `src/cli.rs` | Hand-rolled arg parse (no clap). `--width N\|Npct\|N%`, `--center`/`--left`. |
 | `src/geometry.rs` | Pure layout maths: `margin()`, `resolve_width()` (absolute vs proportional), `physical_col()`. No I/O; property-tested. |
 | `src/terminal.rs` | `OuterTerminal` trait abstracting every outer side effect; crossterm impl + a recording mock for restore-order / column assertions. |
@@ -79,7 +80,7 @@ Most files map one-to-one onto a concern; the non-obvious split:
 | `src/chord.rs` | The reserved `--resize-key` chord and the byte forms it matches. |
 | `src/relay.rs` | The child's keyboard-mode relay and its undo log: a closed allowlist of sequences forwarded outward as canonical bytes. |
 | `src/modes.rs` | The three modes vt100 absorbs into screen state (DECCKM, application keypad, bracketed paste), mirrored onto the outer terminal by poll-diff. |
-| `src/mouse.rs` | Pure forwarding gate: live `(mode, encoding)` in, translated/down-filtered SGR-1006 out. |
+| `src/mouse.rs` | Pure forwarding gate: live `(mode, encoding)` in, translated/down-filtered SGR-1006 out. Also owns the eager-capture wire bundle, which has to stay inside what the scanner can extract. |
 | `src/clipboard.rs` | OSC-52 wire reconstruction → separate `/dev/tty` (so clipboard write and frame repaint don't fight over fd state). |
 | `src/cursor.rs` | DECSCUSR cursor-shape mirroring to the outer terminal. |
 | `src/clock.rs` | Injectable clock + receiver, so the coalescing loop is unit-testable with a virtual clock and scripted messages — no real PTY, no threads. |

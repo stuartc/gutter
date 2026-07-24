@@ -11,6 +11,7 @@
 use std::io::{self, Write};
 
 use crate::geometry::Rails;
+use crate::mouse::{MOUSE_DISABLE, MOUSE_ENABLE};
 
 /// The outer-terminal side effects the setup, render and teardown paths perform.
 ///
@@ -121,17 +122,6 @@ pub trait OuterTerminal {
     /// control sequences leak to the user's shell.
     fn disable_raw_mode(&mut self) -> io::Result<()>;
 }
-
-/// Eager mouse capture (ADR-005): X10 compatibility, button-motion, any-motion,
-/// then SGR-1006 for the extended coordinate encoding.
-///
-/// Written out rather than using crossterm's `EnableMouseCapture`, which also
-/// sends `?1015h` (the urxvt encoding). gutter's scanner recognises the SGR shape
-/// only, so a terminal that honoured `?1015h` would send reports gutter does not
-/// extract and they would leak to the child as literal garbage (ADR-020).
-const MOUSE_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
-/// The matching reset forms, in the same order.
-const MOUSE_DISABLE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 
 /// The real outer terminal, backed by crossterm against stdout.
 pub struct CrosstermTerminal {

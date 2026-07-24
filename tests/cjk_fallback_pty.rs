@@ -12,59 +12,10 @@
 //! the child is `printf` only, deterministic. CI runs this headlessly: a real
 //! PTY, no display, `TERM=xterm-256color`.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use expectrl::session::OsSession;
-
-fn gutter_bin() -> String {
-    env!("CARGO_BIN_EXE_gutter").to_string()
-}
-
-/// Run gutter inside an outer terminal of a fixed size:
-/// `sh -c 'stty cols C rows R; exec gutter <args>'`. `stty` sets gutter's own
-/// controlling-terminal size BEFORE it reads it at startup — no resize race.
-fn gutter_in_terminal(outer_cols: u16, outer_rows: u16, gutter_args: &str) -> std::process::Command {
-    let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    cmd
-}
-
-fn spawn(cmd: std::process::Command) -> OsSession {
-    OsSession::spawn(cmd).expect("spawn gutter under PTY")
-}
-
-/// Drain a bounded window with non-blocking reads, so the window is a real
-/// wall-clock cap even while the child keeps the PTY open — we capture the live
-/// alt-screen frame gutter painted, not the post-exit primary screen.
-fn drain_window(session: &mut OsSession, window: Duration) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    let start = Instant::now();
-    while start.elapsed() < window {
-        match session.try_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    out
-}
-
-/// Parse gutter's outer-terminal bytes through a vt100 at the physical size, so
-/// the test can read which physical column each glyph landed in.
-fn outer_grid(bytes: &[u8], cols: u16, rows: u16) -> vt100::Parser {
-    let mut p = vt100::Parser::new(rows, cols, 0);
-    p.process(bytes);
-    p
-}
+mod common;
+use common::{drain_window, outer_grid, spawn_gutter};
 
 /// Assert the physical band-edge column `margin + W` and every gutter column to
 /// its right hold no painted glyph on any row.
@@ -100,8 +51,8 @@ fn wide_glyph_at_band_edge_does_not_bleed() {
     let child = format!(
         "/bin/sh -c 'printf \"\\033[1;{band}H\\344\\270\\200\"; sleep 3'"
     );
-    let cmd = gutter_in_terminal(outer_cols, outer_rows, &format!("--width {band} --left {child}"));
-    let mut session = spawn(cmd);
+    let mut session =
+        spawn_gutter(outer_cols, outer_rows, &format!("--width {band} --left {child}"));
     let bytes = drain_window(&mut session, Duration::from_millis(800));
 
     let parser = outer_grid(&bytes, outer_cols, outer_rows);
@@ -129,8 +80,8 @@ fn wide_char_line_renders_inside_band() {
     let (band, outer_cols, outer_rows) = (40u16, 100u16, 24u16);
     // 一二三 = E4 B8 80  E4 BA 8C  E4 B8 89 at the home position.
     let child = "/bin/sh -c 'printf \"\\033[1;1H\\344\\270\\200\\344\\272\\214\\344\\270\\211\"; sleep 3'";
-    let cmd = gutter_in_terminal(outer_cols, outer_rows, &format!("--width {band} --left {child}"));
-    let mut session = spawn(cmd);
+    let mut session =
+        spawn_gutter(outer_cols, outer_rows, &format!("--width {band} --left {child}"));
     let bytes = drain_window(&mut session, Duration::from_millis(800));
 
     let parser = outer_grid(&bytes, outer_cols, outer_rows);

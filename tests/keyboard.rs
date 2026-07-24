@@ -26,10 +26,10 @@
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod common;
-use common::{drain_window, find, pty_guard, spawn_gutter};
+use common::{drain_window, pty_guard, read_until, spawn_gutter};
 
 /// The outer terminal these tests run gutter in.
 const OUTER_COLS: u16 = 120;
@@ -66,6 +66,25 @@ fn echo_transcript(child: &str, payload: &[u8]) -> String {
     text
 }
 
+/// Write every case into one session, separated by a marker so a failure can be
+/// read off the transcript, and assert each arrived in caret notation.
+fn assert_all_arrive(cases: &[(&str, &[u8])], why: &str) {
+    let mut payload: Vec<u8> = Vec::new();
+    for (_, bytes) in cases {
+        payload.extend_from_slice(bytes);
+        payload.push(b'.');
+    }
+    let text = transcript(&payload);
+
+    for (name, bytes) in cases {
+        let caret = caret_notation(bytes);
+        assert!(
+            text.contains(&caret),
+            "{name} ({caret}) {why}; transcript was {text:?}"
+        );
+    }
+}
+
 /// **The keys that go silently dead when this breaks.** Delete, Home, End, PageUp,
 /// PageDown, Insert, Shift+Tab and F1–F12 each have to arrive at the child
 /// verbatim; a key that reaches it as nothing at all is a key that does literally
@@ -87,22 +106,7 @@ fn keys_that_were_silently_dead_reach_the_child() {
         ("F5", b"\x1b[15~"),
         ("F12", b"\x1b[24~"),
     ];
-    // One session for the whole battery, separated by a marker so a failure can be
-    // read off the transcript.
-    let mut payload: Vec<u8> = Vec::new();
-    for (_, bytes) in cases {
-        payload.extend_from_slice(bytes);
-        payload.push(b'.');
-    }
-    let text = transcript(&payload);
-
-    for (name, bytes) in cases {
-        let caret = caret_notation(bytes);
-        assert!(
-            text.contains(&caret),
-            "{name} ({caret}) must reach the child; transcript was {text:?}"
-        );
-    }
+    assert_all_arrive(cases, "must reach the child");
 }
 
 /// The keys that arrive as *something*, where the risk is the wrong thing: a
@@ -122,20 +126,7 @@ fn modified_and_alt_keys_arrive_byte_identical() {
         ("xterm-form Shift+Enter", b"\x1b[27;2;13~"),
         ("kitty Ctrl+a", b"\x1b[97;5u"),
     ];
-    let mut payload: Vec<u8> = Vec::new();
-    for (_, bytes) in cases {
-        payload.extend_from_slice(bytes);
-        payload.push(b'.');
-    }
-    let text = transcript(&payload);
-
-    for (name, bytes) in cases {
-        let caret = caret_notation(bytes);
-        assert!(
-            text.contains(&caret),
-            "{name} ({caret}) must arrive byte-identical; transcript was {text:?}"
-        );
-    }
+    assert_all_arrive(cases, "must arrive byte-identical");
 }
 
 /// The same child, announcing itself once its own `stty raw` has landed.
@@ -152,15 +143,8 @@ fn ready_transcript(payload: &[u8]) -> String {
         OUTER_ROWS,
         &format!("--width 100 {READY_CARET_ECHO_CHILD}"),
     );
-    let mut seen = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        seen.extend_from_slice(&drain_window(&mut session, Duration::from_millis(100)));
-        if find(&seen, b"READY").is_some() {
-            break;
-        }
-    }
-    assert!(find(&seen, b"READY").is_some(), "the child never came up");
+    let (_, seen) = read_until(&mut session, "READY", Duration::from_secs(5));
+    assert!(seen.contains("READY"), "the child never came up");
 
     session.write_all(payload).unwrap();
     session.flush().unwrap();

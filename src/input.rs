@@ -9,8 +9,8 @@ use std::sync::mpsc::Sender;
 
 use crate::msg::Msg;
 
-/// Buffer size for one `read()`. Comfortably larger than any single key
-/// sequence or paste burst a terminal delivers in one write.
+/// Buffer size for one `read()`. A larger burst is simply read again on the next
+/// pass — the scanner on the render thread carries state across chunks.
 const READ_BUF: usize = 4096;
 
 /// Pumps the outer tty until EOF, a read error, or the merged channel closing.

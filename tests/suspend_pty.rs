@@ -33,82 +33,10 @@
 //! Headless: a real PTY, no display, `TERM=xterm-256color`.
 
 use std::io::Write;
-use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use expectrl::process::unix::WaitStatus;
-use expectrl::process::Healthcheck;
-use expectrl::session::OsSession;
-
-/// Serialize every PTY test in this binary — run in parallel they flake under
-/// PTY/process contention (issue #1). Mirrors `tests/pty.rs`'s guard; take it on
-/// the first line of each test and hold it for the whole test.
-fn pty_guard() -> MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Path to the freshly-built `gutter` binary (cargo sets this for the test).
-fn gutter_bin() -> String {
-    env!("CARGO_BIN_EXE_gutter").to_string()
-}
-
-/// Spawn gutter under a real 80x24 PTY wrapping `gutter_args` (a single string so
-/// the inner `sh` parses any nested quoting). `stty` pins the size before gutter
-/// reads it; `GUTTER_FORCE_ANCHOR_ROW=0` pins the inline anchor.
-fn spawn_gutter(gutter_args: &str) -> OsSession {
-    let script = format!(
-        "stty cols 80 rows 24; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    OsSession::spawn(cmd).expect("spawn gutter under PTY")
-}
-
-/// Drain a bounded wall-clock window using non-blocking reads, returning every
-/// byte the outer terminal emitted. Stops early on EOF (child + gutter gone).
-fn drain_window(session: &mut OsSession, window: Duration) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    let start = Instant::now();
-    while start.elapsed() < window {
-        match session.try_read(&mut buf) {
-            Ok(0) => break, // EOF
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    out
-}
-
-/// Index of the first occurrence of `needle` in `hay`, if any.
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Block (up to `timeout`) on gutter's exit and return its code, or `None` if it
-/// died by signal or never exited. Polls `get_status` (non-blocking `waitpid`)
-/// like `tests/pty.rs`'s helper.
-fn wait_exit(session: &OsSession, timeout: Duration) -> Option<i32> {
-    let proc = session.get_process();
-    let start = Instant::now();
-    loop {
-        match proc.get_status() {
-            Ok(WaitStatus::Exited(_, code)) => return Some(code),
-            Ok(WaitStatus::Signaled(_, _, _)) => return None,
-            _ => {}
-        }
-        if start.elapsed() > timeout {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
+mod common;
+use common::{drain_window, find, pty_guard, spawn_gutter, wait_exit};
 
 // The head of gutter's mouse disable and the cursor-show — both part of the park
 // restore (and again at final teardown). Finding them BEFORE the resume marker is
@@ -129,7 +57,11 @@ const MOUSE_ON: &[u8] = b"\x1b[?1000h";
 fn self_stop_parks_then_resumes() {
     let _g = pty_guard();
     let mut s =
-        spawn_gutter("--width 40 sh -c 'printf START; kill -STOP $$; printf RESUMED; sleep 0.2'");
+        spawn_gutter(
+            80,
+            24,
+            "--width 40 sh -c 'printf START; kill -STOP $$; printf RESUMED; sleep 0.2'",
+        );
 
     let out = drain_window(&mut s, Duration::from_secs(5));
 
@@ -163,7 +95,7 @@ fn self_stop_parks_then_resumes() {
 #[test]
 fn alt_screen_left_at_park_reentered_at_resume() {
     let _g = pty_guard();
-    let mut s = spawn_gutter(
+    let mut s = spawn_gutter(80, 24, 
         "--width 40 sh -c 'tput smcup; printf READY; sleep 0.3; kill -STOP $$; sleep 0.3; tput rmcup'",
     );
 
@@ -196,7 +128,11 @@ fn alt_screen_left_at_park_reentered_at_resume() {
 #[test]
 fn child_sigkilled_across_suspend_exits_137() {
     let _g = pty_guard();
-    let mut s = spawn_gutter("--width 40 sh -c 'printf START; kill -STOP $$; kill -KILL $$'");
+    let mut s = spawn_gutter(
+        80,
+        24,
+        "--width 40 sh -c 'printf START; kill -STOP $$; kill -KILL $$'",
+    );
 
     let out = drain_window(&mut s, Duration::from_secs(2));
     assert!(find(&out, b"START").is_some(), "child ran before stopping");
@@ -221,7 +157,7 @@ fn child_sigkilled_across_suspend_exits_137() {
 #[test]
 fn relayed_modes_are_reset_at_park_and_replayed_at_resume() {
     let _g = pty_guard();
-    let mut s = spawn_gutter(
+    let mut s = spawn_gutter(80, 24, 
         "--width 40 sh -c 'printf \"\\033[>1u\"; printf START; sleep 0.3; kill -STOP $$; printf RESUMED; sleep 0.2'",
     );
 
@@ -247,7 +183,7 @@ fn relayed_modes_are_reset_at_park_and_replayed_at_resume() {
 #[test]
 fn input_reaches_child_after_resume() {
     let _g = pty_guard();
-    let mut s = spawn_gutter(
+    let mut s = spawn_gutter(80, 24, 
         "--width 40 sh -c 'printf START; kill -STOP $$; read x; printf \"GOT-$x\"; sleep 0.1'",
     );
 

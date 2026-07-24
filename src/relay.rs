@@ -37,7 +37,7 @@ const KITTY_SET_NONE: &[u8] = b"\x1b[=0;1u";
 /// One relayed kitty mode change, kept so teardown can undo it and resume can
 /// replay it. Stores the exact bytes that went out, so no protocol semantics — flag
 /// defaults, or the set form's assign/or/and-not modes — ever need re-deriving.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 enum KittyOp {
     /// `CSI > flags u` — one level pushed onto the terminal's stack.
     Push(Vec<u8>),

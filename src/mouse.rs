@@ -14,16 +14,17 @@ use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::scan::MouseReport;
 
-/// The SGR final byte: `M` for a press or motion, `m` for a release. Encoding a
-/// release with `M` would tell the child the button is still down (a stuck-button
-/// bug) — `encode_sgr` and its golden-byte test pin this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SgrKind {
-    /// Press or motion — final byte `M`.
-    Press,
-    /// Release — final byte `m`.
-    Release,
-}
+/// Eager mouse capture (ADR-005): X10 compatibility, button-motion, any-motion,
+/// then SGR-1006 for the extended coordinate encoding.
+///
+/// Written out rather than using crossterm's `EnableMouseCapture`, which also
+/// sends `?1015h` (the urxvt encoding). What gutter asks the terminal for has to
+/// stay inside what the scanner can extract, and the scanner recognises the SGR
+/// shape only — a terminal that honoured `?1015h` would send reports gutter does
+/// not extract and they would leak to the child as literal garbage (ADR-020).
+pub const MOUSE_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+/// The matching reset forms, in the same order.
+pub const MOUSE_DISABLE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 
 /// What the render loop should do with one decoded outer mouse event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,19 +39,15 @@ pub enum MouseDecision {
     BailNonSgr,
 }
 
-/// The facts the gate needs about one mouse report, derived once by
-/// [`classify`] from the SGR button byte.
-struct Classified {
-    /// The SGR button byte (low button bits + motion bit 32 + wheel bits 64).
-    button_byte: u16,
-    /// Press/motion (`M`) vs release (`m`) final byte.
-    kind: SgrKind,
-    /// Whether this event is a motion event (`Drag`/`Moved`), gated by the
-    /// down-filter against the child's mode.
+/// What one report's button byte implies for the down-filter and the button-held
+/// tracker. The byte itself and the press/release flag are forwarded straight from
+/// the report, so nothing else needs deriving.
+struct ButtonFacts {
+    /// Whether this is a motion report, gated by the down-filter against the
+    /// child's mode.
     is_motion: bool,
-    /// A press/release transition that updates the button-held tracker:
     /// `Some(true)` for a press (button now down), `Some(false)` for a release
-    /// (button now up), `None` for motion and wheel events (no transition).
+    /// (button now up), `None` for motion and wheel reports, which are neither.
     press_transition: Option<bool>,
 }
 
@@ -115,7 +112,12 @@ impl MouseGate {
         // Rows pass through unchanged — the band spans the full height, only
         // columns carry the margin. translate_col discards gutter / out-of-band.
         match translate_col(report.col, left_margin, w) {
-            Some(col0) => MouseDecision::Forward(encode_sgr(c.button_byte, col0, report.row, c.kind)),
+            Some(col0) => MouseDecision::Forward(encode_sgr(
+                report.button,
+                col0,
+                report.row,
+                report.release,
+            )),
             None => MouseDecision::Swallow,
         }
     }
@@ -156,7 +158,7 @@ fn should_forward_motion(mode: MouseProtocolMode, button_held: bool) -> bool {
     }
 }
 
-/// Derive the down-filter and button-tracker facts from the SGR button byte.
+/// Read the down-filter and button-tracker facts off the SGR button byte.
 ///
 /// The button byte: the low 2 bits select the button (0 left, 1 middle, 2 right,
 /// 3 "no button"); bits 2–4 carry the shift/alt/ctrl modifiers and are passed
@@ -166,38 +168,25 @@ fn should_forward_motion(mode: MouseProtocolMode, button_held: bool) -> bool {
 /// Only a real press or release moves the button-held tracker. Motion and wheel
 /// reports are neither, and counting them would invert the `ButtonMotion`
 /// down-filter (ADR-005).
-fn classify(report: &MouseReport) -> Classified {
+fn classify(report: &MouseReport) -> ButtonFacts {
     const MOTION: u16 = 32;
     const WHEEL: u16 = 64;
 
     let is_motion = report.button & MOTION != 0;
     let is_wheel = report.button & WHEEL != 0;
-    Classified {
-        button_byte: report.button,
-        kind: if report.release {
-            SgrKind::Release
-        } else {
-            SgrKind::Press
-        },
+    ButtonFacts {
         is_motion,
-        press_transition: if is_motion || is_wheel {
-            None
-        } else if report.release {
-            Some(false)
-        } else {
-            Some(true)
-        },
+        press_transition: (!is_motion && !is_wheel).then_some(!report.release),
     }
 }
 
 /// Format an SGR 1006 mouse report: `CSI < b ; col+1 ; row+1 M|m`. `col0`/`row0`
-/// are 0-based (vt100/crossterm convention); SGR is 1-based, so each gets `+1`.
-/// `M` for press/motion, `m` for release.
-fn encode_sgr(button_byte: u16, col0: u16, row0: u16, kind: SgrKind) -> Vec<u8> {
-    let final_byte = match kind {
-        SgrKind::Press => 'M',
-        SgrKind::Release => 'm',
-    };
+/// are 0-based as the scanner reports them; SGR is 1-based, so each gets `+1`.
+///
+/// A release takes the lowercase `m`. Encoding one with `M` would tell the child
+/// the button is still down — a stuck-button bug the golden-byte tests pin.
+fn encode_sgr(button_byte: u16, col0: u16, row0: u16, release: bool) -> Vec<u8> {
+    let final_byte = if release { 'm' } else { 'M' };
     format!(
         "\x1b[<{};{};{}{}",
         button_byte,
@@ -241,25 +230,19 @@ mod tests {
     #[test]
     fn encode_sgr_press_at_origin() {
         // A left press at child col 0 row 0 → CSI < 0 ; 1 ; 1 M.
-        assert_eq!(encode_sgr(0, 0, 0, SgrKind::Press), b"\x1b[<0;1;1M".to_vec());
+        assert_eq!(encode_sgr(0, 0, 0, false), b"\x1b[<0;1;1M".to_vec());
     }
 
     #[test]
     fn encode_sgr_release_uses_lowercase_m() {
         // A release → ... m, never M (the stuck-button guard).
-        assert_eq!(
-            encode_sgr(0, 0, 0, SgrKind::Release),
-            b"\x1b[<0;1;1m".to_vec()
-        );
+        assert_eq!(encode_sgr(0, 0, 0, true), b"\x1b[<0;1;1m".to_vec());
     }
 
     #[test]
     fn encode_sgr_adds_one_to_both_coords() {
         // col 9 row 4 (0-based) → 10 ; 5 (1-based).
-        assert_eq!(
-            encode_sgr(2, 9, 4, SgrKind::Press),
-            b"\x1b[<2;10;5M".to_vec()
-        );
+        assert_eq!(encode_sgr(2, 9, 4, false), b"\x1b[<2;10;5M".to_vec());
     }
 
     // --- should_forward_motion truth table ---
@@ -286,8 +269,6 @@ mod tests {
         let c = classify(&drag(0, 0, 0));
         assert!(c.is_motion);
         assert_eq!(c.press_transition, None);
-        // Left (0) | motion (32).
-        assert_eq!(c.button_byte, 32);
     }
 
     #[test]
@@ -295,37 +276,32 @@ mod tests {
         let c = classify(&moved(0, 0));
         assert!(c.is_motion);
         assert_eq!(c.press_transition, None);
-        // No-button (3) | motion (32).
-        assert_eq!(c.button_byte, 35);
     }
 
     #[test]
     fn classify_down_up_transitions() {
         let down = classify(&press(2, 0, 0));
         assert_eq!(down.press_transition, Some(true));
-        assert_eq!(down.kind, SgrKind::Press);
-        assert_eq!(down.button_byte, 2);
         assert!(!down.is_motion);
 
-        let up = classify(&release(2, 0, 0));
-        assert_eq!(up.press_transition, Some(false));
-        assert_eq!(up.kind, SgrKind::Release);
+        assert_eq!(classify(&release(2, 0, 0)).press_transition, Some(false));
     }
 
     #[test]
     fn classify_wheel_is_neither_motion_nor_a_transition() {
         let up = classify(&press(WHEEL, 0, 0));
-        assert_eq!(up.button_byte, 64);
         assert!(!up.is_motion);
         assert_eq!(up.press_transition, None, "a wheel tick never holds a button");
-        assert_eq!(classify(&press(WHEEL | 1, 0, 0)).button_byte, 65);
+        assert!(!classify(&press(WHEEL | 1, 0, 0)).is_motion);
     }
 
     #[test]
-    fn classify_passes_modifier_bits_through() {
-        // Shift-click: button 0 | shift 4. The child must see the modifier.
-        assert_eq!(classify(&press(4, 0, 0)).button_byte, 4);
-        assert_eq!(classify(&press(4, 0, 0)).press_transition, Some(true));
+    fn classify_reads_a_modified_click_as_a_press() {
+        // Shift-click: button 0 | shift 4. The modifier bits must not read as the
+        // motion or wheel bit.
+        let c = classify(&press(4, 0, 0));
+        assert!(!c.is_motion);
+        assert_eq!(c.press_transition, Some(true));
     }
 
     // --- MouseGate::forward branches ---

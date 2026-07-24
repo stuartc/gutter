@@ -60,8 +60,8 @@ pub enum Token {
 }
 
 impl Token {
-    /// The bytes this token carries, for the forwarding path and the
-    /// byte-identity property. `Mouse` carries none — it is consumed by the gate.
+    /// The bytes this token carries. `Mouse` carries none — it is consumed by the
+    /// gate.
     #[cfg(test)]
     pub fn payload(&self) -> &[u8] {
         match self {

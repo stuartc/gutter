@@ -749,7 +749,7 @@ fn walk_tokens<C, T, P, R>(
                         }
                         None => {
                             forward_to_child(pty_writer, rest);
-                            i = run.len();
+                            break;
                         }
                     }
                 }
@@ -1613,11 +1613,11 @@ where
 /// Park the outer terminal (ADR-0019 step 3): leave alt (or hand the shell a fresh
 /// line below the inline band), reset attributes and cursor shape, undo the mirrored
 /// input modes and the child's keyboard modes, disable mouse, show the cursor, and
-/// drop raw mode LAST — then
-/// flush so it all lands before the self-stop. Deliberately does NOT clear
-/// `outer_alt_active`: it stays as "the child's screen is alt" for the resume
-/// re-derivation (the double-meaning note in ADR-0019). The relay's log survives for
-/// the same reason — this is a park, not a teardown, and `unpark` replays it.
+/// drop raw mode LAST — then flush so it all lands before the self-stop.
+/// Deliberately does NOT clear `outer_alt_active`: it stays as "the child's screen
+/// is alt" for the resume re-derivation (the double-meaning note in ADR-0019). The
+/// relay's log survives for the same reason — this is a park, not a teardown, and
+/// `unpark` replays it.
 fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
     // Best-effort per step (ADR-010's "restore by hand, each step conditional"):
     // attempt EVERY restore step even if an earlier one errors, so an early failure

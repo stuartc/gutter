@@ -18,7 +18,7 @@ const CTRL: u8 = 4;
 
 /// The base key of a chord.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChordKey {
+enum ChordKey {
     Char(char),
     Esc,
     Tab,

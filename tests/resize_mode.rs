@@ -21,70 +21,10 @@
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use expectrl::session::OsSession;
-
-fn gutter_bin() -> String {
-    env!("CARGO_BIN_EXE_gutter").to_string()
-}
-
-/// Run gutter inside an outer terminal of the given size:
-/// `sh -c 'stty cols C rows R; exec env gutter <args>'`.
-fn gutter_in_terminal(outer_cols: u16, outer_rows: u16, gutter_args: &str) -> std::process::Command {
-    let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    cmd
-}
-
-fn spawn(cmd: std::process::Command) -> OsSession {
-    OsSession::spawn(cmd).expect("spawn gutter under PTY")
-}
-
-/// Drain a bounded window of output with NON-BLOCKING reads — a wall-clock cap
-/// even while the child keeps the PTY open.
-fn drain_window(session: &mut OsSession, window: Duration) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    let start = Instant::now();
-    while start.elapsed() < window {
-        match session.try_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    out
-}
-
-/// Parse outer-terminal bytes through a vt100 at the given physical size.
-fn outer_grid(bytes: &[u8], cols: u16, rows: u16) -> vt100::Parser {
-    let mut p = vt100::Parser::new(rows, cols, 0);
-    p.process(bytes);
-    p
-}
-
-/// The physical column of the first painted (non-blank) cell on row 0, or `None`
-/// if the row is blank.
-fn first_painted_col(screen: &vt100::Screen, cols: u16) -> Option<u16> {
-    for c in 0..cols {
-        if let Some(cell) = screen.cell(0, c) {
-            let s = cell.contents();
-            if !s.is_empty() && s != " " {
-                return Some(c);
-            }
-        }
-    }
-    None
-}
+mod common;
+use common::{drain_window, first_painted_col, outer_grid, spawn_gutter};
 
 /// The last painted (non-blank) physical column on row 0, or `None` if blank.
 fn last_painted_col(screen: &vt100::Screen, cols: u16) -> Option<u16> {
@@ -108,8 +48,8 @@ fn last_painted_col(screen: &vt100::Screen, cols: u16) -> Option<u16> {
 #[test]
 fn resize_key_grows_band() {
     let child = "/bin/sh -c 'trap \"stty size\" WINCH; stty size; while true; do sleep 0.2; done'";
-    let cmd = gutter_in_terminal(160, 40, &format!("--width 60 --left --resize-key ctrl-o {child}"));
-    let mut session = spawn(cmd);
+    let mut session =
+        spawn_gutter(160, 40, &format!("--width 60 --left --resize-key ctrl-o {child}"));
 
     let mut bytes = drain_window(&mut session, Duration::from_millis(500));
     let parser0 = outer_grid(&bytes, 160, 40);
@@ -141,8 +81,8 @@ fn resize_key_grows_band() {
 #[test]
 fn resize_key_shrinks_band() {
     let child = "/bin/sh -c 'trap \"stty size\" WINCH; stty size; while true; do sleep 0.2; done'";
-    let cmd = gutter_in_terminal(160, 40, &format!("--width 60 --left --resize-key ctrl-o {child}"));
-    let mut session = spawn(cmd);
+    let mut session =
+        spawn_gutter(160, 40, &format!("--width 60 --left --resize-key ctrl-o {child}"));
 
     let _ = drain_window(&mut session, Duration::from_millis(500));
 
@@ -171,8 +111,7 @@ fn resize_key_shrinks_band() {
 /// mode really released the key, it did not swallow it as a stray in-mode key).
 #[test]
 fn esc_exits_mode_key_reaches_child() {
-    let cmd = gutter_in_terminal(120, 40, "--width 60 --resize-key ctrl-o /bin/cat");
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, "--width 60 --resize-key ctrl-o /bin/cat");
     std::thread::sleep(Duration::from_millis(300));
 
     session.write_all(&[0x0F]).unwrap(); // enter
@@ -201,8 +140,7 @@ fn esc_exits_mode_key_reaches_child() {
 #[test]
 fn default_chord_enters_via_raw_fs_byte() {
     let child = "/bin/sh -c 'trap \"stty size\" WINCH; stty size; while true; do sleep 0.2; done'";
-    let cmd = gutter_in_terminal(160, 40, &format!("--width 60 --left {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(160, 40, &format!("--width 60 --left {child}"));
 
     let mut bytes = drain_window(&mut session, Duration::from_millis(500));
     let parser0 = outer_grid(&bytes, 160, 40);
@@ -236,8 +174,7 @@ fn default_chord_enters_via_raw_fs_byte() {
 /// mode stays active — a following resize key still works.
 #[test]
 fn swallowed_key_does_not_leak_and_mode_persists() {
-    let cmd = gutter_in_terminal(120, 40, "--width 60 --resize-key ctrl-o /bin/cat");
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, "--width 60 --resize-key ctrl-o /bin/cat");
     std::thread::sleep(Duration::from_millis(300));
 
     session.write_all(&[0x0F]).unwrap(); // enter

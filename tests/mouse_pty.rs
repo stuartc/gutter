@@ -28,61 +28,10 @@
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use expectrl::session::OsSession;
-
-fn gutter_bin() -> String {
-    env!("CARGO_BIN_EXE_gutter").to_string()
-}
-
-/// Run gutter inside an outer terminal of a fixed size.
-fn gutter_in_terminal(outer_cols: u16, outer_rows: u16, gutter_args: &str) -> std::process::Command {
-    let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    cmd
-}
-
-fn spawn(cmd: std::process::Command) -> OsSession {
-    OsSession::spawn(cmd).expect("spawn gutter under PTY")
-}
-
-/// Drain a bounded window with non-blocking reads, so the window is a real
-/// wall-clock cap even while the child keeps the PTY open.
-fn drain_window(session: &mut OsSession, window: Duration) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    let start = Instant::now();
-    while start.elapsed() < window {
-        match session.try_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    out
-}
-
-fn outer_grid(bytes: &[u8], cols: u16, rows: u16) -> vt100::Parser {
-    let mut p = vt100::Parser::new(rows, cols, 0);
-    p.process(bytes);
-    p
-}
-
-fn grid_text(screen: &vt100::Screen, cols: u16, rows: u16) -> String {
-    (0..rows)
-        .map(|r| screen.rows(0, cols).nth(r as usize).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+mod common;
+use common::{drain_window, grid_text, spawn_gutter};
 
 /// A child that negotiates SGR press/release mouse, then idles. The tty driver is
 /// in cooked mode, so any bytes gutter forwards to the child's stdin are echoed
@@ -102,8 +51,7 @@ fn sgr_mouse_child() -> String {
 #[test]
 fn first_click_delivered_with_margin_subtracted() {
     let child = sgr_mouse_child();
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 40 --center {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, &format!("--width 40 --center {child}"));
     // Let gutter come up and the child negotiate mouse (vt100 must see the DECSET
     // so the gate forwards — eager capture is already on the outer terminal).
     std::thread::sleep(Duration::from_millis(600));
@@ -115,8 +63,7 @@ fn first_click_delivered_with_margin_subtracted() {
     session.flush().unwrap();
 
     let bytes = drain_window(&mut session, Duration::from_millis(900));
-    let parser = outer_grid(&bytes, 120, 40);
-    let text = grid_text(parser.screen(), 120, 40);
+    let text = grid_text(&bytes, 120, 40);
     // The child received `CSI < 0 ; 6 ; 5 M`, echoed in caret notation.
     assert!(
         text.contains("^[[<0;6;5M"),
@@ -133,8 +80,7 @@ fn first_click_delivered_with_margin_subtracted() {
 #[test]
 fn gutter_click_delivers_nothing() {
     let child = sgr_mouse_child();
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 40 --center {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, &format!("--width 40 --center {child}"));
     std::thread::sleep(Duration::from_millis(600));
 
     // Click at wire col 6 (0-based phys 5) — left of the margin-40 band.
@@ -142,8 +88,7 @@ fn gutter_click_delivers_nothing() {
     session.flush().unwrap();
 
     let bytes = drain_window(&mut session, Duration::from_millis(700));
-    let parser = outer_grid(&bytes, 120, 40);
-    let text = grid_text(parser.screen(), 120, 40);
+    let text = grid_text(&bytes, 120, 40);
     // No echoed SGR report (`^[[<` is the start of an SGR report) — the gutter
     // click was discarded, so nothing reached the child to echo.
     assert!(
@@ -162,16 +107,14 @@ fn gutter_click_delivers_nothing() {
 #[test]
 fn shift_click_keeps_the_modifier_bit() {
     let child = sgr_mouse_child();
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 40 --center {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, &format!("--width 40 --center {child}"));
     std::thread::sleep(Duration::from_millis(600));
 
     session.write_all(b"\x1b[<4;46;5M").unwrap();
     session.flush().unwrap();
 
     let bytes = drain_window(&mut session, Duration::from_millis(900));
-    let parser = outer_grid(&bytes, 120, 40);
-    let text = grid_text(parser.screen(), 120, 40);
+    let text = grid_text(&bytes, 120, 40);
     assert!(
         text.contains("^[[<4;6;5M"),
         "the shift bit must survive the margin translation; grid was {text:?}"

@@ -16,9 +16,12 @@
 //!
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use expectrl::session::OsSession;
+
+mod common;
+use common::{assert_cols_blank, drain_window, outer_grid, wait_exit};
 
 fn gutter_bin() -> String {
     env!("CARGO_BIN_EXE_gutter").to_string()
@@ -83,49 +86,6 @@ fn gutter_replaying_then_exit(
     let mut cmd = std::process::Command::new("/bin/sh");
     cmd.arg("-c").arg(script);
     OsSession::spawn(cmd).expect("spawn gutter under PTY")
-}
-
-/// Bounded, non-blocking drain — a wall-clock cap even while the child idles, so
-/// the live alt-screen frame is captured (not the discarded post-exit screen).
-fn drain_window(session: &mut OsSession, window: Duration) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    let start = Instant::now();
-    while start.elapsed() < window {
-        match session.try_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    out
-}
-
-/// Parse outer-terminal bytes through a vt100 at the given physical size.
-fn outer_grid(bytes: &[u8], cols: u16, rows: u16) -> vt100::Parser {
-    let mut p = vt100::Parser::new(rows, cols, 0);
-    p.process(bytes);
-    p
-}
-
-/// Assert the physical columns `[from, to)` on every row are blank — no stale
-/// gutter cells.
-fn assert_cols_blank(screen: &vt100::Screen, from: u16, to: u16, rows: u16) {
-    for r in 0..rows {
-        for c in from..to {
-            if let Some(cell) = screen.cell(r, c) {
-                let s = cell.contents();
-                assert!(
-                    s.is_empty() || s == " ",
-                    "gutter cell ({r},{c}) must be blank, found {s:?}"
-                );
-            }
-        }
-    }
 }
 
 /// **Reverse-video statusline highlight stops at the band edge (slice 09, the
@@ -331,7 +291,11 @@ fn plain_command_output_survives_to_primary_screen() {
          not be discarded — the E2 regression"
     );
 
-    assert_eq!(wait_status(session), Some(0), "gutter propagates the zero exit");
+    assert_eq!(
+        wait_exit(&session, Duration::from_secs(5)),
+        Some(0),
+        "gutter propagates the zero exit"
+    );
 }
 
 /// **End-to-end child-exit-restore against the live target (slices 01/04/07
@@ -367,7 +331,7 @@ fn child_exit_mid_alt_screen_restores_and_propagates_code() {
     );
 
     assert_eq!(
-        wait_status(session),
+        wait_exit(&session, Duration::from_secs(5)),
         Some(7),
         "gutter must propagate the child's exit code from a mid-alt-screen exit"
     );
@@ -504,7 +468,7 @@ fn inline_clean_hand_back_below_band() {
         );
 
         assert_eq!(
-            wait_status(session),
+            wait_exit(&session, Duration::from_secs(5)),
             Some(exit_code),
             "gutter must propagate the exit code {exit_code}"
         );
@@ -618,27 +582,9 @@ fn inline_alt_excursion_preserves_anchor() {
     );
 
     assert_eq!(
-        wait_status(session),
+        wait_exit(&session, Duration::from_secs(5)),
         Some(0),
         "the inline hand-back propagates the zero exit"
     );
 }
 
-/// Block on the wrapped process and return its exit code, if any.
-fn wait_status(session: OsSession) -> Option<i32> {
-    use expectrl::process::unix::WaitStatus;
-    use expectrl::process::Healthcheck;
-    let proc = session.get_process();
-    let start = Instant::now();
-    loop {
-        match proc.get_status() {
-            Ok(WaitStatus::Exited(_, code)) => return Some(code),
-            Ok(WaitStatus::Signaled(_, _, _)) => return None,
-            _ => {}
-        }
-        if start.elapsed() > Duration::from_secs(5) {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}

@@ -31,7 +31,7 @@ const BRACKETED_PASTE_OFF: &[u8] = b"\x1b[?2004l";
 /// diffed against the `prev` parser: `contents_formatted` — what `sync_prev` replays
 /// — deliberately excludes the input modes, so `prev`'s flags sit at their defaults
 /// for ever and a diff against it would re-emit every frame.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct ModeMirror {
     application_cursor: bool,
     application_keypad: bool,
