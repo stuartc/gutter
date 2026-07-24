@@ -39,6 +39,8 @@ The scanner's grammar is small and closed:
 - **Recognise** the reserved resize chord (ADR-016).
 - **Track** bracketed-paste guards, so a literal chord byte inside a paste is
   forwarded rather than interpreted.
+- **Delimit** OSC/DCS/APC/PM/SOS string sequences, so an arbitrary payload — a
+  terminal's colour or clipboard reply — is forwarded rather than interpreted.
 - **Buffer** sequences split across reads.
 - Everything else is `write_all` to the PTY.
 

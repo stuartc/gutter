@@ -47,6 +47,11 @@ pub enum Token {
     /// Bytes between bracketed-paste guards. Forwarded verbatim and never
     /// inspected — not for the chord, not for the in-mode table, not for mouse.
     Paste(Vec<u8>),
+    /// Bytes of an OSC/DCS/APC/PM/SOS string sequence, guards included. Forwarded
+    /// verbatim and never inspected: a payload is arbitrary data (base64, a
+    /// colour spec) that can hold any byte, so matching it against the chord or
+    /// the in-mode table would step the band on a terminal's reply.
+    Str(Vec<u8>),
     /// A complete SGR-1006 report, coordinates still in physical columns.
     Mouse(MouseReport),
 }
@@ -57,7 +62,7 @@ impl Token {
     #[cfg(test)]
     pub fn payload(&self) -> &[u8] {
         match self {
-            Token::Text(b) | Token::Seq(b) | Token::Paste(b) => b,
+            Token::Text(b) | Token::Seq(b) | Token::Paste(b) | Token::Str(b) => b,
             Token::Mouse(_) => &[],
         }
     }
@@ -200,6 +205,7 @@ impl Scanner {
                 State::Str => {
                     self.run.push(b);
                     if b == BEL {
+                        self.emit_run(out);
                         self.state = State::Ground;
                     } else if b == ESC {
                         self.state = State::StrEsc;
@@ -207,11 +213,12 @@ impl Scanner {
                 }
                 State::StrEsc => {
                     self.run.push(b);
-                    self.state = if b == b'\\' {
-                        State::Ground
+                    if b == b'\\' {
+                        self.emit_run(out);
+                        self.state = State::Ground;
                     } else {
-                        State::Str
-                    };
+                        self.state = State::Str;
+                    }
                 }
             }
         }
@@ -225,15 +232,20 @@ impl Scanner {
         if !self.pending.is_empty() {
             let held = std::mem::take(&mut self.pending);
             self.emit_loose(held, out);
+            self.state = State::Ground;
         }
-        self.state = State::Ground;
     }
 
-    /// Close off the accumulated ordinary run.
+    /// Close off the accumulated run — ordinary bytes, or the part of a string
+    /// sequence seen so far.
     fn emit_run(&mut self, out: &mut Vec<Token>) {
-        if !self.run.is_empty() {
-            let run = std::mem::take(&mut self.run);
-            self.emit_loose(run, out);
+        if self.run.is_empty() {
+            return;
+        }
+        let run = std::mem::take(&mut self.run);
+        match self.state {
+            State::Str | State::StrEsc => out.push(Token::Str(run)),
+            _ => self.emit_loose(run, out),
         }
     }
 
@@ -376,6 +388,39 @@ mod tests {
         s.feed(dcs, &mut out);
         assert_eq!(payloads(&out), dcs.to_vec());
         assert!(!s.holding());
+    }
+
+    /// A string payload is arbitrary data. An OSC 52 answer's base64 routinely
+    /// carries `h`, `l`, `+` and `=`, and nothing stops a terminal putting a
+    /// `0x1c` in one — none of it may reach the classifier.
+    #[test]
+    fn string_payloads_are_never_offered_to_the_classifier() {
+        let osc = b"\x1b]52;c;aGVsbG8rbGw=\x07";
+        assert_eq!(scan(osc), vec![Token::Str(osc.to_vec())]);
+
+        let with_chord = b"\x1bP\x1c\x1b\\";
+        assert_eq!(scan(with_chord), vec![Token::Str(with_chord.to_vec())]);
+
+        // Ground bytes on either side stay ordinary and matchable.
+        assert_eq!(
+            scan(b"a\x1b]0;t\x07b"),
+            vec![
+                Token::Text(b"a".to_vec()),
+                Token::Str(b"\x1b]0;t\x07".to_vec()),
+                Token::Text(b"b".to_vec()),
+            ]
+        );
+
+        // A payload split across reads stays Str on both sides.
+        let mut s = Scanner::new();
+        let mut out = Vec::new();
+        s.feed(b"\x1b]52;c;aGVs", &mut out);
+        s.feed(b"bG8=\x07", &mut out);
+        assert!(
+            out.iter().all(|t| matches!(t, Token::Str(_))),
+            "a split payload must not surface as Text: {out:?}"
+        );
+        assert_eq!(payloads(&out), b"\x1b]52;c;aGVsbG8=\x07".to_vec());
     }
 
     #[test]

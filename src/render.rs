@@ -658,9 +658,10 @@ fn walk_tokens<C, T, P, R>(
 {
     for token in tokens {
         match token {
-            // Pasted bytes are data, not input protocol: nothing is extracted,
-            // nothing is matched, nothing is dropped.
-            Token::Paste(bytes) => forward_to_child(pty_writer, bytes),
+            // Pasted text and string-sequence payloads are data, not input
+            // protocol: nothing is extracted, nothing is matched, nothing is
+            // dropped.
+            Token::Paste(bytes) | Token::Str(bytes) => forward_to_child(pty_writer, bytes),
             Token::Mouse(report) => {
                 // The mouse forwarding gate (ADR-005). Read the child's
                 // (mode, encoding) from the live screen FIRST: this runs after the
