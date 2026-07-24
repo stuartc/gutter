@@ -1,6 +1,6 @@
 # ADR-002: Keyboard always re-encoded
 
-Status: Accepted
+Status: Superseded by [ADR-020](0020-raw-input-passthrough.md)
 
 ## Context
 
@@ -28,3 +28,11 @@ kitty `CSI … u` when it is on.
 - `src/render.rs` — input dispatch re-encodes at the child's live level
 
 See also [ADR-003](0003-two-independent-kitty-states.md) for how the level is tracked.
+
+---
+
+Superseded by [ADR-020](0020-raw-input-passthrough.md). The premise — that
+crossterm hands us a decoded `KeyEvent` with no raw bytes — held only while
+crossterm owned the input fd. gutter now reads the tty itself, so the raw bytes
+are available and re-encoding is no longer forced. Everything above is kept for
+the record; none of it describes current behaviour.

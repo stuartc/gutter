@@ -6,8 +6,9 @@ Status: Accepted
 
 We can't react to the child's mouse negotiation the way the original plan assumed:
 the child's `CSI ?1006h` and friends are DECSET private modes that vt100 absorbs
-into its screen state, so they never reach `unhandled_csi`. crossterm also has no
-"mode changed" event to hook.
+into its screen state, so they never reach `unhandled_csi`. That is true whoever
+reads the input fd, so a per-frame poll of the screen is the only mirror point
+available.
 
 ## Decision
 
@@ -32,9 +33,18 @@ re-encode as SGR-1006. Only SGR is emitted; a non-SGR encoding bails loudly.
 - Coordinate translation subtracts the margin with `checked_sub`: a click that
   lands in the gutter underflows to `None` and is dropped, never forwarded to the
   child.
+- The input side is now gutter's own scanner (ADR-020), not crossterm's decoder.
+  The gate's contract is unchanged; only the type of its input moved from a
+  decoded event to an extracted SGR report, whose button byte — modifier bits and
+  all — is passed through rather than rebuilt.
+- gutter writes the outer enable/disable bytes itself rather than using
+  crossterm's bundle, deliberately omitting `?1015h`: the scanner recognises the
+  SGR shape only, and reports in the urxvt encoding would leak to the child.
 
 ## Code anchors
 
 - `src/mouse.rs` — the gate, the button-held tracker, coordinate translation
+- `src/scan.rs` — SGR extraction on the input side
+- `src/terminal.rs` — the hand-written enable/disable byte strings
 - `src/main.rs` — the one eager capture call
 - `src/render.rs` — the per-frame live poll

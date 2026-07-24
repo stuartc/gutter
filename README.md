@@ -118,8 +118,8 @@ A few things worth knowing:
 
 ## What passes through
 
-- **Keyboard**, including the kitty keyboard protocol where your terminal
-  supports it (re-encoded to whatever level the child negotiates).
+- **Keyboard**, byte for byte: whatever your terminal sends is what the child
+  receives, with only the reserved resize chord held back.
 - **Mouse**, with coordinates translated into the band.
 - **Clipboard**, via OSC 52.
 - **Resizes** — the child is told its new size, and proportional widths

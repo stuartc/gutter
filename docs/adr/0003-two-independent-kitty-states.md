@@ -32,3 +32,12 @@ touches only `kitty_state`, never the clipboard.
 - `src/callbacks.rs` — the shared struct and the `unhandled_csi` watcher
 - `src/keyboard/kitty_state.rs` — the push/pop stack and clamp
 - `src/main.rs` — the startup capability probe
+
+---
+
+**Amended by [ADR-020](0020-raw-input-passthrough.md).** Both states are gone.
+gutter no longer probes the outer terminal's capability, no longer pushes flags
+of its own, and no longer tracks or clamps the child's level — under raw
+passthrough there is nothing to encode at, so there is nothing to know. What
+remains of this record is the reasoning for why the two sides were ever
+independent, which is still the right frame for the relay that replaces them.

@@ -11,15 +11,18 @@ after disabling raw mode and the terminal is left corrupted.
 ## Decision
 
 Restore explicitly, in order, before exiting: leave the alt screen (or hand back
-inline) → pop kitty flags → disable mouse → show cursor → disable raw mode. Each
-step is conditional on what was actually set up.
+inline) → undo whatever input modes gutter set on the child's behalf → disable
+mouse → show cursor → disable raw mode. Each step is conditional on what was
+actually set up.
 
 ## Consequences
 
 - All cleanup is in one teardown path; nothing relies on `Drop`.
 - The alt-leave only fires if the child exited in the alt screen. A plain command's
   output is left on the primary screen.
-- The kitty pop only fires if we pushed a level.
+- gutter never resets a mode it did not set. Under raw passthrough (ADR-020) it
+  sets no keyboard mode of its own at all, so that slot is currently empty; the
+  rule is what keeps it honest when the child's own requests start being relayed.
 - Disabling mouse, showing the cursor, and disabling raw mode are always safe to
   call unconditionally.
 

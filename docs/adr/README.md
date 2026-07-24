@@ -6,7 +6,7 @@ The decisions behind gutter's design. Code comments reference these by number
 | # | Decision |
 |---|----------|
 | [001](0001-two-emulator-equivalence-gate.md) | Two-emulator equivalence gate |
-| [002](0002-keyboard-always-re-encoded.md) | Keyboard always re-encoded |
+| [002](0002-keyboard-always-re-encoded.md) | Keyboard always re-encoded — superseded by [020](0020-raw-input-passthrough.md) |
 | [003](0003-two-independent-kitty-states.md) | Two independent kitty states |
 | [004](0004-osc52-clipboard-separate-tty.md) | OSC-52 clipboard to a separate `/dev/tty` |
 | [005](0005-mouse-eager-capture-poll-gate.md) | Mouse eager capture and poll-diff gate |
@@ -24,6 +24,7 @@ The decisions behind gutter's design. Code comments reference these by number
 | [017](0017-uniform-margin-management.md) | Uniform margin management |
 | [018](0018-stop-aware-waiter.md) | Stop-aware waiter (`waitpid` + `WUNTRACED`/`WCONTINUED`) |
 | [019](0019-suspend-resume-cycle-ordering.md) | Suspend/resume cycle ordering |
+| [020](0020-raw-input-passthrough.md) | Raw input passthrough |
 
 ## Format
 

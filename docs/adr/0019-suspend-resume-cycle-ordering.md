@@ -43,17 +43,18 @@ process. This is the entire point of the fix: today's bug is exactly *not* doing
 this.
 
 **Raw mode dropped last, re-taken first.** `unpark()` mirrors `park()` in reverse,
-with raw mode re-enabled *first* — before kitty, mouse, or alt screen — to shrink
-the cooked-mode window during which the already-running input thread (Thread 3,
-which owns crossterm's event source across the whole suspend) could see canonical
-rather than raw input.
+with raw mode re-enabled *first* — before mouse or alt screen — to shrink the
+cooked-mode window during which the already-running input thread (Thread 3, which
+owns the tty read fd across the whole suspend) could see canonical rather than raw
+input.
 
-**No kitty re-probe, no CPR, at resume.** Both would need a round-trip read of
-crossterm's event source, which Thread 3 already owns and never releases during
-suspend (it freezes with the process but never joins or restarts). Re-probing would
-be eaten silently. So `unpark()` re-pushes kitty flags from `outer_supports_kitty`
-— the value captured once at startup, before Thread 3 spawned — and the inline
-anchor is not re-queried at all: **`base_row` is reseeded to the bottom
+**No CPR at resume.** It would need a round-trip read of the tty, which Thread 3
+already owns and never releases during suspend (it freezes with the process but
+never joins or restarts), so the reply would be eaten silently. There is no
+keyboard capability to re-probe either — gutter asks the outer terminal for no
+keyboard mode of its own (ADR-020) — so `unpark()` re-takes raw mode, mouse and
+the alt screen and nothing else. The inline anchor is not re-queried at all:
+**`base_row` is reseeded to the bottom
 (`rows.saturating_sub(1)`)** for primary-screen (non-alt) children, on the
 assumption that the shell scrolled the screen while gutter slept, making the old
 `base_row` meaningless. `render_once`'s make-room scroll then re-lays the band at
@@ -62,8 +63,8 @@ pre-suspend band copy — the same duplication a plain terminal shows after `fg`
 Accepted, not fixed.
 
 **TIOCSWINSZ before child SIGCONT.** The outer terminal may have been resized while
-gutter was stopped; crossterm's own pending-SIGWINCH can coalesce a resize-and-back
-into a stale or missing event, so `unpark` queries `term.terminal_size()` explicitly
+gutter was stopped; a pending SIGWINCH can coalesce a resize-and-back into a stale
+or missing event, so `unpark` queries `term.terminal_size()` explicitly
 and, if it differs from the parser's current size, runs the full ADR-008 resize
 handler. Because this runs *before* `continue_child()`, the `TIOCSWINSZ` queues one
 SIGWINCH on the still-stopped child; the child wakes to a single pending resize and
@@ -155,9 +156,10 @@ no guard against a double call was needed.
   long suspension.
 - Direct `SIGTSTP` sent straight to gutter (not via a child's Ctrl-Z) is
   unaffected by this ADR — gutter has no handler, so it stops in raw mode,
-  corrupting the outer terminal exactly as before. Deferred hardening (a fifth
-  signal-handling thread) is out of scope for this fix; `signal-hook` stays in
-  `Cargo.toml` unused, reserved for it.
+  corrupting the outer terminal exactly as before. Deferred hardening (handling
+  `SIGTSTP` on gutter's own signal thread) is out of scope for this fix.
+  `signal-hook` is no longer unused — ADR-020 gives it `SIGWINCH` — so the
+  hardening would extend that thread rather than add one.
 
 ## Code anchors
 
