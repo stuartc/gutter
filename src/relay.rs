@@ -119,8 +119,11 @@ impl KeyModeRelay {
                 self.kitty.push(KittyOp::Set(bytes.clone()));
                 Some(bytes)
             }
-            // kitty query: CSI ? u. Changes nothing, so records nothing.
-            (b'?', 'u') => Some(KITTY_QUERY.to_vec()),
+            // kitty query: CSI ? u. Changes nothing, so records nothing. The
+            // parameter must be absent (vte's zero), because `CSI ? flags u` with a
+            // flags value is the terminal's *reply* — relaying that back out as a
+            // fresh query would loop against any child that echoes its own input.
+            (b'?', 'u') if param(params, 0) == 0 => Some(KITTY_QUERY.to_vec()),
             // xterm modifyOtherKeys. Only `Pp == 4` is relayed; its siblings (0
             // modifyKeyboard, 1 modifyCursorKeys, 2 modifyFunctionKeys) each change a
             // different key class and nothing gutter wraps has been shown to need them.
@@ -285,6 +288,8 @@ mod tests {
     /// Everything else is dropped. The near misses are the point: `CSI u` is the
     /// ANSI restore-cursor and really does reach `unhandled_csi`, and `CSI > 1 ; 2 m`
     /// is a modifyOtherKeys sibling that looks equally safe and is still not relayed.
+    /// `CSI ? 1 u` is the kitty *reply* wearing the query's shape: relaying it would
+    /// ask the question again, and a child that echoes its input would never stop.
     #[test]
     fn allowlist_denies_everything_else() {
         let denied: &[Case] = &[
@@ -296,6 +301,7 @@ mod tests {
             ("focus reporting", Some(b'?'), &[&[1004]], 'h'),
             ("modifyCursorKeys", Some(b'>'), &[&[1], &[2]], 'm'),
             ("wrong final", Some(b'>'), &[&[4], &[2]], 'x'),
+            ("reply-shaped query", Some(b'?'), &[&[1]], 'u'),
         ];
         for (name, i1, params, c) in denied {
             assert_eq!(matched(*i1, params, *c), None, "{name} must not be relayed");

@@ -69,7 +69,9 @@ at all — there is no "no" reply, so silence *is* the no. gutter cannot help he
 any answer it invents is a claim about a terminal it has not asked. So the question
 goes out, and the answer comes back on the input fd and reaches the child through
 ADR-020's passthrough with no relay code involved. The absence of an answer relays
-itself, for free, by gutter doing nothing.
+itself, for free, by gutter doing nothing. The match is on the paramless form only:
+a reply-shaped `CSI ? flags u` appearing in the child's *output* is dropped, so a
+child that echoes what it reads cannot drive the question back out again and again.
 
 **gutter remains the authority for device queries.** DA1, DSR status and above all
 `CSI 6 n` are still answered locally, because the cursor-position reply must be in
