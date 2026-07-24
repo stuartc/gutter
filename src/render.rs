@@ -801,6 +801,12 @@ where
     R: PtyResizer,
 {
     if let Msg::Input(bytes) = &m {
+        // The paste gate reads what gutter told the OUTER terminal (ADR-022), because
+        // only a terminal that was sent `?2004h` can have produced the guards. Same
+        // thread as the mirror, so this is a plain field read.
+        input
+            .scanner
+            .set_paste_guards(renderer.mode_mirror.bracketed_paste());
         let mut tokens = Vec::new();
         input.scanner.feed(bytes, &mut tokens);
         walk_tokens(&tokens, clock, renderer, resize, term, pty_writer, resizer);

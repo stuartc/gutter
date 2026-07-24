@@ -44,6 +44,15 @@ impl ModeMirror {
         Self::default()
     }
 
+    /// Whether gutter has told the outer terminal to bracket its pastes. The input
+    /// scanner gates its paste state on this rather than on the child's live mode: it
+    /// answers "could the terminal have produced these guard bytes?", which is the
+    /// question a guard-shaped byte run actually poses.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
+    }
+
     /// The bytes to emit for whatever changed since the last poll, marking the new
     /// state mirrored. Empty on a frame that changed nothing, which is nearly all of
     /// them.
@@ -197,6 +206,22 @@ mod tests {
             b"\x1b[?1l\x1b[?2004l",
             "the keypad was never set, so it is never reset"
         );
+    }
+
+    /// The scanner's paste gate reads what was mirrored, not what the child asked
+    /// for, so it tracks the emitted edges exactly.
+    #[test]
+    fn the_paste_flag_follows_what_was_mirrored() {
+        let mut mirror = ModeMirror::new();
+        assert!(!mirror.bracketed_paste());
+
+        let mut parser = screen_after(b"\x1b[?2004h");
+        let _ = mirror.take_pending(parser.screen());
+        assert!(mirror.bracketed_paste());
+
+        parser.process(b"\x1b[?2004l");
+        let _ = mirror.take_pending(parser.screen());
+        assert!(!mirror.bracketed_paste());
     }
 
     /// Park clears the mirror after emitting the offs; resume re-derives from the

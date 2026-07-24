@@ -101,6 +101,10 @@ pub struct Scanner {
     pending: Vec<u8>,
     /// Ordinary bytes accumulated since the last emitted token.
     run: Vec<u8>,
+    /// Whether gutter has told the outer terminal to bracket its pastes (ADR-022).
+    /// Only a terminal that was sent `?2004h` can have produced the guards, so a
+    /// guard-shaped run is ordinary input until it has been.
+    paste_guards: bool,
     in_paste: bool,
 }
 
@@ -116,7 +120,26 @@ impl Scanner {
             state: State::Ground,
             pending: Vec::new(),
             run: Vec::new(),
+            paste_guards: false,
             in_paste: false,
+        }
+    }
+
+    /// Tell the scanner whether the mode mirror currently has bracketed paste on
+    /// (ADR-022). The render loop sets this from its own mirror before every
+    /// [`feed`], never from the child's live mode: gating on the child's would let a
+    /// literal `ESC [ 200 ~` in ordinary input open a paste in the window between the
+    /// child setting the mode and gutter mirroring it.
+    ///
+    /// Turning it off ends any open paste at once. Waiting for a closing guard the
+    /// terminal may already have decided not to send risks a stuck state; the exposure
+    /// this trades for is the tail of a paste the child stopped protecting mid-way.
+    ///
+    /// [`feed`]: Scanner::feed
+    pub fn set_paste_guards(&mut self, enabled: bool) {
+        self.paste_guards = enabled;
+        if !enabled {
+            self.in_paste = false;
         }
     }
 
@@ -269,7 +292,8 @@ impl Scanner {
 
     /// Decide what a completed CSI is. The paste gate comes first and is
     /// blanket: between the guards nothing is extracted and nothing is dropped,
-    /// because pasted text is data, not input protocol.
+    /// because pasted text is data, not input protocol. A paste can only open
+    /// while the mirror has `?2004` on — otherwise the guards are just bytes.
     fn classify_csi(&mut self, seq: Vec<u8>, out: &mut Vec<Token>) {
         let last = seq.len() - 1;
         let final_byte = seq[last];
@@ -284,7 +308,7 @@ impl Scanner {
             }
             return;
         }
-        if final_byte == b'~' && body == b"200" {
+        if self.paste_guards && final_byte == b'~' && body == b"200" {
             self.in_paste = true;
             out.push(Token::Seq(seq));
             return;
@@ -534,6 +558,7 @@ mod tests {
     #[test]
     fn paste_guards_switch_extraction_off_and_back_on() {
         let mut s = Scanner::new();
+        s.set_paste_guards(true);
         let mut out = Vec::new();
         s.feed(b"\x1b[200~", &mut out);
         // A well-formed mouse report inside a paste is forwarded, not extracted.
@@ -559,6 +584,49 @@ mod tests {
             out.iter().filter(|t| matches!(t, Token::Mouse(_))).count(),
             1,
             "only the post-guard report is extracted"
+        );
+    }
+
+    /// The gate is a gate: until gutter has mirrored `?2004h`, a guard-shaped run is
+    /// input like any other, and a `0x1C` in it still reaches the classifier as the
+    /// chord. Anything else would let a program that never asked for paste protection
+    /// disable the reserved chord by sending the guard bytes itself.
+    #[test]
+    fn guards_are_ordinary_bytes_until_the_mirror_is_on() {
+        let span = b"\x1b[200~a\x1cb\x1b[<0;10;5M\x1b[201~";
+        let out = scan(span);
+        assert!(
+            !out.iter().any(|t| matches!(t, Token::Paste(_))),
+            "no paste state without the mirror: {out:?}"
+        );
+        assert_eq!(
+            out.iter().filter(|t| matches!(t, Token::Mouse(_))).count(),
+            1,
+            "the mouse report is extracted as usual"
+        );
+        assert!(
+            payloads(&out).contains(&0x1c),
+            "the chord byte reaches the classifier"
+        );
+    }
+
+    /// The child turning paste mode off re-arms normal scanning at once, rather than
+    /// waiting for a closing guard the terminal may never send.
+    #[test]
+    fn clearing_the_mirror_ends_an_open_paste() {
+        let mut s = Scanner::new();
+        s.set_paste_guards(true);
+        let mut out = Vec::new();
+        s.feed(b"\x1b[200~pasted", &mut out);
+        assert!(out.iter().any(|t| matches!(t, Token::Paste(_))));
+
+        out.clear();
+        s.set_paste_guards(false);
+        s.feed(b"\x1b[<0;10;5M", &mut out);
+        assert_eq!(
+            out.iter().filter(|t| matches!(t, Token::Mouse(_))).count(),
+            1,
+            "extraction resumes immediately: {out:?}"
         );
     }
 
