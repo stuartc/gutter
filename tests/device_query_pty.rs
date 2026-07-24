@@ -25,8 +25,6 @@ fn gutter_cmd(child_argv: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gutter"));
     cmd.args(child_argv);
     cmd.env("TERM", "xterm-256color");
-    // A dumb test PTY can't answer the kitty probe; inject the known result so
-    // the run is not itself stalled by the startup probe (slice 04's seam).
     cmd.env("GUTTER_FORCE_ANCHOR_ROW", "0");
     cmd
 }

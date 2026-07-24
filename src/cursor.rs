@@ -3,7 +3,7 @@
 //! vt100 doesn't implement DECSCUSR, so the child's request surfaces through
 //! `unhandled_csi`. The watcher records the requested shape and the render loop
 //! re-emits the matching `CSI Ps SP q` to the outer terminal. It lives on
-//! [`crate::callbacks::GutterCallbacks`] beside the kitty and clipboard hooks
+//! [`crate::callbacks::GutterCallbacks`] beside the clipboard hook
 //! and touches only its own field.
 
 /// The intermediate byte of DECSCUSR (`CSI Ps SP q`) — a space (0x20).
