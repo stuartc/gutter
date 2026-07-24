@@ -17,6 +17,7 @@ use crate::callbacks::GutterCallbacks;
 use crate::chord::Chord;
 use crate::clock::{Clock, Recv};
 use crate::geometry::{self, Layout, Width};
+use crate::modes::ModeMirror;
 use crate::mouse::{MouseDecision, MouseGate};
 use crate::msg::Msg;
 use crate::pty::PtyResizer;
@@ -83,6 +84,10 @@ pub struct Renderer {
     /// an enter/leave only on a real change. Never forced — gutter enters the alt
     /// screen only when the child does.
     outer_alt_active: bool,
+    /// The input modes last mirrored to the outer terminal (ADR-022) — DECCKM,
+    /// application keypad and bracketed paste. Edge-triggered like `cursor_visible`
+    /// and `outer_alt_active`, and polled from the same place in the frame.
+    mode_mirror: ModeMirror,
     /// Physical terminal row where grid row 0 sits on the PRIMARY screen (ADR-013).
     /// Initialised to the launch cursor row and driven monotonically toward 0 by the
     /// per-frame make-room scroll as the band grows; once it reaches 0 the band fills
@@ -154,6 +159,8 @@ impl Renderer {
             cursor_visible: true,
             // gutter never forces the alt screen (ADR-012); start false.
             outer_alt_active: false,
+            // Nothing mirrored yet, so nothing owed back at teardown (ADR-022).
+            mode_mirror: ModeMirror::new(),
             // The inline anchor (ADR-013), clamped into the grid.
             base_row: base_row.min(rows.saturating_sub(1)),
             ever_painted_inline: false,
@@ -845,6 +852,18 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
             renderer.reset_prev_baseline();
         }
         renderer.outer_alt_active = child_alt;
+    }
+
+    // Mirror the input modes vt100 swallowed into its screen state (ADR-022): DECCKM,
+    // application keypad and bracketed paste, each edge-triggered against what was last
+    // mirrored. Sitting next to the alt-screen mirror is legibility, not ordering — all
+    // three are terminal-global and survive a `?1049` either way — but being ahead of
+    // the paint loop is load-bearing: a painted row is a self-contained run inside its
+    // margin-offset rectangle (ADR-014), and mode bytes between a `move_to` and its row
+    // would break that for nothing.
+    let mode_bytes = renderer.mode_mirror.take_pending(renderer.parser.screen());
+    if !mode_bytes.is_empty() {
+        term.relay(&mode_bytes)?;
     }
 
     // Scroll emit (ADR-013): on the primary screen, advance each line that left the
@@ -1585,8 +1604,9 @@ where
 }
 
 /// Park the outer terminal (ADR-0019 step 3): leave alt (or hand the shell a fresh
-/// line below the inline band), reset attributes and cursor shape, undo the child's
-/// keyboard modes, disable mouse, show the cursor, and drop raw mode LAST — then
+/// line below the inline band), reset attributes and cursor shape, undo the mirrored
+/// input modes and the child's keyboard modes, disable mouse, show the cursor, and
+/// drop raw mode LAST — then
 /// flush so it all lands before the self-stop. Deliberately does NOT clear
 /// `outer_alt_active`: it stays as "the child's screen is alt" for the resume
 /// re-derivation (the double-meaning note in ADR-0019). The relay's log survives for
@@ -1614,6 +1634,10 @@ fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Res
     }
     record(term.write_row(b"\x1b[0m")); // drop any leftover attribute run
     record(term.set_cursor_shape(b"\x1b[0 q")); // hand the shell a default cursor shape
+    record(mode_reset(renderer, term)); // undo the mirrored input modes (ADR-022)
+    // Cleared, not kept: the child's modes are still on its screen, so the step-9
+    // repaint's poll re-asserts them on resume with no replay list.
+    renderer.mode_mirror.clear();
     record(relay_reset(renderer, term)); // undo the child's keyboard modes (ADR-021)
     record(term.disable_mouse()); // conditional on mouse_enabled
     record(term.show_cursor());
@@ -1645,6 +1669,21 @@ fn unpark<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::R
     // cursor to the default, so the watcher's mirrored state is stale.
     renderer.parser.callbacks_mut().cursor_shape.rearm();
     Ok(())
+}
+
+/// Turn off the input modes gutter mirrored onto the outer terminal (ADR-022),
+/// immediately before the relay's own reset so every input-encoding restore sits
+/// together with the coarsest last.
+///
+/// Restores to the terminal's defaults rather than to whatever it had before gutter
+/// launched. A shell whose paste protection is clobbered by this re-asserts its input
+/// modes at its next prompt, so the blast radius is one prompt.
+fn mode_reset<T: OuterTerminal>(renderer: &Renderer, term: &mut T) -> std::io::Result<()> {
+    let bytes = renderer.mode_mirror.reset_bytes();
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    term.relay(&bytes)
 }
 
 /// Undo the keyboard modes the child asked the outer terminal for (ADR-021), in the
@@ -1739,9 +1778,9 @@ fn drain_pty_path<C, T, P, R>(
 }
 
 /// The explicit, ordered terminal restore (ADR-010), mode-aware (ADR-012/013):
-/// conditional alt-leave / inline hand-back → reset the child's keyboard modes →
-/// disable mouse → show cursor → disable raw mode. Each step undoes only what was
-/// actually set up.
+/// conditional alt-leave / inline hand-back → reset the mirrored input modes → reset
+/// the child's keyboard modes → disable mouse → show cursor → disable raw mode. Each
+/// step undoes only what was actually set up.
 ///
 /// The discriminator is the live `outer_alt_active`: a child that exits in the alt
 /// screen takes the leave-alt path; one that exits inline hands back below the band. The
@@ -1758,6 +1797,7 @@ fn run_teardown<T: OuterTerminal>(
     } else if renderer.ever_painted_inline {
         hand_back_inline(renderer, term, exit_code)?;
     }
+    mode_reset(renderer, term)?;
     relay_reset(renderer, term)?;
     term.disable_mouse()?;
     term.show_cursor()?;

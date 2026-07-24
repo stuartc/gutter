@@ -648,10 +648,12 @@ pub mod mock {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
-        fn relay(&mut self, _bytes: &[u8]) -> io::Result<()> {
-            // Keyboard-mode requests change how the terminal encodes the keys it
-            // sends and paint nothing — the premise of the allowlist (ADR-021) — so
-            // the physical-cell recorder has nothing to record.
+        fn relay(&mut self, bytes: &[u8]) -> io::Result<()> {
+            // Relayed bytes paint nothing — that is the premise of both the keyboard
+            // allowlist (ADR-021) and the mode mirror (ADR-022) — but feeding them to
+            // the parser lets a test read back the outer terminal's resulting input
+            // modes instead of matching on byte spelling.
+            self.parser.process(bytes);
             Ok(())
         }
         fn leave_alt_screen(&mut self) -> io::Result<()> {

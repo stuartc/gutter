@@ -29,6 +29,7 @@ mod clock;
 mod cursor;
 mod geometry;
 mod input;
+mod modes;
 mod mouse;
 mod msg;
 mod pty;
