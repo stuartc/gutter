@@ -219,6 +219,36 @@ fn the_reserved_chord_byte_never_reaches_the_child() {
     );
 }
 
+/// A `cat -v` child that first asks its terminal to bracket pastes, so gutter
+/// mirrors `?2004h` outward and the scanner's paste gate is live (ADR-022).
+const PASTE_ECHO_CHILD: &str =
+    "/bin/sh -c 'stty raw -echo; printf \"\\033[?2004h\"; exec cat -v'";
+
+/// **A pasted chord byte is text.** Under the guards nothing is interpreted, so the
+/// `0x1C` that would otherwise open resize mode mid-paste reaches the child like any
+/// other pasted byte — the live misbehaviour this slice removes.
+#[test]
+fn a_pasted_chord_byte_reaches_the_child() {
+    let text = echo_transcript(PASTE_ECHO_CHILD, b"\x1b[200~abc\x1cdef\x1b[201~");
+    assert!(
+        text.contains("^[[200~abc^\\def^[[201~"),
+        "the whole paste, guards and chord byte included, must arrive verbatim; \
+         transcript was {text:?}"
+    );
+}
+
+/// **And so is a pasted mouse report.** Sharper than the chord case: inside the
+/// guards nothing is *extracted* either, so a mouse-report-shaped run arrives
+/// verbatim rather than margin-translated, and a malformed one is not swallowed.
+#[test]
+fn a_pasted_mouse_report_is_not_extracted() {
+    let text = echo_transcript(PASTE_ECHO_CHILD, b"\x1b[200~\x1b[<0;10;5M\x1b[<99M\x1b[201~");
+    assert!(
+        text.contains("^[[200~^[[<0;10;5M^[[<99M^[[201~"),
+        "pasted text is data, not input protocol; transcript was {text:?}"
+    );
+}
+
 /// UTF-8 must never be split across the scanner's buffering.
 #[test]
 fn multi_byte_utf8_survives_intact() {

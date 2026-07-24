@@ -521,6 +521,17 @@ pub mod mock {
                 .collect()
         }
 
+        /// The outer terminal's own input modes, as the relayed bytes left them:
+        /// `(application_cursor, application_keypad, bracketed_paste)` (ADR-022).
+        pub fn outer_input_modes(&self) -> (bool, bool, bool) {
+            let s = self.parser.screen();
+            (
+                s.application_cursor(),
+                s.application_keypad(),
+                s.bracketed_paste(),
+            )
+        }
+
         /// The lines in the recorder's scrollback, oldest first, each read across
         /// the band columns `[0, width)` (the tests paint a margin-0 band).
         pub fn scrollback_top_rows(&mut self, width: u16) -> Vec<String> {

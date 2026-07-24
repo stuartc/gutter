@@ -3305,6 +3305,205 @@ line two\r\n\
         );
     }
 
+    /// Absorbed-mode mirroring (ADR-022) through the real frame. `render_once` takes
+    /// an injected terminal, so every one of these is a parser feed, a frame, and a
+    /// read of what the outer terminal saw — no PTY, no threads, no clock.
+    mod mode_mirror {
+        use super::*;
+        use crate::terminal::mock::RecordingGrid;
+
+        /// Feed the child's bytes, run one frame, and return the bytes the frame
+        /// relayed to the outer terminal.
+        fn frame(renderer: &mut Renderer, term: &mut MockTerminal, child: &[u8]) -> Vec<u8> {
+            renderer.parser.process(child);
+            let before = term.calls.len();
+            render_once(renderer, term).unwrap();
+            term.calls[before..]
+                .iter()
+                .filter_map(|c| match c {
+                    Call::Relay(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        }
+
+        /// Each mode reaches the outer terminal once on the edge that set it, once on
+        /// the edge that cleared it, and never on a repeat of either.
+        #[test]
+        fn each_edge_emits_once_and_a_repeat_emits_nothing() {
+            for (set, on, clear, off) in [
+                (&b"\x1b[?1h"[..], &b"\x1b[?1h"[..], &b"\x1b[?1l"[..], &b"\x1b[?1l"[..]),
+                (b"\x1b=", b"\x1b=", b"\x1b>", b"\x1b>"),
+                (b"\x1b[?2004h", b"\x1b[?2004h", b"\x1b[?2004l", b"\x1b[?2004l"),
+            ] {
+                let mut renderer = left_renderer(20, 5);
+                let mut term = MockTerminal::new();
+
+                assert_eq!(frame(&mut renderer, &mut term, set), on);
+                assert!(frame(&mut renderer, &mut term, set).is_empty());
+                assert_eq!(frame(&mut renderer, &mut term, clear), off);
+                assert!(frame(&mut renderer, &mut term, clear).is_empty());
+            }
+        }
+
+        /// All three in one frame, in one relay call, in the pinned order.
+        #[test]
+        fn all_three_land_in_one_frame() {
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            assert_eq!(
+                frame(&mut renderer, &mut term, b"\x1b[?2004h\x1b=\x1b[?1h"),
+                b"\x1b[?1h\x1b=\x1b[?2004h"
+            );
+        }
+
+        /// `ESC c` resets vt100's screen wholesale, so the next frame's poll finds all
+        /// three off with no RIS handling anywhere in gutter.
+        #[test]
+        fn ris_turns_all_three_off_on_the_next_frame() {
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            frame(&mut renderer, &mut term, b"\x1b[?1h\x1b=\x1b[?2004h");
+            assert_eq!(
+                frame(&mut renderer, &mut term, b"\x1bc"),
+                b"\x1b[?1l\x1b>\x1b[?2004l"
+            );
+        }
+
+        /// **The one that stops someone reaching for `input_mode_diff`.** A mouse mode
+        /// on the outer terminal would be a second authority over state ADR-005 owns,
+        /// and a child that disabled reporting would turn gutter's own capture off
+        /// underneath it.
+        #[test]
+        fn no_mouse_mode_ever_reaches_the_outer_terminal() {
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            assert!(frame(
+                &mut renderer,
+                &mut term,
+                b"\x1b[?9h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1005h"
+            )
+            .is_empty());
+        }
+
+        /// This slice ships no relay path for private modes at all, so the assertion is
+        /// the strongest available form: no DECSET is ever forwarded, whether vt100
+        /// implements it or drops it through `unhandled_csi`.
+        #[test]
+        fn no_decset_is_relayed() {
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            assert!(frame(
+                &mut renderer,
+                &mut term,
+                b"\x1b[?1047h\x1b[?1048h\x1b[?2048h\x1b[?1004h\x1b[?66h\x1b[?7727h\x1b[?2026h"
+            )
+            .is_empty());
+        }
+
+        /// The alt screen keeps its own mirror (ADR-012) and gains nothing from this one.
+        #[test]
+        fn alt_screen_stays_on_its_own_mirror() {
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            assert!(frame(&mut renderer, &mut term, b"\x1b[?1049h").is_empty());
+            assert!(
+                term.calls.contains(&Call::EnterAltScreen),
+                "the alt screen still mirrors: {:?}",
+                term.calls
+            );
+        }
+
+        /// The mirror must not be diffed against the `prev` parser. `sync_prev` replays
+        /// `contents_formatted`, which excludes the input modes, so `prev`'s flags sit
+        /// at their defaults for ever — a diff against it would re-emit every frame,
+        /// which is exactly what an idle frame here proves it does not.
+        #[test]
+        fn the_diff_baseline_is_not_prev() {
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            frame(&mut renderer, &mut term, b"\x1b[?1h\x1b=\x1b[?2004h");
+            // `render_once` ends in `sync_prev`, so `prev` is already the trap's state.
+            assert!(!renderer.prev.screen().application_cursor());
+            for _ in 0..3 {
+                assert!(frame(&mut renderer, &mut term, b"").is_empty());
+            }
+        }
+
+        /// What the outer terminal ends up in, rather than what gutter spelled: the
+        /// recording grid parses the relayed bytes the way a real terminal would.
+        #[test]
+        fn the_outer_terminal_ends_up_in_the_childs_modes() {
+            let mut renderer = Renderer::at_margin(20, 5, 0);
+            let mut grid = RecordingGrid::new(20, 5);
+            renderer.parser.process(b"\x1b[?1h\x1b=\x1b[?2004h");
+            render_once(&mut renderer, &mut grid).unwrap();
+            assert_eq!(grid.outer_input_modes(), (true, true, true));
+
+            renderer.parser.process(b"\x1b[?1l\x1b>\x1b[?2004l");
+            render_once(&mut renderer, &mut grid).unwrap();
+            assert_eq!(grid.outer_input_modes(), (false, false, false));
+        }
+
+        /// Teardown hands the terminal back at its defaults, in ADR-010's slot: after
+        /// the alt-leave and immediately before the keyboard-mode reset, so every
+        /// input-encoding restore sits together with the coarsest last.
+        #[test]
+        fn child_exit_resets_the_mirrored_modes_before_the_relay_reset() {
+            use crate::terminal::OuterTerminal;
+            let mut clock = VirtualClock::new(vec![
+                (0u64, Msg::Pty(b"\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[>1u".to_vec())),
+                (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+            ]);
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            term.enable_mouse().unwrap();
+            let mut pty: Vec<u8> = Vec::new();
+
+            run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
+
+            assert_eq!(
+                term.restore_calls(),
+                vec![
+                    Call::Relay(b"\x1b[>1u".to_vec()),
+                    Call::Relay(b"\x1b[?1h\x1b[?2004h".to_vec()),
+                    Call::LeaveAltScreen,
+                    Call::Relay(b"\x1b[?1l\x1b[?2004l".to_vec()),
+                    Call::Relay(b"\x1b[<1u".to_vec()),
+                    Call::DisableMouse,
+                    Call::ShowCursor,
+                    Call::DisableRawMode,
+                ],
+                "the mode reset sits between the alt-leave and the keyboard-mode reset"
+            );
+        }
+
+        /// The other half of ADR-010's rule: a mode gutter never mirrored on is a mode
+        /// gutter never turns off. A shell that had its own paste protection running
+        /// keeps it.
+        #[test]
+        fn child_exit_resets_nothing_that_was_never_mirrored() {
+            use crate::terminal::OuterTerminal;
+            let mut clock = VirtualClock::new(vec![
+                (0u64, Msg::Pty(b"plain output".to_vec())),
+                (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+            ]);
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            term.enable_mouse().unwrap();
+            let mut pty: Vec<u8> = Vec::new();
+
+            run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
+
+            assert!(
+                !term.calls.iter().any(|c| matches!(c, Call::Relay(_))),
+                "nothing mirrored, nothing reset: {:?}",
+                term.calls
+            );
+        }
+    }
+
     /// The ESC-hold (ADR-020), on virtual time. The hold is loop-owned, so these
     /// drive `apply_message` and `flush_hold` directly with a `VirtualClock`: no
     /// wall-clock sleeps, no threads, no PTY.
@@ -3819,6 +4018,62 @@ line two\r\n\
             assert_eq!(*resizer.calls.borrow(), vec![(81, 24)], "exactly one resize, from the step");
             assert_eq!(pty, b"l", "the delayed key after idle-exit passes through to the child");
         }
+
+        /// A paste span with the chord byte in it, once the child has asked for paste
+        /// guards. Every byte reaches the child and none of it is read as input
+        /// protocol: no resize mode, and a pasted mouse report arrives verbatim rather
+        /// than margin-translated (or dropped for being malformed).
+        fn paste_span() -> Vec<u8> {
+            b"\x1b[200~ab\x1cc\x1b[<0;10;5M\x1b[<99Md\x1b[201~".to_vec()
+        }
+
+        /// Put the mirror into paste mode the way production does — the child asks,
+        /// the frame mirrors.
+        fn mirror_paste_on(ctx: &mut Ctx) {
+            ctx.renderer.parser.process(b"\x1b[?2004h");
+            render_once(&mut ctx.renderer, &mut ctx.term).unwrap();
+            assert!(ctx.renderer.mode_mirror.bracketed_paste());
+        }
+
+        #[test]
+        fn pasted_bytes_reach_the_child_untouched_under_the_guards() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            mirror_paste_on(&mut ctx);
+            ctx.send(&paste_span());
+
+            assert_eq!(ctx.pty, paste_span(), "every pasted byte, verbatim");
+            assert!(!ctx.resize.active(), "a pasted 0x1C is text, not the chord");
+        }
+
+        /// The gate is a gate. Without the mirror the same span is ordinary input, so
+        /// the `0x1C` still enters resize mode and the mouse report is still extracted
+        /// and translated — today's behaviour, unchanged.
+        #[test]
+        fn the_same_span_is_scanned_normally_with_the_mirror_off() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.send(&paste_span());
+
+            assert!(ctx.resize.active(), "the bare 0x1C enters resize mode");
+            assert!(
+                !ctx.pty.windows(6).any(|w| w == b"\x1b[<0;1"),
+                "the mouse report was extracted, not forwarded: {:?}",
+                ctx.pty
+            );
+        }
+
+        /// The child disabling paste mode mid-paste re-arms normal scanning at once.
+        #[test]
+        fn clearing_paste_mode_mid_paste_re_arms_the_scanner() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            mirror_paste_on(&mut ctx);
+            ctx.send(b"\x1b[200~ab");
+            assert_eq!(ctx.pty, b"\x1b[200~ab");
+
+            ctx.renderer.parser.process(b"\x1b[?2004l");
+            render_once(&mut ctx.renderer, &mut ctx.term).unwrap();
+            ctx.send(&[0x1c]);
+            assert!(ctx.resize.active(), "the tail is scanned normally again");
+        }
     }
 
     /// The suspend/resume cycle (ADR-0019): park → self-stop → unpark →
@@ -4023,6 +4278,39 @@ line two\r\n\
                     Call::ContinueChild,
                 ],
                 "reset before the hand-back, replay after raw mode is re-taken"
+            );
+        }
+
+        /// The mirrored input modes (ADR-022) come off before the shell gets the
+        /// terminal and go back on after `fg` — and the re-assert is the ordinary
+        /// per-frame poll finding the child's live modes disagreeing with a mirror park
+        /// cleared, so there is no replay list and no `rearm` call anywhere.
+        #[test]
+        fn ordering_mirrored_modes_reset_at_park_and_re_polled_at_resume() {
+            let (log, mut term, mut renderer) = harness();
+            renderer.ever_painted_inline = true;
+            // The child asked its terminal for application cursor keys and paste guards.
+            renderer.parser.process(b"\x1b[?1h\x1b[?2004h");
+            render_once(&mut renderer, &mut term).unwrap();
+            log.borrow_mut().clear();
+
+            let outcome = drive(&log, &mut term, &mut renderer);
+            assert!(matches!(outcome, SuspendOutcome::Resumed));
+
+            assert_eq!(
+                significant(&log.borrow()),
+                vec![
+                    Call::Relay(b"\x1b[?1l\x1b[?2004l".to_vec()),
+                    Call::DisableMouse,
+                    Call::ShowCursor,
+                    Call::DisableRawMode,
+                    Call::SuspendSelf,
+                    Call::EnableRawMode,
+                    Call::EnableMouse,
+                    Call::ContinueChild,
+                    Call::Relay(b"\x1b[?1h\x1b[?2004h".to_vec()),
+                ],
+                "off before the hand-back, back on from the resume repaint's poll"
             );
         }
 
