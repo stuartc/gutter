@@ -20,6 +20,7 @@ use crate::geometry::{self, Layout, Width};
 use crate::mouse::{MouseDecision, MouseGate};
 use crate::msg::Msg;
 use crate::pty::PtyResizer;
+use crate::relay::KeyModeRelay;
 use crate::rowclip::clip_row_to_width_into;
 use crate::scan::{Scanner, Token, ESC_HOLD};
 use crate::suspend::Suspender;
@@ -1584,11 +1585,12 @@ where
 }
 
 /// Park the outer terminal (ADR-0019 step 3): leave alt (or hand the shell a fresh
-/// line below the inline band), reset attributes and cursor shape, disable mouse,
-/// show the cursor, and drop raw mode LAST — then flush so it all
-/// lands before the self-stop. Deliberately does NOT clear `outer_alt_active`: it
-/// stays as "the child's screen is alt" for the resume re-derivation (the
-/// double-meaning note in ADR-0019).
+/// line below the inline band), reset attributes and cursor shape, undo the child's
+/// keyboard modes, disable mouse, show the cursor, and drop raw mode LAST — then
+/// flush so it all lands before the self-stop. Deliberately does NOT clear
+/// `outer_alt_active`: it stays as "the child's screen is alt" for the resume
+/// re-derivation (the double-meaning note in ADR-0019). The relay's log survives for
+/// the same reason — this is a park, not a teardown, and `unpark` replays it.
 fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
     // Best-effort per step (ADR-010's "restore by hand, each step conditional"):
     // attempt EVERY restore step even if an earlier one errors, so an early failure
@@ -1612,6 +1614,7 @@ fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Res
     }
     record(term.write_row(b"\x1b[0m")); // drop any leftover attribute run
     record(term.set_cursor_shape(b"\x1b[0 q")); // hand the shell a default cursor shape
+    record(relay_reset(renderer, term)); // undo the child's keyboard modes (ADR-021)
     record(term.disable_mouse()); // conditional on mouse_enabled
     record(term.show_cursor());
     renderer.cursor_visible = true;
@@ -1622,10 +1625,12 @@ fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Res
 
 /// Unpark the outer terminal (ADR-0019 step 5): re-take it after the self-stop
 /// returns, in inverse order — raw mode FIRST, shrinking the cooked-mode window the
-/// already-running input thread could read canonical input in. There is no keyboard
-/// mode to re-assert: gutter asks the outer terminal for none of its own (ADR-020).
+/// already-running input thread could read canonical input in. gutter asks the outer
+/// terminal for no keyboard mode of its own (ADR-020); what it re-asserts is what the
+/// child asked for, replayed from the relay's log (ADR-021).
 fn unpark<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
     retry_enable_raw(term)?;
+    relay_replay(renderer, term)?;
     term.enable_mouse()?;
     let child_alt = renderer.parser.screen().alternate_screen();
     if child_alt {
@@ -1640,6 +1645,40 @@ fn unpark<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::R
     // cursor to the default, so the watcher's mirrored state is stale.
     renderer.parser.callbacks_mut().cursor_shape.rearm();
     Ok(())
+}
+
+/// Undo the keyboard modes the child asked the outer terminal for (ADR-021), in the
+/// slot ADR-010 gives the input-encoding restores: after the screen is back to the
+/// primary buffer, so the bytes land on the screen the shell inherits, and before raw
+/// mode is dropped.
+///
+/// Writes nothing when the child negotiated nothing — the relay's log is the record of
+/// what was actually set up, and gutter resets no mode it did not set.
+fn relay_reset<T: OuterTerminal>(renderer: &Renderer, term: &mut T) -> std::io::Result<()> {
+    relay_write(renderer, term, KeyModeRelay::reset_bytes)
+}
+
+/// Re-apply the child's keyboard modes on resume, oldest first, so the terminal comes
+/// back at the depth and flags the child last asked for and a later pop still lines up.
+fn relay_replay<T: OuterTerminal>(renderer: &Renderer, term: &mut T) -> std::io::Result<()> {
+    relay_write(renderer, term, KeyModeRelay::replay_bytes)
+}
+
+fn relay_write<T: OuterTerminal>(
+    renderer: &Renderer,
+    term: &mut T,
+    bytes: fn(&KeyModeRelay) -> Vec<u8>,
+) -> std::io::Result<()> {
+    let out = renderer
+        .parser
+        .callbacks()
+        .key_modes()
+        .map(bytes)
+        .unwrap_or_default();
+    if out.is_empty() {
+        return Ok(());
+    }
+    term.relay(&out)
 }
 
 /// Re-enter raw mode on resume, retrying a bounded number of times on `EINTR`: the
@@ -1700,8 +1739,9 @@ fn drain_pty_path<C, T, P, R>(
 }
 
 /// The explicit, ordered terminal restore (ADR-010), mode-aware (ADR-012/013):
-/// conditional alt-leave / inline hand-back → disable mouse → show cursor → disable
-/// raw mode. Each step undoes only what was actually set up.
+/// conditional alt-leave / inline hand-back → reset the child's keyboard modes →
+/// disable mouse → show cursor → disable raw mode. Each step undoes only what was
+/// actually set up.
 ///
 /// The discriminator is the live `outer_alt_active`: a child that exits in the alt
 /// screen takes the leave-alt path; one that exits inline hands back below the band. The
@@ -1718,6 +1758,7 @@ fn run_teardown<T: OuterTerminal>(
     } else if renderer.ever_painted_inline {
         hand_back_inline(renderer, term, exit_code)?;
     }
+    relay_reset(renderer, term)?;
     term.disable_mouse()?;
     term.show_cursor()?;
     term.disable_raw_mode()?;
@@ -2131,6 +2172,66 @@ mod tests {
                 .count(),
             0,
             "an alt-screen TUI replays nothing onto the primary screen"
+        );
+    }
+
+    /// Teardown undoes the keyboard modes the child asked the outer terminal for
+    /// (ADR-021), in the ADR-010 slot: after the screen is back to the primary
+    /// buffer, so the bytes land on the screen the shell inherits, and before the
+    /// mouse and raw mode come off. Without this the user's shell is left with kitty
+    /// reporting active and Escape starts producing `CSI 27 u`.
+    #[test]
+    fn child_exit_resets_the_relayed_keyboard_modes() {
+        use crate::terminal::OuterTerminal;
+        let mut clock = VirtualClock::new(vec![
+            // A TUI that enters the alt screen, pushes a kitty level and turns
+            // modifyOtherKeys on, then exits with both still live.
+            (0u64, Msg::Pty(b"\x1b[?1049h\x1b[>1u\x1b[>4;2m".to_vec())),
+            (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ]);
+        let mut renderer = left_renderer(80, 24);
+        let mut term = MockTerminal::new();
+        term.enable_mouse().unwrap();
+        let mut pty: Vec<u8> = Vec::new();
+
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
+
+        assert_eq!(
+            term.restore_calls(),
+            vec![
+                // The child's own request, carried out to the terminal while it ran.
+                Call::Relay(b"\x1b[>1u\x1b[>4;2m".to_vec()),
+                Call::LeaveAltScreen,
+                Call::Relay(b"\x1b[<1u\x1b[>4;0m".to_vec()),
+                Call::DisableMouse,
+                Call::ShowCursor,
+                Call::DisableRawMode,
+            ],
+            "the mode reset slots between the alt-leave and the mouse disable"
+        );
+    }
+
+    /// The other half of ADR-010's rule: a child that never negotiated a keyboard
+    /// mode leaves the outer terminal's own keyboard settings alone. A terminal
+    /// whose user configured modifyOtherKeys themselves must survive gutter.
+    #[test]
+    fn child_exit_relays_nothing_when_no_mode_was_requested() {
+        use crate::terminal::OuterTerminal;
+        let mut clock = VirtualClock::new(vec![
+            (0u64, Msg::Pty(b"plain output".to_vec())),
+            (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ]);
+        let mut renderer = left_renderer(80, 24);
+        let mut term = MockTerminal::new();
+        term.enable_mouse().unwrap();
+        let mut pty: Vec<u8> = Vec::new();
+
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
+
+        assert!(
+            !term.calls.iter().any(|c| matches!(c, Call::Relay(_))),
+            "no mode requested, no mode reset: {:?}",
+            term.calls
         );
     }
 
@@ -3696,6 +3797,7 @@ line two\r\n\
                             | Call::EnableRawMode
                             | Call::DisableRawMode
                             | Call::ShowCursor
+                            | Call::Relay(_)
                             | Call::SuspendSelf
                             | Call::ContinueChild
                     )
@@ -3809,12 +3911,49 @@ line two\r\n\
                 "no alt enter/leave on the primary screen"
             );
             assert!(
+                !log.borrow().iter().any(|c| matches!(c, Call::Relay(_))),
+                "a child that asked for no keyboard mode gets none relayed at park"
+            );
+            assert!(
                 term.calls.contains(&Call::Newline),
                 "the inline hand-back drops the shell a fresh line below the band"
             );
             assert_eq!(
                 renderer.base_row, 9,
                 "base_row reseeds to the bottom row (rows - 1) on resume"
+            );
+        }
+
+        /// A child that negotiated keyboard modes adds one step at each end of the
+        /// cycle (ADR-021): park undoes them before the shell gets the terminal, and
+        /// unpark replays them after raw mode is back and before mouse capture. The
+        /// replayed bytes are the canonical ones originally relayed, in the order the
+        /// child issued them, so the terminal comes back at the same stack depth and
+        /// a later pop from the child still lines up.
+        #[test]
+        fn ordering_relayed_modes_reset_at_park_and_replayed_at_resume() {
+            let (log, mut term, mut renderer) = harness();
+            renderer.ever_painted_inline = true;
+            // The child pushed a kitty level and turned modifyOtherKeys on.
+            renderer.parser.process(b"\x1b[>1u\x1b[>4;2m");
+
+            let outcome = drive(&log, &mut term, &mut renderer);
+            assert!(matches!(outcome, SuspendOutcome::Resumed));
+
+            assert_eq!(
+                significant(&log.borrow()),
+                vec![
+                    Call::Relay(b"\x1b[<1u\x1b[>4;0m".to_vec()),
+                    Call::DisableMouse,
+                    Call::ShowCursor,
+                    Call::DisableRawMode,
+                    Call::SuspendSelf,
+                    Call::EnableRawMode,
+                    Call::Relay(b"\x1b[>1u\x1b[>4;2m".to_vec()),
+                    Call::EnableMouse,
+                    Call::ContinueChild,
+                ],
+                "reset before the hand-back, replay after raw mode is re-taken"
             );
         }
 

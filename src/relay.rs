@@ -214,6 +214,10 @@ fn param(params: &[&[u16]], index: usize) -> u16 {
 mod tests {
     use super::*;
 
+    /// One CSI in the shape `unhandled_csi` delivers it: a name for the failure
+    /// message, the first intermediate, the parameter list and the final character.
+    type Case<'a> = (&'a str, Option<u8>, &'a [&'a [u16]], char);
+
     /// Run one `(i1, params, c)` through a fresh relay.
     fn matched(i1: Option<u8>, params: &[&[u16]], c: char) -> Option<Vec<u8>> {
         KeyModeRelay::new().observe(i1, None, params, c)
@@ -230,15 +234,15 @@ mod tests {
     /// pop — the first undefined, the second a no-op.
     #[test]
     fn allowlist_admits_the_six_shapes_with_canonical_bytes() {
-        let admitted: &[(&str, Option<u8>, &[&[u16]], char, &[u8])] = &[
-            ("kitty push", Some(b'>'), &[&[1]], 'u', b"\x1b[>1u"),
-            ("kitty pop", Some(b'<'), &[&[3]], 'u', b"\x1b[<3u"),
-            ("kitty set", Some(b'='), &[&[5], &[2]], 'u', b"\x1b[=5;2u"),
-            ("kitty query", Some(b'?'), &[&[0]], 'u', b"\x1b[?u"),
-            ("modifyOtherKeys", Some(b'>'), &[&[4], &[2]], 'm', b"\x1b[>4;2m"),
-            ("modifyOtherKeys restore", Some(b'>'), &[&[4]], 'm', b"\x1b[>4m"),
+        let admitted: &[(Case, &[u8])] = &[
+            (("kitty push", Some(b'>'), &[&[1]], 'u'), b"\x1b[>1u"),
+            (("kitty pop", Some(b'<'), &[&[3]], 'u'), b"\x1b[<3u"),
+            (("kitty set", Some(b'='), &[&[5], &[2]], 'u'), b"\x1b[=5;2u"),
+            (("kitty query", Some(b'?'), &[&[0]], 'u'), b"\x1b[?u"),
+            (("modifyOtherKeys", Some(b'>'), &[&[4], &[2]], 'm'), b"\x1b[>4;2m"),
+            (("modifyOtherKeys restore", Some(b'>'), &[&[4]], 'm'), b"\x1b[>4m"),
         ];
-        for (name, i1, params, c, want) in admitted {
+        for ((name, i1, params, c), want) in admitted {
             // A pop needs a level outstanding before it can be relayed.
             let mut relay = KeyModeRelay::new();
             if *i1 == Some(b'<') {
@@ -283,7 +287,7 @@ mod tests {
     /// is a modifyOtherKeys sibling that looks equally safe and is still not relayed.
     #[test]
     fn allowlist_denies_everything_else() {
-        let denied: &[(&str, Option<u8>, &[&[u16]], char)] = &[
+        let denied: &[Case] = &[
             ("CSI u (SCORC)", None, &[&[0]], 'u'),
             ("secondary DA", Some(b'>'), &[&[0]], 'c'),
             ("tertiary DA", Some(b'='), &[&[0]], 'c'),
