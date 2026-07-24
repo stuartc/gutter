@@ -40,6 +40,13 @@ re-encode as SGR-1006. Only SGR is emitted; a non-SGR encoding bails loudly.
 - gutter writes the outer enable/disable bytes itself rather than using
   crossterm's bundle, deliberately omitting `?1015h`: the scanner recognises the
   SGR shape only, and reports in the urxvt encoding would leak to the child.
+- The child's own mouse-mode escapes stay absorbed. ADR-022 mirrors three other
+  modes vt100 swallows out to the real terminal by this same poll-diff, and
+  deliberately excludes the mouse: two authorities over the terminal's mouse state
+  would fight, and a child that disabled reporting would turn gutter's own capture
+  off underneath it. `vt100::Screen::input_mode_diff` bundles the mouse modes in
+  with those three, which is the single most likely way this gets broken by
+  accident — hence the hand-rolled diff and its negative test.
 
 ## Code anchors
 

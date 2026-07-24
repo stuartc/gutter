@@ -37,8 +37,9 @@ thread's process, not the group a shell's job control watches.
 Stopped` must inherit a sane state: cooked mode, cursor shown and default-shaped,
 mouse off, the child's keyboard modes undone, alt screen left (or an inline
 hand-back newline emitted). `park()` runs this in ADR-010's order —
-leave-alt-or-hand-back, reset attributes, default cursor shape, reset the relayed
-keyboard modes, disable mouse, show cursor, disable raw mode **last** — then
+leave-alt-or-hand-back, reset attributes, default cursor shape, reset the mirrored
+input modes, reset the relayed keyboard modes, disable mouse, show cursor, disable
+raw mode **last** — then
 flushes, so every byte lands before `suspend_self()` freezes the
 process. This is the entire point of the fix: today's bug is exactly *not* doing
 this.
@@ -58,6 +59,13 @@ keyboard mode of its own (ADR-020). What `unpark()` does re-assert is what the
 before mouse: a set mutates whichever level was on top when it was issued, so the
 order is load-bearing. `park` deliberately leaves that log alone — it is a park,
 not a teardown, and the same double-meaning trap as `outer_alt_active` applies.
+The three modes ADR-022 mirrors are the opposite case and need no replay at all:
+`park` clears the mirror after emitting their off forms, and the step-9 repaint's
+per-frame poll finds the child's live modes disagreeing with it and re-asserts them.
+The poll-diff is the replay mechanism, which is why there is no `rearm` counterpart
+here for it. That lands after `continue_child`, so the child could in principle paint
+in the gap — it cannot matter, since the mode affects only what the terminal sends and
+the user is not typing during those microseconds.
 Beyond raw mode, the replay, mouse and the alt screen, nothing else is re-taken.
 The inline anchor is not re-queried at all: **`base_row` is reseeded to the bottom
 (`rows.saturating_sub(1)`)** for primary-screen (non-alt) children, on the

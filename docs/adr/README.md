@@ -26,6 +26,7 @@ The decisions behind gutter's design. Code comments reference these by number
 | [019](0019-suspend-resume-cycle-ordering.md) | Suspend/resume cycle ordering |
 | [020](0020-raw-input-passthrough.md) | Raw input passthrough |
 | [021](0021-child-driven-mode-relay.md) | Child-driven outer keyboard modes |
+| [022](0022-absorbed-mode-mirroring.md) | Absorbed-mode mirroring by poll-diff |
 
 ## Format
 

@@ -74,6 +74,16 @@ extending the mode indefinitely.
   separate cross-cutting concern.
 - `base_row` is untouched by a width-only change, keeping the inline anchor
   (ADR-013) exactly as `handle_resize` does on a width-only resize.
+- Inside a bracketed paste the chord is not matched at all (ADR-022). Pasted text is
+  data, not input protocol, so a `0x1C` in it is forwarded like any other byte —
+  which removes the live misbehaviour where a paste containing that byte dropped the
+  user into resize mode and the rest of the paste was eaten as commands. The
+  suppression is gated on gutter having mirrored `?2004h` outward, so a program that
+  never asked for paste protection cannot disable the chord by sending the guards
+  itself.
+- The in-mode arrow aliases match both cursor-key encodings, `ESC [ D` and `ESC O D`.
+  With DECCKM mirrored (ADR-022) the terminal really does send the SS3 form, and a
+  decoder matching only the CSI form would silently drop it.
 
 ## Code anchors
 
