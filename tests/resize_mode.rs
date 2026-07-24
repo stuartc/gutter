@@ -8,11 +8,15 @@
 //! B's integration scope is the width change via the modal keys (the rails are
 //! stream C's integration test).
 //!
-//! `--resize-key ctrl-o` is the harness chord for most of the suite: `0x0F`
-//! decodes unambiguously as `Char('o')+CONTROL` on the legacy
-//! (`GUTTER_FORCE_KITTY=0`) outer terminal. The default chord (raw `0x1C` →
-//! legacy decode `Char('4')+CONTROL`, matched via the chord's legacy alias) gets
-//! one dedicated smoke test so that path is exercised end-to-end too.
+//! `--resize-key ctrl-o` is the harness chord for most of the suite; the default
+//! `ctrl-\` (raw `0x1C`) gets one dedicated smoke test so that path is exercised
+//! end-to-end too. Under byte matching both are unambiguous.
+//!
+//! Between writes the suite DRAINS rather than sleeps. gutter's output goes into
+//! the same PTY the test reads, so a test that only sleeps lets that buffer fill
+//! — a full-screen rails repaint is enough — and gutter's render thread blocks in
+//! `write`. Input then queues up and a lone Escape arrives glued to the keystroke
+//! behind it, which is Alt+<key>, not Escape.
 //!
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
@@ -28,8 +32,7 @@ fn gutter_bin() -> String {
 /// Run gutter inside an outer terminal of the given size:
 /// `sh -c 'stty cols C rows R; exec env GUTTER_FORCE_KITTY=0 gutter <args>'`.
 /// `GUTTER_FORCE_KITTY=0` skips the ~2s kitty probe stall a dumb test PTY can't
-/// answer, and decodes Ctrl chords via the legacy byte tables (the ones the
-/// chord's alias fold targets).
+/// answer.
 fn gutter_in_terminal(outer_cols: u16, outer_rows: u16, gutter_args: &str) -> std::process::Command {
     let script = format!(
         "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
@@ -176,10 +179,10 @@ fn esc_exits_mode_key_reaches_child() {
 
     session.write_all(&[0x0F]).unwrap(); // enter
     session.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    let _ = drain_window(&mut session, Duration::from_millis(150));
     session.write_all(&[0x1b]).unwrap(); // Esc
     session.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    let _ = drain_window(&mut session, Duration::from_millis(150));
     session.write_all(b"MARKER_AFTER_ESC").unwrap();
     session.flush().unwrap();
 
@@ -194,11 +197,9 @@ fn esc_exits_mode_key_reaches_child() {
     drop(session);
 }
 
-/// **The default chord (`Ctrl-\`) enters via the raw legacy byte.** `0x1C`
-/// decodes on the legacy (non-kitty) outer terminal as `Char('4')+CONTROL`,
-/// which the chord's alias fold matches against the default `Ctrl-\`. One
+/// **The default chord (`Ctrl-\`) enters via the raw legacy byte `0x1C`.** One
 /// dedicated smoke test for the default-chord path; the rest of the suite uses
-/// `ctrl-o` (unambiguous on any decode).
+/// `ctrl-o`.
 #[test]
 fn default_chord_enters_via_raw_fs_byte() {
     let child = "/bin/sh -c 'trap \"stty size\" WINCH; stty size; while true; do sleep 0.2; done'";
@@ -243,13 +244,13 @@ fn swallowed_key_does_not_leak_and_mode_persists() {
 
     session.write_all(&[0x0F]).unwrap(); // enter
     session.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    let _ = drain_window(&mut session, Duration::from_millis(150));
     session.write_all(b"z").unwrap(); // unrecognised in-mode key
     session.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    let _ = drain_window(&mut session, Duration::from_millis(150));
     session.write_all(&[0x1b]).unwrap(); // Esc: exit
     session.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    let _ = drain_window(&mut session, Duration::from_millis(150));
     session.write_all(b"z").unwrap(); // now passes through to cat
     session.flush().unwrap();
 

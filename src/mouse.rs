@@ -1,13 +1,18 @@
-//! Mouse forwarding gate: turn one decoded outer mouse event into the SGR bytes
-//! the child expects, or a decision to drop it. See ADR-005.
+//! Mouse forwarding gate: turn one outer mouse report into the SGR bytes the
+//! child expects, or a decision to drop it. See ADR-005.
 //!
 //! Pure — no I/O, no terminal, no channel. The render loop reads the child's live
 //! `(mode, encoding)` from the screen each frame and passes them in; that poll is
 //! the only mirror point, because the child's mode-set escapes are absorbed into
 //! vt100's screen state and never reach a callback we can hook.
+//!
+//! The reports arrive from gutter's own scanner (ADR-020). gutter forces the
+//! outer terminal into SGR-1006 itself, so there is exactly one wire shape to
+//! recognise on the input side.
 
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+
+use crate::scan::MouseReport;
 
 /// The SGR final byte: `M` for a press or motion, `m` for a release. Encoding a
 /// release with `M` would tell the child the button is still down (a stuck-button
@@ -33,8 +38,8 @@ pub enum MouseDecision {
     BailNonSgr,
 }
 
-/// The facts the gate needs about one crossterm mouse event, extracted once by
-/// [`classify`] so the forwarding logic doesn't re-match the crossterm enums.
+/// The facts the gate needs about one mouse report, derived once by
+/// [`classify`] from the SGR button byte.
 struct Classified {
     /// The SGR button byte (low button bits + motion bit 32 + wheel bits 64).
     button_byte: u16,
@@ -66,8 +71,8 @@ pub struct MouseGate {
 }
 
 impl MouseGate {
-    /// Decide what to do with one decoded outer mouse event, against the child's
-    /// live `(mode, encoding)` (read from the screen by the caller this cycle) and
+    /// Decide what to do with one outer mouse report, against the child's live
+    /// `(mode, encoding)` (read from the screen by the caller this cycle) and
     /// `left_margin`/`w`.
     ///
     /// Order matters: gate on the child's reporting mode first (swallow `None`,
@@ -78,13 +83,13 @@ impl MouseGate {
     /// across a mode change.
     pub fn forward(
         &mut self,
-        event: &MouseEvent,
+        report: &MouseReport,
         mode: MouseProtocolMode,
         encoding: MouseProtocolEncoding,
         left_margin: u16,
         w: u16,
     ) -> MouseDecision {
-        let c = classify(event);
+        let c = classify(report);
 
         // Track button-held on every press/release before any swallow path: a
         // press that lands while the child is in None still means the button is
@@ -109,8 +114,8 @@ impl MouseGate {
 
         // Rows pass through unchanged — the band spans the full height, only
         // columns carry the margin. translate_col discards gutter / out-of-band.
-        match translate_col(event.column, left_margin, w) {
-            Some(col0) => MouseDecision::Forward(encode_sgr(c.button_byte, col0, event.row, c.kind)),
+        match translate_col(report.col, left_margin, w) {
+            Some(col0) => MouseDecision::Forward(encode_sgr(c.button_byte, col0, report.row, c.kind)),
             None => MouseDecision::Swallow,
         }
     }
@@ -151,79 +156,36 @@ fn should_forward_motion(mode: MouseProtocolMode, button_held: bool) -> bool {
     }
 }
 
-/// Map a crossterm `MouseEvent` to the SGR button byte and the facts the
-/// down-filter and button tracker need.
+/// Derive the down-filter and button-tracker facts from the SGR button byte.
 ///
-/// The SGR button byte: the low 2 bits select the button (0 left, 1 middle,
-/// 2 right); bit 5 (value 32) is the motion bit, set for `Drag`/`Moved`; bit 6
-/// (value 64) is the wheel bit, set for the scroll events (wheel-up 64, wheel-down
-/// 65, wheel-left 66, wheel-right 67). `Drag` carries the held button (motion +
-/// that button); `Moved` is motion with no button (the SGR "button 3 / release"
-/// code 3 plus the motion bit → 35). Getting `Drag` vs `Moved` right is what keeps
-/// the `ButtonMotion` down-filter from inverting (ADR-005).
-fn classify(event: &MouseEvent) -> Classified {
+/// The button byte: the low 2 bits select the button (0 left, 1 middle, 2 right,
+/// 3 "no button"); bits 2–4 carry the shift/alt/ctrl modifiers and are passed
+/// through untouched; bit 5 (value 32) is the motion bit; bit 6 (value 64) is the
+/// wheel bit (wheel-up 64, wheel-down 65, wheel-left 66, wheel-right 67).
+///
+/// Only a real press or release moves the button-held tracker. Motion and wheel
+/// reports are neither, and counting them would invert the `ButtonMotion`
+/// down-filter (ADR-005).
+fn classify(report: &MouseReport) -> Classified {
     const MOTION: u16 = 32;
     const WHEEL: u16 = 64;
-    // SGR "no button" code for a bare move (button bits 0b11 = 3).
-    const NO_BUTTON: u16 = 3;
 
-    fn button_bits(b: MouseButton) -> u16 {
-        match b {
-            MouseButton::Left => 0,
-            MouseButton::Middle => 1,
-            MouseButton::Right => 2,
-        }
-    }
-
-    match event.kind {
-        MouseEventKind::Down(b) => Classified {
-            button_byte: button_bits(b),
-            kind: SgrKind::Press,
-            is_motion: false,
-            press_transition: Some(true),
+    let is_motion = report.button & MOTION != 0;
+    let is_wheel = report.button & WHEEL != 0;
+    Classified {
+        button_byte: report.button,
+        kind: if report.release {
+            SgrKind::Release
+        } else {
+            SgrKind::Press
         },
-        MouseEventKind::Up(b) => Classified {
-            button_byte: button_bits(b),
-            kind: SgrKind::Release,
-            is_motion: false,
-            press_transition: Some(false),
-        },
-        MouseEventKind::Drag(b) => Classified {
-            button_byte: button_bits(b) | MOTION,
-            // Motion uses the press final byte `M`.
-            kind: SgrKind::Press,
-            is_motion: true,
-            press_transition: None,
-        },
-        MouseEventKind::Moved => Classified {
-            button_byte: NO_BUTTON | MOTION,
-            kind: SgrKind::Press,
-            is_motion: true,
-            press_transition: None,
-        },
-        MouseEventKind::ScrollUp => Classified {
-            button_byte: WHEEL,
-            kind: SgrKind::Press,
-            is_motion: false,
-            press_transition: None,
-        },
-        MouseEventKind::ScrollDown => Classified {
-            button_byte: WHEEL | 1,
-            kind: SgrKind::Press,
-            is_motion: false,
-            press_transition: None,
-        },
-        MouseEventKind::ScrollLeft => Classified {
-            button_byte: WHEEL | 2,
-            kind: SgrKind::Press,
-            is_motion: false,
-            press_transition: None,
-        },
-        MouseEventKind::ScrollRight => Classified {
-            button_byte: WHEEL | 3,
-            kind: SgrKind::Press,
-            is_motion: false,
-            press_transition: None,
+        is_motion,
+        press_transition: if is_motion || is_wheel {
+            None
+        } else if report.release {
+            Some(false)
+        } else {
+            Some(true)
         },
     }
 }
@@ -249,16 +211,29 @@ fn encode_sgr(button_byte: u16, col0: u16, row0: u16, kind: SgrKind) -> Vec<u8> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
     use proptest::prelude::*;
 
-    fn ev(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
-        MouseEvent {
-            kind,
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
-        }
+    /// The SGR wire bits the tests build reports from.
+    const MOTION: u16 = 32;
+    const WHEEL: u16 = 64;
+    const NO_BUTTON: u16 = 3;
+
+    fn press(button: u16, col: u16, row: u16) -> MouseReport {
+        MouseReport { button, col, row, release: false }
+    }
+
+    fn release(button: u16, col: u16, row: u16) -> MouseReport {
+        MouseReport { button, col, row, release: true }
+    }
+
+    /// A drag: motion carrying the held button.
+    fn drag(button: u16, col: u16, row: u16) -> MouseReport {
+        press(button | MOTION, col, row)
+    }
+
+    /// A bare move: motion with no button held.
+    fn moved(col: u16, row: u16) -> MouseReport {
+        press(NO_BUTTON | MOTION, col, row)
     }
 
     // --- encode_sgr golden bytes ---
@@ -308,7 +283,7 @@ mod tests {
 
     #[test]
     fn classify_drag_is_motion_with_button() {
-        let c = classify(&ev(MouseEventKind::Drag(MouseButton::Left), 0, 0));
+        let c = classify(&drag(0, 0, 0));
         assert!(c.is_motion);
         assert_eq!(c.press_transition, None);
         // Left (0) | motion (32).
@@ -317,7 +292,7 @@ mod tests {
 
     #[test]
     fn classify_moved_is_motion_without_button() {
-        let c = classify(&ev(MouseEventKind::Moved, 0, 0));
+        let c = classify(&moved(0, 0));
         assert!(c.is_motion);
         assert_eq!(c.press_transition, None);
         // No-button (3) | motion (32).
@@ -326,52 +301,50 @@ mod tests {
 
     #[test]
     fn classify_down_up_transitions() {
-        let down = classify(&ev(MouseEventKind::Down(MouseButton::Right), 0, 0));
+        let down = classify(&press(2, 0, 0));
         assert_eq!(down.press_transition, Some(true));
         assert_eq!(down.kind, SgrKind::Press);
         assert_eq!(down.button_byte, 2);
         assert!(!down.is_motion);
 
-        let up = classify(&ev(MouseEventKind::Up(MouseButton::Right), 0, 0));
+        let up = classify(&release(2, 0, 0));
         assert_eq!(up.press_transition, Some(false));
         assert_eq!(up.kind, SgrKind::Release);
     }
 
     #[test]
-    fn classify_wheel_sets_wheel_bit() {
-        assert_eq!(
-            classify(&ev(MouseEventKind::ScrollUp, 0, 0)).button_byte,
-            64
-        );
-        assert_eq!(
-            classify(&ev(MouseEventKind::ScrollDown, 0, 0)).button_byte,
-            65
-        );
+    fn classify_wheel_is_neither_motion_nor_a_transition() {
+        let up = classify(&press(WHEEL, 0, 0));
+        assert_eq!(up.button_byte, 64);
+        assert!(!up.is_motion);
+        assert_eq!(up.press_transition, None, "a wheel tick never holds a button");
+        assert_eq!(classify(&press(WHEEL | 1, 0, 0)).button_byte, 65);
+    }
+
+    #[test]
+    fn classify_passes_modifier_bits_through() {
+        // Shift-click: button 0 | shift 4. The child must see the modifier.
+        assert_eq!(classify(&press(4, 0, 0)).button_byte, 4);
+        assert_eq!(classify(&press(4, 0, 0)).press_transition, Some(true));
     }
 
     // --- MouseGate::forward branches ---
 
-    /// Forward a single event at `(mode, Sgr)` against a fresh gate.
+    /// Forward a single report at `(mode, Sgr)`.
     fn fwd_sgr(
         g: &mut MouseGate,
         mode: MouseProtocolMode,
-        event: MouseEvent,
+        report: MouseReport,
         left_margin: u16,
         w: u16,
     ) -> MouseDecision {
-        g.forward(&event, mode, MouseProtocolEncoding::Sgr, left_margin, w)
+        g.forward(&report, mode, MouseProtocolEncoding::Sgr, left_margin, w)
     }
 
     #[test]
     fn forward_swallows_when_mode_none() {
         let mut g = MouseGate::default();
-        let d = fwd_sgr(
-            &mut g,
-            MouseProtocolMode::None,
-            ev(MouseEventKind::Down(MouseButton::Left), 5, 2),
-            0,
-            80,
-        );
+        let d = fwd_sgr(&mut g, MouseProtocolMode::None, press(0, 5, 2), 0, 80);
         assert_eq!(d, MouseDecision::Swallow);
     }
 
@@ -380,7 +353,7 @@ mod tests {
         for enc in [MouseProtocolEncoding::Default, MouseProtocolEncoding::Utf8] {
             let mut g = MouseGate::default();
             let d = g.forward(
-                &ev(MouseEventKind::Down(MouseButton::Left), 5, 2),
+                &press(0, 5, 2),
                 MouseProtocolMode::PressRelease,
                 enc,
                 0,
@@ -398,17 +371,17 @@ mod tests {
         let m = MouseProtocolMode::PressRelease;
         // Press → forward.
         assert!(matches!(
-            fwd_sgr(&mut g, m, ev(MouseEventKind::Down(MouseButton::Left), 0, 0), 0, 80),
+            fwd_sgr(&mut g, m, press(0, 0, 0), 0, 80),
             MouseDecision::Forward(_)
         ));
-        // Motion (Drag) → swallow even though a button is now held.
+        // Motion (drag) → swallow even though a button is now held.
         assert_eq!(
-            fwd_sgr(&mut g, m, ev(MouseEventKind::Drag(MouseButton::Left), 1, 0), 0, 80),
+            fwd_sgr(&mut g, m, drag(0, 1, 0), 0, 80),
             MouseDecision::Swallow
         );
         // Release → forward.
         assert!(matches!(
-            fwd_sgr(&mut g, m, ev(MouseEventKind::Up(MouseButton::Left), 1, 0), 0, 80),
+            fwd_sgr(&mut g, m, release(0, 1, 0), 0, 80),
             MouseDecision::Forward(_)
         ));
     }
@@ -419,20 +392,20 @@ mod tests {
         let m = MouseProtocolMode::ButtonMotion;
         // press, motion, release, motion → forward, forward, forward, swallow.
         assert!(matches!(
-            fwd_sgr(&mut g, m, ev(MouseEventKind::Down(MouseButton::Left), 0, 0), 0, 80),
+            fwd_sgr(&mut g, m, press(0, 0, 0), 0, 80),
             MouseDecision::Forward(_)
         ));
         assert!(matches!(
-            fwd_sgr(&mut g, m, ev(MouseEventKind::Drag(MouseButton::Left), 1, 0), 0, 80),
+            fwd_sgr(&mut g, m, drag(0, 1, 0), 0, 80),
             MouseDecision::Forward(_)
         ));
         assert!(matches!(
-            fwd_sgr(&mut g, m, ev(MouseEventKind::Up(MouseButton::Left), 1, 0), 0, 80),
+            fwd_sgr(&mut g, m, release(0, 1, 0), 0, 80),
             MouseDecision::Forward(_)
         ));
         // Motion with no button held → swallow.
         assert_eq!(
-            fwd_sgr(&mut g, m, ev(MouseEventKind::Moved, 2, 0), 0, 80),
+            fwd_sgr(&mut g, m, moved(2, 0), 0, 80),
             MouseDecision::Swallow
         );
     }
@@ -441,14 +414,20 @@ mod tests {
     fn forward_clean_click_translates_and_encodes() {
         let mut g = MouseGate::default();
         // margin 10, click at physical col 15 → child col 5 → SGR col 6.
-        let d = fwd_sgr(
-            &mut g,
-            MouseProtocolMode::PressRelease,
-            ev(MouseEventKind::Down(MouseButton::Left), 15, 3),
-            10,
-            80,
-        );
+        let d = fwd_sgr(&mut g, MouseProtocolMode::PressRelease, press(0, 15, 3), 10, 80);
         assert_eq!(d, MouseDecision::Forward(b"\x1b[<0;6;4M".to_vec()));
+    }
+
+    #[test]
+    fn forward_keeps_the_modifier_bits_on_a_click() {
+        let mut g = MouseGate::default();
+        // Shift-click (button 0 | 4) at margin 10, physical col 15.
+        let d = fwd_sgr(&mut g, MouseProtocolMode::PressRelease, press(4, 15, 3), 10, 80);
+        assert_eq!(
+            d,
+            MouseDecision::Forward(b"\x1b[<4;6;4M".to_vec()),
+            "the child must see the shift bit, not a plain click"
+        );
     }
 
     #[test]
@@ -457,22 +436,22 @@ mod tests {
         let m = MouseProtocolMode::PressRelease;
         // margin 10, click at col 4 (left of band) → swallow.
         assert_eq!(
-            fwd_sgr(&mut g, m, ev(MouseEventKind::Down(MouseButton::Left), 4, 0), 10, 20),
+            fwd_sgr(&mut g, m, press(0, 4, 0), 10, 20),
             MouseDecision::Swallow
         );
         // click at col 30 (>= margin 10 + W 20) → swallow.
         assert_eq!(
-            fwd_sgr(&mut g, m, ev(MouseEventKind::Down(MouseButton::Left), 30, 0), 10, 20),
+            fwd_sgr(&mut g, m, press(0, 30, 0), 10, 20),
             MouseDecision::Swallow
         );
     }
 
-    // --- the live mode/encoding poll drives the gate per-event ---
+    // --- the live mode/encoding poll drives the gate per-report ---
 
     #[test]
     fn gate_flips_with_polled_modes() {
         let mut g = MouseGate::default();
-        let click = ev(MouseEventKind::Down(MouseButton::Left), 5, 1);
+        let click = press(0, 5, 1);
 
         // None → swallow.
         assert_eq!(

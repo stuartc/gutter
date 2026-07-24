@@ -6,20 +6,23 @@
 //! render thread and repainted to the real terminal at a left-margin column
 //! offset.
 //!
-//! Three live threads plus a waiter feed one merged unbounded channel; no async
+//! Four live threads plus a waiter feed one merged unbounded channel; no async
 //! runtime. The design decisions behind all this live in `docs/adr/`.
 //!
 //! - Thread 1 (`pty::reader`)  — PTY byte pump, self-throttled via a bounded
 //!   staging `sync_channel` (the backpressure seam, ADR-007/009).
 //! - Thread 2 (`render::run`)  — owns the `vt100::Parser`, the outer terminal
-//!   handle and the sole PTY-master writer; runs the coalescing loop and the
-//!   offset repaint.
-//! - Thread 3 (`input::run`)   — owns crossterm's event source exclusively.
+//!   handle and the sole PTY-master writer; runs the coalescing loop, the input
+//!   scanner and the offset repaint.
+//! - Thread 3 (`input::run`)   — owns the outer tty read fd exclusively; a dumb
+//!   `read()` pump that interprets nothing (ADR-020).
 //! - Thread 4 (`waiter::run`)  — on unix, loops on raw `waitpid(WUNTRACED|
 //!   WCONTINUED)`, the authoritative child-state signal (exit AND stop/continue,
 //!   ADR-0018).
+//! - Thread 5 (`sigwinch::run`) — `SIGWINCH` → `Msg::Resize`.
 
 mod callbacks;
+mod chord;
 mod cli;
 mod clipboard;
 mod clock;
@@ -32,6 +35,8 @@ mod msg;
 mod pty;
 mod render;
 mod rowclip;
+mod scan;
+mod sigwinch;
 mod suspend;
 mod terminal;
 mod waiter;
@@ -43,13 +48,21 @@ mod waiter;
 #[cfg(all(test, feature = "oracle"))]
 mod oracle;
 
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::process;
 use std::sync::mpsc::{channel, sync_channel};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use clock::RealClock;
 use render::Renderer;
 use terminal::{CrosstermTerminal, OuterTerminal};
+
+/// How long the startup CPR probe waits for the terminal's reply. Generous: a
+/// real terminal answers in a millisecond or two.
+const CPR_TIMEOUT: Duration = Duration::from_millis(100);
 
 fn main() {
     let code = run();
@@ -156,33 +169,49 @@ fn run() -> i32 {
         }
     }
 
-    // Capture the launch cursor row, the inline anchor (ADR-013), in the same
-    // exclusive window the kitty probe used: once the input thread spawns it owns
-    // crossterm's event source and would consume the `ESC[6n` CPR reply, so the
-    // query must run while nothing else drains the terminal.
+    // The tty gutter reads input from. Opened ONCE here: the CPR probe below and
+    // Thread 3 must share one file description, or they would race for the reply.
+    // A separate open from the clipboard's (ADR-004); nothing ever reads that one.
+    let input_tty = open_input_tty();
+
+    // Capture the launch cursor row, the inline anchor (ADR-013), before Thread 3
+    // starts draining the same fd.
     //
     // `GUTTER_FORCE_ANCHOR_ROW` injects the row for tests, whose kernel PTY never
-    // answers CPR. On a failed query, fall back to the bottom line (`rows - 1`),
-    // the common launch point — NOT row 0, which would reproduce the overpaint the
-    // anchor exists to prevent. `position()` has no timeout, but a real tty answers.
-    let anchor_row = match std::env::var("GUTTER_FORCE_ANCHOR_ROW").ok() {
-        Some(v) => v.parse::<u16>().unwrap_or(rows.saturating_sub(1)),
-        None => crossterm::cursor::position()
-            .map(|(_col, row)| row)
-            .unwrap_or(rows.saturating_sub(1)),
+    // answers CPR; when it is set the probe is skipped entirely. On a failed query,
+    // fall back to the bottom line (`rows - 1`), the common launch point — NOT row
+    // 0, which would reproduce the overpaint the anchor exists to prevent.
+    let (anchor_row, leftover) = match std::env::var("GUTTER_FORCE_ANCHOR_ROW").ok() {
+        Some(v) => (v.parse::<u16>().unwrap_or(rows.saturating_sub(1)), Vec::new()),
+        None => match input_tty.as_ref() {
+            Some(tty) => {
+                let (row, leftover) = probe_cursor_row(tty, CPR_TIMEOUT);
+                (row.unwrap_or(rows.saturating_sub(1)), leftover)
+            }
+            None => (rows.saturating_sub(1), Vec::new()),
+        },
     };
+
+    // Anything the probe read that was not the reply is a keystroke typed during
+    // startup. Seed it into the merged channel BEFORE Thread 3 exists, so mpsc's
+    // per-sender ordering guarantees the render thread scans it ahead of the first
+    // byte Thread 3 reads.
+    if !leftover.is_empty() {
+        let _ = merged_tx.send(msg::Msg::Input(leftover));
+    }
 
     // Thread 3: input reader, DETACHED. Spawned but never joined; the
     // un-interruptible `read()` is reaped by process::exit on teardown (ADR-010).
-    //
-    // ORDERING (load-bearing): this spawn MUST stay after the kitty probe. Thread 3
-    // drains crossterm's event source, and the probe's `CSI ? u` reply returns
-    // through that same source — a Thread 3 started first would consume the reply,
-    // forcing the probe to its full ~2 s timeout and a permanent `false` (kitty
-    // silently clamped off even on capable terminals). The span from
-    // `enable_raw_mode()` to this spawn is the only window an outer round-trip
-    // query can read its own reply uncontended.
-    thread::spawn(move || input::run(merged_tx));
+    if let Some(tty) = input_tty {
+        let merged_tx = merged_tx.clone();
+        thread::spawn(move || input::run(tty, merged_tx));
+    } else {
+        eprintln!("gutter: /dev/tty unavailable, keyboard input is disabled");
+    }
+
+    // Thread 5: SIGWINCH → Msg::Resize. Detached like Thread 3; crossterm no longer
+    // installs a handler, so this is the only resize source (ADR-020).
+    thread::spawn(move || sigwinch::run(merged_tx));
 
     // Eager outer mouse capture (ADR-005): enable ONCE here, before the alt
     // screen, so the outer terminal is already reporting SGR motion at the first
@@ -233,4 +262,135 @@ fn run() -> i32 {
     // The render loop already ran the ordered restore before returning. A None
     // (channel disconnected without ChildExited) counts as success.
     code.unwrap_or(0)
+}
+
+/// The tty gutter reads input from: `/dev/tty` (a separate open from the
+/// clipboard's, ADR-004), falling back to a `dup` of stdin.
+fn open_input_tty() -> Option<File> {
+    if let Ok(tty) = clipboard::open_tty_read_write() {
+        return Some(tty);
+    }
+    // SAFETY: `dup` returns a fresh descriptor this process owns outright, so
+    // handing it to `File` transfers a genuinely exclusive ownership.
+    let fd = unsafe { libc::dup(0) };
+    (fd >= 0).then(|| unsafe { File::from_raw_fd(fd) })
+}
+
+/// Ask the terminal where the cursor is (DSR-CPR, `ESC [ 6 n`) and read the
+/// `ESC [ row ; col R` answer back off the input tty. Returns the 0-based row and
+/// **everything else that was read** — bytes the user typed while gutter was
+/// starting, which the caller must not drop.
+///
+/// Hand-rolled rather than `crossterm::cursor::position()`: that runs through
+/// crossterm's event machinery, which pushes every non-reply event it meets into
+/// an internal queue that nothing drains once crossterm is out of the input path
+/// (ADR-020).
+fn probe_cursor_row(tty: &File, timeout: Duration) -> (Option<u16>, Vec<u8>) {
+    let mut out = std::io::stdout();
+    if out.write_all(b"\x1b[6n").is_err() || out.flush().is_err() {
+        return (None, Vec::new());
+    }
+
+    let deadline = Instant::now() + timeout;
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        if let Some((start, end, row)) = find_cpr(&buf) {
+            let mut leftover = buf[..start].to_vec();
+            leftover.extend_from_slice(&buf[end..]);
+            return (Some(row), leftover);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || !wait_readable(tty, remaining) {
+            break;
+        }
+        let mut chunk = [0u8; 256];
+        match (&mut &*tty).read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    // No reply inside the window: the whole buffer is the user's.
+    (None, buf)
+}
+
+/// Whether `tty` has readable bytes within `timeout`.
+fn wait_readable(tty: &File, timeout: Duration) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: tty.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: one initialised pollfd, described honestly by the count.
+    let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+    n > 0 && pfd.revents & libc::POLLIN != 0
+}
+
+/// Locate a `ESC [ <row> ; <col> R` reply: its byte span and the 0-based row.
+fn find_cpr(buf: &[u8]) -> Option<(usize, usize, u16)> {
+    for start in 0..buf.len().saturating_sub(1) {
+        if buf[start] != 0x1b || buf[start + 1] != b'[' {
+            continue;
+        }
+        let digits_start = start + 2;
+        let mut i = digits_start;
+        while i < buf.len() && buf[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == digits_start || i >= buf.len() || buf[i] != b';' {
+            continue;
+        }
+        let row_end = i;
+        i += 1;
+        let col_start = i;
+        while i < buf.len() && buf[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == col_start || i >= buf.len() || buf[i] != b'R' {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&buf[digits_start..row_end]) else {
+            continue;
+        };
+        let Ok(row) = text.parse::<u32>() else {
+            continue;
+        };
+        // The reply is 1-based; the grid is 0-based.
+        let row0 = row.saturating_sub(1).min(u16::MAX as u32) as u16;
+        return Some((start, i + 1, row0));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_cpr;
+
+    #[test]
+    fn cpr_reply_is_located_and_the_row_is_zero_based() {
+        assert_eq!(find_cpr(b"\x1b[24;1R"), Some((0, 7, 23)));
+        assert_eq!(find_cpr(b"\x1b[1;1R"), Some((0, 6, 0)));
+    }
+
+    #[test]
+    fn keystrokes_around_the_reply_are_leftover() {
+        let buf = b"ab\x1b[7;3Rcd";
+        let (start, end, row) = find_cpr(buf).unwrap();
+        assert_eq!(row, 6);
+        let mut leftover = buf[..start].to_vec();
+        leftover.extend_from_slice(&buf[end..]);
+        assert_eq!(leftover, b"abcd".to_vec());
+    }
+
+    #[test]
+    fn a_partial_or_absent_reply_is_not_matched() {
+        assert_eq!(find_cpr(b""), None);
+        assert_eq!(find_cpr(b"\x1b[24;1"), None, "no final byte yet");
+        assert_eq!(find_cpr(b"\x1b[24R"), None, "no column parameter");
+        assert_eq!(find_cpr(b"hello"), None);
+        // A different CSI must not be mistaken for the reply.
+        assert_eq!(find_cpr(b"\x1b[15~"), None);
+    }
 }

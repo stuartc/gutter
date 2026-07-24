@@ -7,7 +7,9 @@ use portable_pty::ExitStatus;
 /// `std::sync::mpsc` channel.
 ///
 /// - `Pty` — a chunk of raw child output from the PTY reader (Thread 1).
-/// - `Input` — a decoded crossterm event from the input reader (Thread 3).
+/// - `Input` — a chunk of raw outer-terminal input from the input reader
+///   (Thread 3), uninterpreted.
+/// - `Resize` — a `SIGWINCH` from the signal thread (Thread 5).
 /// - `ChildExited` — the child-death signal from the waiter (Thread 4). The
 ///   authoritative shutdown trigger: PTY EOF never drives it, and a channel
 ///   `Disconnected` is only a backstop for when every sender drops without one.
@@ -25,7 +27,14 @@ use portable_pty::ExitStatus;
 #[derive(Debug)]
 pub enum Msg {
     Pty(Vec<u8>),
-    Input(crossterm::event::Event),
+    /// Raw bytes read from the outer tty. Uninterpreted — the render thread's
+    /// scanner turns them into forwarded bytes, mouse reports and gutter-consumed
+    /// keys (ADR-020).
+    Input(Vec<u8>),
+    /// The outer terminal resized. No payload: the render thread reads the real
+    /// size when it handles this, so coalesced signals cannot leave it acting on
+    /// a stale one.
+    Resize,
     ChildExited(ExitStatus),
     /// The child stopped (`WIFSTOPPED`). `sig` is `WSTOPSIG`, carried for
     /// tests/logging; v1 reacts to every stop signal identically, so the binary

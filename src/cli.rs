@@ -5,7 +5,7 @@
 //! arguments — a hand-rolled split of `std::env::args`, no clap.
 
 use crate::geometry::{Layout, Width};
-use crate::keyboard::{parse_chord, KeyChord};
+use crate::chord::{parse_chord, Chord};
 
 /// The parsed invocation: the band width, the alignment, the resize-mode
 /// chord, and the child command.
@@ -19,7 +19,7 @@ pub struct Config {
     /// Defaults to [`Layout::Center`].
     pub layout: Layout,
     /// The resize-mode enter chord (`--resize-key`). Defaults to Ctrl-\.
-    pub resize_key: KeyChord,
+    pub resize_key: Chord,
     pub cmd: String,
     pub args: Vec<String>,
 }
@@ -36,7 +36,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
     let mut iter = args.into_iter().peekable();
     let mut width: Option<Width> = None;
     let mut layout: Option<Layout> = None;
-    let mut resize_key: Option<KeyChord> = None;
+    let mut resize_key: Option<Chord> = None;
 
     // Leading flags, terminated by the first non-flag (the command).
     while let Some(arg) = iter.peek() {
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn default_resize_key_is_ctrl_backslash() {
         let cfg = parse(v(&["echo"])).unwrap();
-        assert_eq!(cfg.resize_key, KeyChord::default());
+        assert_eq!(cfg.resize_key, Chord::default());
     }
 
     #[test]
@@ -236,12 +236,12 @@ mod tests {
         let cfg = parse(v(&["--resize-key", "ctrl-g", "echo"])).unwrap();
         assert_eq!(
             cfg.resize_key,
-            crate::keyboard::parse_chord("ctrl-g").unwrap()
+            crate::chord::parse_chord("ctrl-g").unwrap()
         );
         let cfg = parse(v(&["--resize-key=ctrl-o", "echo"])).unwrap();
         assert_eq!(
             cfg.resize_key,
-            crate::keyboard::parse_chord("ctrl-o").unwrap()
+            crate::chord::parse_chord("ctrl-o").unwrap()
         );
     }
 
@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn resize_key_after_command_is_child_arg() {
         let cfg = parse(v(&["vim", "--resize-key", "ctrl-g"])).unwrap();
-        assert_eq!(cfg.resize_key, KeyChord::default());
+        assert_eq!(cfg.resize_key, Chord::default());
         assert_eq!(cfg.cmd, "vim");
         assert_eq!(cfg.args, v(&["--resize-key", "ctrl-g"]));
     }
