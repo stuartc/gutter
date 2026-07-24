@@ -26,10 +26,10 @@
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod common;
-use common::{drain_window, pty_guard, spawn_gutter};
+use common::{drain_window, find, pty_guard, spawn_gutter};
 
 /// The outer terminal these tests run gutter in.
 const OUTER_COLS: u16 = 120;
@@ -70,9 +70,6 @@ fn echo_transcript(child: &str, payload: &[u8]) -> String {
 /// PageDown, Insert, Shift+Tab and F1–F12 each have to arrive at the child
 /// verbatim; a key that reaches it as nothing at all is a key that does literally
 /// nothing in a TUI, with no error anywhere to say so.
-///
-/// Named after the symptom rather than the mechanism, so a future regression says
-/// what it broke.
 #[test]
 fn keys_that_were_silently_dead_reach_the_child() {
     let _g = pty_guard();
@@ -139,6 +136,53 @@ fn modified_and_alt_keys_arrive_byte_identical() {
             "{name} ({caret}) must arrive byte-identical; transcript was {text:?}"
         );
     }
+}
+
+/// The same child, announcing itself once its own `stty raw` has landed.
+const READY_CARET_ECHO_CHILD: &str =
+    "/bin/sh -c 'stty raw -echo; printf READY; exec cat -v'";
+
+/// Write `payload` only once the child has printed `READY`, and return the band
+/// transcript. For payloads carrying a byte the line discipline would act on: a
+/// `0x1A` written before the child's `stty raw` lands is SUSP, and stops the child
+/// instead of reaching `cat`, so a fixed sleep is a race rather than a delay.
+fn ready_transcript(payload: &[u8]) -> String {
+    let mut session = spawn_gutter(
+        OUTER_COLS,
+        OUTER_ROWS,
+        &format!("--width 100 {READY_CARET_ECHO_CHILD}"),
+    );
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        seen.extend_from_slice(&drain_window(&mut session, Duration::from_millis(100)));
+        if find(&seen, b"READY").is_some() {
+            break;
+        }
+    }
+    assert!(find(&seen, b"READY").is_some(), "the child never came up");
+
+    session.write_all(payload).unwrap();
+    session.flush().unwrap();
+
+    let bytes = drain_window(&mut session, Duration::from_millis(700));
+    let text = band_text(&bytes);
+    drop(session);
+    text
+}
+
+/// The bare control bytes, which have no escape-sequence shape for the scanner to
+/// recognise and so must simply fall through. `0x7f` is what Backspace sends on
+/// nearly every terminal; `0x1a` is the byte a cooked-mode Ctrl-Z relies on
+/// reaching the child's own line discipline (ADR-0018).
+#[test]
+fn bare_control_bytes_reach_the_child() {
+    let _g = pty_guard();
+    let text = ready_transcript(b"A\x7fB\x1aC");
+    assert!(
+        text.contains("A^?B^ZC"),
+        "DEL and SUB must arrive verbatim; transcript was {text:?}"
+    );
 }
 
 /// A lone Escape is the one key the scanner has to withhold, because it cannot be
