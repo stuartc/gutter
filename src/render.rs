@@ -1951,6 +1951,104 @@ mod tests {
         )
     }
 
+    /// A recording [`PtyResizer`] capturing each `master.resize(cols, rows)` in
+    /// order.
+    #[derive(Default)]
+    struct RecResizer {
+        calls: std::cell::RefCell<Vec<(u16, u16)>>,
+    }
+    impl PtyResizer for RecResizer {
+        fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+            self.calls.borrow_mut().push((cols, rows));
+            Ok(())
+        }
+    }
+
+    /// Build a centred renderer with an explicit width config, for the tests that
+    /// drive the width machinery.
+    fn mode_renderer(width: u16, rows: u16, real_cols: u16, cfg: Width) -> Renderer {
+        Renderer::new(
+            width,
+            rows,
+            real_cols,
+            Layout::Center,
+            cfg,
+            Box::new(std::io::sink()),
+            0,
+        )
+    }
+
+    /// The default chord's byte, the one gutter withholds from the child.
+    const CHORD: &[u8] = &[0x1c];
+
+    /// Everything one turn of the loop touches, bundled so tests read as a script of
+    /// `send`/`enter` calls rather than repeating eight `&mut` arguments. Drives
+    /// `apply_message` and `flush_hold` directly, which is the whole loop minus the
+    /// frame timing.
+    struct Ctx {
+        clock: VirtualClock,
+        renderer: Renderer,
+        resize: ResizeCtl<u64>,
+        input: InputCtl<u64>,
+        term: MockTerminal,
+        pty: Vec<u8>,
+        resizer: RecResizer,
+    }
+
+    impl Ctx {
+        fn new(width: u16, rows: u16, real_cols: u16, cfg: Width) -> Self {
+            Self {
+                clock: VirtualClock::new(vec![]),
+                renderer: mode_renderer(width, rows, real_cols, cfg),
+                resize: ResizeCtl::inactive(),
+                input: InputCtl::new(),
+                term: MockTerminal::new(),
+                pty: Vec::new(),
+                resizer: RecResizer::default(),
+            }
+        }
+
+        fn send(&mut self, bytes: &[u8]) -> Flow {
+            apply_message(
+                Msg::Input(bytes.to_vec()),
+                &mut self.clock,
+                &mut self.renderer,
+                &mut self.resize,
+                &mut self.input,
+                &mut self.term,
+                &mut self.pty,
+                &self.resizer,
+            )
+        }
+
+        /// Release whatever the ESC-hold is withholding, as the loop's top-of-frame
+        /// check does once the deadline passes.
+        fn expire_hold(&mut self) {
+            flush_hold(
+                &mut self.input,
+                &mut self.clock,
+                &mut self.renderer,
+                &mut self.resize,
+                &mut self.term,
+                &mut self.pty,
+                &self.resizer,
+            );
+        }
+
+        /// Advance virtual time, firing the hold only once its deadline has passed —
+        /// the loop's own top-of-frame condition.
+        fn advance(&mut self, ms: u64) {
+            self.clock.now_ms += ms;
+            if self.input.hold_deadline.is_some_and(|d| self.clock.now_ms >= d) {
+                self.expire_hold();
+            }
+        }
+
+        fn enter(&mut self) {
+            self.send(CHORD);
+        }
+    }
+
     fn run_with(
         script: Vec<(u64, Msg)>,
         width: u16,
@@ -2101,7 +2199,6 @@ mod tests {
     /// emits the dim `Exited with: 42` status line before the remaining restore steps.
     #[test]
     fn child_exit_restores_in_order() {
-        use crate::terminal::OuterTerminal;
         let mut clock = VirtualClock::new(vec![
             (0u64, Msg::Pty(b"report".to_vec())),
             (1, Msg::ChildExited(ExitStatus::with_exit_code(42))),
@@ -2172,7 +2269,6 @@ mod tests {
     /// zero exit (ADR-010/012).
     #[test]
     fn child_exit_leaves_alt_screen_then_restores_in_order() {
-        use crate::terminal::OuterTerminal;
         let mut clock = VirtualClock::new(vec![
             // The child enters the alt screen (a TUI), then exits while still in it.
             (0u64, Msg::Pty(b"\x1b[?1049h".to_vec())),
@@ -2228,7 +2324,6 @@ mod tests {
     /// reporting active and Escape starts producing `CSI 27 u`.
     #[test]
     fn child_exit_resets_the_relayed_keyboard_modes() {
-        use crate::terminal::OuterTerminal;
         let mut clock = VirtualClock::new(vec![
             // A TUI that enters the alt screen, pushes a kitty level and turns
             // modifyOtherKeys on, then exits with both still live.
@@ -2262,7 +2357,6 @@ mod tests {
     /// whose user configured modifyOtherKeys themselves must survive gutter.
     #[test]
     fn child_exit_relays_nothing_when_no_mode_was_requested() {
-        use crate::terminal::OuterTerminal;
         let mut clock = VirtualClock::new(vec![
             (0u64, Msg::Pty(b"plain output".to_vec())),
             (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
@@ -2289,7 +2383,6 @@ mod tests {
     /// and emitted no `LeaveAltScreen`.
     #[test]
     fn child_exit_before_final_alt_frame_still_leaves_alt() {
-        use crate::terminal::OuterTerminal;
         let mut clock = VirtualClock::new(vec![
             // The waiter's ChildExited lands first; the alt-screen bytes the child
             // wrote just before exiting are still queued behind it, then PtyEof.
@@ -2727,8 +2820,8 @@ mod tests {
     #[test]
     fn dispatch_forwards_input_bytes_verbatim() {
         let script = vec![
-            // The two modifyOtherKeys Enter forms, then a battery of the keys that
-            // produced nothing at all under the old encoder.
+            // The two modifyOtherKeys Enter forms, then a battery of navigation
+            // and function keys.
             (0u64, Msg::Input(b"\r".to_vec())),
             (1, Msg::Input(b"\x1b[13;2u".to_vec())),
             (1, Msg::Input(b"\x1b[3~\x1b[H\x1b[5~\x1bOP\x1b[24~".to_vec())),
@@ -2743,7 +2836,7 @@ mod tests {
         );
     }
 
-    /// Alt+<char> keeps its ESC prefix, which the old encoder dropped.
+    /// Alt+<char> reaches the child with its ESC prefix intact.
     #[test]
     fn dispatch_forwards_alt_char_with_its_esc_prefix() {
         let script = vec![
@@ -3451,7 +3544,6 @@ line two\r\n\
         /// input-encoding restore sits together with the coarsest last.
         #[test]
         fn child_exit_resets_the_mirrored_modes_before_the_relay_reset() {
-            use crate::terminal::OuterTerminal;
             let mut clock = VirtualClock::new(vec![
                 (0u64, Msg::Pty(b"\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[>1u".to_vec())),
                 (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
@@ -3484,7 +3576,6 @@ line two\r\n\
         /// keeps it.
         #[test]
         fn child_exit_resets_nothing_that_was_never_mirrored() {
-            use crate::terminal::OuterTerminal;
             let mut clock = VirtualClock::new(vec![
                 (0u64, Msg::Pty(b"plain output".to_vec())),
                 (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
@@ -3510,64 +3601,18 @@ line two\r\n\
     mod esc_hold {
         use super::*;
 
-        /// The state one frame of the loop carries for input.
-        struct Ctx {
-            clock: VirtualClock,
-            renderer: Renderer,
-            resize: ResizeCtl<u64>,
-            input: InputCtl<u64>,
-            term: MockTerminal,
-            pty: Vec<u8>,
-        }
-
-        impl Ctx {
-            fn new() -> Self {
-                Self {
-                    clock: VirtualClock::new(vec![]),
-                    renderer: left_renderer(80, 24),
-                    resize: ResizeCtl::inactive(),
-                    input: InputCtl::new(),
-                    term: MockTerminal::new(),
-                    pty: Vec::new(),
-                }
-            }
-
-            fn feed(&mut self, bytes: &[u8]) {
-                apply_message(
-                    Msg::Input(bytes.to_vec()),
-                    &mut self.clock,
-                    &mut self.renderer,
-                    &mut self.resize,
-                    &mut self.input,
-                    &mut self.term,
-                    &mut self.pty,
-                    &NoopResizer,
-                );
-            }
-
-            /// The loop's hold branch: fire only once the deadline has passed.
-            fn advance(&mut self, ms: u64) {
-                self.clock.now_ms += ms;
-                if self.input.hold_deadline.is_some_and(|d| self.clock.now_ms >= d) {
-                    flush_hold(
-                        &mut self.input,
-                        &mut self.clock,
-                        &mut self.renderer,
-                        &mut self.resize,
-                        &mut self.term,
-                        &mut self.pty,
-                        &NoopResizer,
-                    );
-                }
-            }
-        }
-
         const HOLD_MS: u64 = 25;
+
+        /// The band geometry these tests use: margin 0, so nothing here depends on
+        /// where the band sits.
+        fn ctx() -> Ctx {
+            Ctx::new(80, 24, 80, Width::Cols(80))
+        }
 
         #[test]
         fn lone_esc_waits_then_flushes() {
-            let mut ctx = Ctx::new();
-            ctx.feed(b"\x1b");
+            let mut ctx = ctx();
+            ctx.send(b"\x1b");
             assert!(ctx.pty.is_empty(), "the Escape is withheld");
             assert_eq!(ctx.input.hold_deadline, Some(HOLD_MS), "armed at now + 25ms");
 
@@ -3581,10 +3626,10 @@ line two\r\n\
 
         #[test]
         fn esc_completed_within_hold_cancels_it() {
-            let mut ctx = Ctx::new();
-            ctx.feed(b"\x1b");
+            let mut ctx = ctx();
+            ctx.send(b"\x1b");
             ctx.clock.now_ms += 5;
-            ctx.feed(b"[A");
+            ctx.send(b"[A");
             assert_eq!(ctx.pty, b"\x1b[A", "the arrow goes out whole");
             assert_eq!(ctx.input.hold_deadline, None, "the deadline is disarmed");
 
@@ -3594,8 +3639,8 @@ line two\r\n\
 
         #[test]
         fn plain_bytes_are_never_delayed() {
-            let mut ctx = Ctx::new();
-            ctx.feed(b"abc");
+            let mut ctx = ctx();
+            ctx.send(b"abc");
             assert_eq!(ctx.pty, b"abc");
             assert_eq!(
                 ctx.input.hold_deadline, None,
@@ -3605,16 +3650,16 @@ line two\r\n\
 
         #[test]
         fn complete_sequence_in_one_chunk_never_arms_the_hold() {
-            let mut ctx = Ctx::new();
-            ctx.feed(b"\x1b[15~");
+            let mut ctx = ctx();
+            ctx.send(b"\x1b[15~");
             assert_eq!(ctx.pty, b"\x1b[15~");
             assert_eq!(ctx.input.hold_deadline, None);
         }
 
         #[test]
         fn partial_sequence_flushed_whole_on_timeout() {
-            let mut ctx = Ctx::new();
-            ctx.feed(b"\x1b[");
+            let mut ctx = ctx();
+            ctx.send(b"\x1b[");
             ctx.advance(HOLD_MS);
             assert_eq!(
                 ctx.pty, b"\x1b[",
@@ -3624,10 +3669,10 @@ line two\r\n\
 
         #[test]
         fn late_tail_is_forwarded_in_order() {
-            let mut ctx = Ctx::new();
-            ctx.feed(b"\x1b[");
+            let mut ctx = ctx();
+            ctx.send(b"\x1b[");
             ctx.advance(HOLD_MS);
-            ctx.feed(b"3~");
+            ctx.send(b"3~");
             assert_eq!(
                 ctx.pty, b"\x1b[3~",
                 "the child's own parser reassembles across the two writes"
@@ -3636,10 +3681,10 @@ line two\r\n\
 
         #[test]
         fn nothing_overtakes_the_hold_buffer() {
-            let mut ctx = Ctx::new();
-            ctx.feed(b"\x1b");
+            let mut ctx = ctx();
+            ctx.send(b"\x1b");
             ctx.advance(HOLD_MS);
-            ctx.feed(b"a");
+            ctx.send(b"a");
             assert_eq!(
                 ctx.pty, b"\x1ba",
                 "reordering would turn a flushed Escape and an 'a' into Alt+a"
@@ -3648,8 +3693,8 @@ line two\r\n\
 
         #[test]
         fn double_esc_holds_only_the_second() {
-            let mut ctx = Ctx::new();
-            ctx.feed(b"\x1b\x1b");
+            let mut ctx = ctx();
+            ctx.send(b"\x1b\x1b");
             assert_eq!(ctx.pty, b"\x1b", "the first Escape is resolved by the second");
             assert!(ctx.input.hold_deadline.is_some());
             ctx.advance(HOLD_MS);
@@ -3658,11 +3703,11 @@ line two\r\n\
 
         #[test]
         fn a_chunk_extending_a_sequence_restarts_the_clock() {
-            let mut ctx = Ctx::new();
-            ctx.feed(b"\x1b");
+            let mut ctx = ctx();
+            ctx.send(b"\x1b");
             assert_eq!(ctx.input.hold_deadline, Some(HOLD_MS));
             ctx.clock.now_ms += 20;
-            ctx.feed(b"[");
+            ctx.send(b"[");
             assert_eq!(
                 ctx.input.hold_deadline,
                 Some(20 + HOLD_MS),
@@ -3672,11 +3717,11 @@ line two\r\n\
 
         #[test]
         fn mouse_report_is_extracted_not_forwarded() {
-            let mut ctx = Ctx::new();
+            let mut ctx = ctx();
             // The child negotiates SGR mouse so the gate forwards rather than swallows.
             ctx.renderer.parser.process(b"\x1b[?1000h\x1b[?1006h");
             for byte in b"\x1b[<0;10;5M" {
-                ctx.feed(&[*byte]);
+                ctx.send(&[*byte]);
             }
             assert_eq!(
                 ctx.pty, b"\x1b[<0;10;5M",
@@ -3691,110 +3736,22 @@ line two\r\n\
         /// a cleverer scanner.
         #[test]
         fn split_mouse_report_flushes_as_literal_text() {
-            let mut ctx = Ctx::new();
+            let mut ctx = ctx();
             ctx.renderer.parser.process(b"\x1b[?1000h\x1b[?1006h");
-            ctx.feed(b"\x1b[<0;42");
+            ctx.send(b"\x1b[<0;42");
             ctx.advance(HOLD_MS);
             assert_eq!(ctx.pty, b"\x1b[<0;42", "the fragment leaks verbatim");
-            ctx.feed(b";5M");
+            ctx.send(b";5M");
             assert_eq!(ctx.pty, b"\x1b[<0;42;5M", "and so does its tail");
         }
     }
 
-    /// Modal resize-mode state machine. `VirtualClock`, `MockTerminal`,
-    /// `mode_renderer` and `run_with_resizer` are nested here (rather than a
-    /// top-level sibling module) so the suite can reuse `VirtualClock`/`MockTerminal`,
-    /// which are private to this `mod tests` — a sibling module cannot see them.
-    /// `RecResizer` is a local copy of the one in the (sibling) `mod resize`, which
-    /// is likewise private to that module.
+    /// Modal resize-mode state machine, driven through the shared [`Ctx`].
+    /// `run_with_resizer` is nested here (rather than a top-level sibling module) so
+    /// it can reach `VirtualClock`/`MockTerminal`, which are private to this
+    /// `mod tests` — a sibling module cannot see them.
     mod resize_mode {
         use super::*;
-        use std::cell::RefCell;
-
-        /// The default chord's byte, the one gutter withholds from the child.
-        const CHORD: &[u8] = &[0x1c];
-
-        /// A recording [`PtyResizer`], local to this module (the sibling `mod
-        /// resize`'s copy is private to it).
-        #[derive(Default)]
-        struct RecResizer {
-            calls: RefCell<Vec<(u16, u16)>>,
-        }
-        impl PtyResizer for RecResizer {
-            fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
-                self.calls.borrow_mut().push((cols, rows));
-                Ok(())
-            }
-        }
-
-        fn mode_renderer(width: u16, rows: u16, real_cols: u16, cfg: Width) -> Renderer {
-            Renderer::new(
-                width,
-                rows,
-                real_cols,
-                Layout::Center,
-                cfg,
-                Box::new(std::io::sink()),
-                0,
-            )
-        }
-
-        /// Bundles the state `apply_message` needs so tests read as a script of
-        /// `send`/`enter` calls rather than repeating seven `&mut` arguments.
-        struct Ctx {
-            clock: VirtualClock,
-            renderer: Renderer,
-            resize: ResizeCtl<u64>,
-            input: InputCtl<u64>,
-            term: MockTerminal,
-            pty: Vec<u8>,
-            resizer: RecResizer,
-        }
-
-        impl Ctx {
-            fn new(width: u16, rows: u16, real_cols: u16, cfg: Width) -> Self {
-                Self {
-                    clock: VirtualClock::new(vec![]),
-                    renderer: mode_renderer(width, rows, real_cols, cfg),
-                    resize: ResizeCtl::inactive(),
-                    input: InputCtl::new(),
-                    term: MockTerminal::new(),
-                    pty: Vec::new(),
-                    resizer: RecResizer::default(),
-                }
-            }
-
-            fn send(&mut self, bytes: &[u8]) -> Flow {
-                apply_message(
-                    Msg::Input(bytes.to_vec()),
-                    &mut self.clock,
-                    &mut self.renderer,
-                    &mut self.resize,
-                    &mut self.input,
-                    &mut self.term,
-                    &mut self.pty,
-                    &self.resizer,
-                )
-            }
-
-            /// Release whatever the ESC-hold is withholding, as the loop's
-            /// top-of-frame check does once the deadline passes.
-            fn expire_hold(&mut self) {
-                flush_hold(
-                    &mut self.input,
-                    &mut self.clock,
-                    &mut self.renderer,
-                    &mut self.resize,
-                    &mut self.term,
-                    &mut self.pty,
-                    &self.resizer,
-                );
-            }
-
-            fn enter(&mut self) {
-                self.send(CHORD);
-            }
-        }
 
         /// Drive the real loop (needed only by the idle tests, which exercise
         /// `run`'s Phase-A bounded wait and top-of-frame idle check — behaviour
@@ -3911,8 +3868,8 @@ line two\r\n\
         }
 
         /// The chord's kitty release form must not read as a second chord press and
-        /// toggle straight back out. Unreachable until the child's own
-        /// `REPORT_EVENT_TYPES` push is relayed, and pinned now so it stays that way.
+        /// toggle straight back out. Only reachable once the child has pushed kitty's
+        /// `REPORT_EVENT_TYPES`, which the relay carries out for it (ADR-021).
         #[test]
         fn chord_release_does_not_toggle() {
             let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
@@ -4099,28 +4056,14 @@ line two\r\n\
         use super::super::{
             dispatch, render_once, run, suspend_cycle, Flow, Renderer, ResizeCtl, SuspendOutcome,
         };
-        use super::{left_renderer, NoopResizer, VirtualClock};
+        use super::{left_renderer, NoopResizer, RecResizer, VirtualClock};
         use crate::msg::Msg;
-        use crate::pty::PtyResizer;
         use crate::suspend::mock::{MockSuspender, OrderLog};
         use crate::terminal::mock::{Call, MockTerminal};
         use crate::terminal::OuterTerminal;
         use portable_pty::ExitStatus;
         use std::cell::RefCell;
         use std::rc::Rc;
-
-        /// A recording resizer that captures the `(cols, rows)` the resume
-        /// resize-catch-up drives into the child PTY.
-        #[derive(Default)]
-        struct RecResizer {
-            calls: RefCell<Vec<(u16, u16)>>,
-        }
-        impl PtyResizer for RecResizer {
-            fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
-                self.calls.borrow_mut().push((cols, rows));
-                Ok(())
-            }
-        }
 
         /// The lifecycle + suspend markers that carry the ordering; render-output
         /// noise (MoveTo/WriteRow/Flush/PlaceCursor/…) is filtered out.

@@ -26,68 +26,18 @@
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use expectrl::session::OsSession;
+mod common;
+use common::{drain_window, pty_guard, spawn_gutter};
 
-fn gutter_bin() -> String {
-    env!("CARGO_BIN_EXE_gutter").to_string()
-}
+/// The outer terminal these tests run gutter in.
+const OUTER_COLS: u16 = 120;
+const OUTER_ROWS: u16 = 40;
 
-/// Run gutter inside an outer terminal of a fixed size:
-/// `sh -c 'stty cols C rows R; exec env gutter <args>'`.
-fn gutter_in_terminal(
-    outer_cols: u16,
-    outer_rows: u16,
-    gutter_args: &str,
-) -> std::process::Command {
-    let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    cmd
-}
-
-fn spawn(cmd: std::process::Command) -> OsSession {
-    OsSession::spawn(cmd).expect("spawn gutter under PTY")
-}
-
-/// Drain a bounded window with non-blocking reads, so the window is a real
-/// wall-clock cap even while the child keeps the PTY open.
-fn drain_window(session: &mut OsSession, window: Duration) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    let start = Instant::now();
-    while start.elapsed() < window {
-        match session.try_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    out
-}
-
-/// Parse outer-terminal bytes through a vt100 at the physical size.
-fn outer_grid(bytes: &[u8], cols: u16, rows: u16) -> vt100::Parser {
-    let mut p = vt100::Parser::new(rows, cols, 0);
-    p.process(bytes);
-    p
-}
-
-/// The whole grid joined to a single string, so a test can search for echoed
-/// content regardless of which row it landed on.
-fn grid_text(screen: &vt100::Screen, cols: u16, rows: u16) -> String {
-    (0..rows)
-        .map(|r| screen.rows(0, cols).nth(r as usize).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("\n")
+/// The band as the outer terminal rendered it.
+fn band_text(bytes: &[u8]) -> String {
+    common::grid_text(bytes, OUTER_COLS, OUTER_ROWS)
 }
 
 /// A `cat -v` child in raw mode: what it prints is a caret-notation transcript of
@@ -104,29 +54,28 @@ fn transcript(payload: &[u8]) -> String {
 }
 
 fn echo_transcript(child: &str, payload: &[u8]) -> String {
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(OUTER_COLS, OUTER_ROWS, &format!("--width 100 {child}"));
     std::thread::sleep(Duration::from_millis(400));
 
     session.write_all(payload).unwrap();
     session.flush().unwrap();
 
     let bytes = drain_window(&mut session, Duration::from_millis(700));
-    let parser = outer_grid(&bytes, 120, 40);
-    let text = grid_text(parser.screen(), 120, 40);
+    let text = band_text(&bytes);
     drop(session);
     text
 }
 
-/// **The keys that were silently dead.** Delete, Home, End, PageUp, PageDown,
-/// Insert, Shift+Tab and F1–F12 produced no bytes at all under the old
-/// re-encoder: pressing F5 in a TUI under gutter did literally nothing. Every one
-/// of them must now arrive at the child verbatim.
+/// **The keys that go silently dead when this breaks.** Delete, Home, End, PageUp,
+/// PageDown, Insert, Shift+Tab and F1–F12 each have to arrive at the child
+/// verbatim; a key that reaches it as nothing at all is a key that does literally
+/// nothing in a TUI, with no error anywhere to say so.
 ///
-/// Named after the bug rather than the mechanism, so a future regression says
+/// Named after the symptom rather than the mechanism, so a future regression says
 /// what it broke.
 #[test]
 fn keys_that_were_silently_dead_reach_the_child() {
+    let _g = pty_guard();
     let cases: &[(&str, &[u8])] = &[
         ("Delete", b"\x1b[3~"),
         ("Home", b"\x1b[H"),
@@ -159,12 +108,13 @@ fn keys_that_were_silently_dead_reach_the_child() {
     }
 }
 
-/// The faults the old encoder had on keys that *did* produce something: modifiers
-/// dropped on specials, the ESC prefix dropped on Alt+&lt;char&gt;, and arrows
-/// always emitted in CSI form even under DECCKM. Under passthrough gutter never
-/// chooses a form, so whatever the terminal sent is what arrives.
+/// The keys that arrive as *something*, where the risk is the wrong thing: a
+/// modifier dropped from a special, the ESC prefix dropped from Alt+&lt;char&gt;, an
+/// arrow flattened into CSI form under DECCKM. gutter chooses no form at all, so
+/// whatever the terminal sent is what arrives.
 #[test]
 fn modified_and_alt_keys_arrive_byte_identical() {
+    let _g = pty_guard();
     let cases: &[(&str, &[u8])] = &[
         ("Ctrl+Right", b"\x1b[1;5C"),
         ("Shift+Left", b"\x1b[1;2D"),
@@ -196,6 +146,7 @@ fn modified_and_alt_keys_arrive_byte_identical() {
 /// hold expires. It must still arrive, exactly once, and nothing else with it.
 #[test]
 fn a_lone_escape_reaches_the_child_after_the_hold() {
+    let _g = pty_guard();
     let text = transcript(b"\x1b");
     assert!(
         text.contains("^["),
@@ -209,6 +160,7 @@ fn a_lone_escape_reaches_the_child_after_the_hold() {
 /// are not swallowed by the mode it opened.
 #[test]
 fn the_reserved_chord_byte_never_reaches_the_child() {
+    let _g = pty_guard();
     // `Ctrl-\` (0x1C) is the default chord; `a` and `b` bracket it so the test
     // fails loudly if the surrounding bytes went missing too.
     let text = transcript(b"a\x1c\x1cb");
@@ -229,6 +181,7 @@ const PASTE_ECHO_CHILD: &str =
 /// other pasted byte.
 #[test]
 fn a_pasted_chord_byte_reaches_the_child() {
+    let _g = pty_guard();
     let text = echo_transcript(PASTE_ECHO_CHILD, b"\x1b[200~abc\x1cdef\x1b[201~");
     assert!(
         text.contains("^[[200~abc^\\def^[[201~"),
@@ -242,6 +195,7 @@ fn a_pasted_chord_byte_reaches_the_child() {
 /// verbatim rather than margin-translated, and a malformed one is not swallowed.
 #[test]
 fn a_pasted_mouse_report_is_not_extracted() {
+    let _g = pty_guard();
     let text = echo_transcript(PASTE_ECHO_CHILD, b"\x1b[200~\x1b[<0;10;5M\x1b[<99M\x1b[201~");
     assert!(
         text.contains("^[[200~^[[<0;10;5M^[[<99M^[[201~"),
@@ -252,6 +206,7 @@ fn a_pasted_mouse_report_is_not_extracted() {
 /// UTF-8 must never be split across the scanner's buffering.
 #[test]
 fn multi_byte_utf8_survives_intact() {
+    let _g = pty_guard();
     let text = echo_transcript(RAW_ECHO_CHILD, "MARK-é🎉-END".as_bytes());
     assert!(
         text.contains("MARK-é🎉-END"),
@@ -263,16 +218,15 @@ fn multi_byte_utf8_survives_intact() {
 /// stdin; the echoed text must appear in gutter's band.
 #[test]
 fn ordinary_typing_reaches_child() {
-    let cmd = gutter_in_terminal(120, 40, "--width 100 /bin/cat");
-    let mut session = spawn(cmd);
+    let _g = pty_guard();
+    let mut session = spawn_gutter(OUTER_COLS, OUTER_ROWS, "--width 100 /bin/cat");
     std::thread::sleep(Duration::from_millis(400));
 
     session.write_all(b"HELLO_KBD").unwrap();
     session.flush().unwrap();
 
     let bytes = drain_window(&mut session, Duration::from_millis(600));
-    let parser = outer_grid(&bytes, 120, 40);
-    let text = grid_text(parser.screen(), 120, 40);
+    let text = band_text(&bytes);
     assert!(
         text.contains("HELLO_KBD"),
         "ordinary typing must reach the child; grid was {text:?}"
@@ -288,9 +242,9 @@ fn ordinary_typing_reaches_child() {
 /// so the live frame is captured.
 #[test]
 fn enter_reaches_child() {
+    let _g = pty_guard();
     let child = "/bin/sh -c 'i=0; while [ $i -lt 2 ] && read x; do printf \"GOT:%s \" \"$x\"; i=$((i+1)); done; sleep 3'";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(OUTER_COLS, OUTER_ROWS, &format!("--width 100 {child}"));
     std::thread::sleep(Duration::from_millis(400));
 
     // Two lines, each terminated by Enter (\r): the read loop fires twice.
@@ -301,8 +255,7 @@ fn enter_reaches_child() {
     session.flush().unwrap();
 
     let bytes = drain_window(&mut session, Duration::from_millis(700));
-    let parser = outer_grid(&bytes, 120, 40);
-    let text = grid_text(parser.screen(), 120, 40);
+    let text = band_text(&bytes);
     assert!(
         text.contains("GOT:ALPHA") && text.contains("GOT:BETA"),
         "each Enter must complete a child read (two markers); grid was {text:?}"
@@ -320,17 +273,16 @@ fn enter_reaches_child() {
 /// marker stays on the live frame the drain window captures.
 #[test]
 fn ctrl_c_delivers_interrupt_to_child() {
+    let _g = pty_guard();
     let child = "/bin/sh -c 'trap \"printf GOTSIGINT; sleep 3\" INT; while true; do sleep 0.1; done'";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(OUTER_COLS, OUTER_ROWS, &format!("--width 100 {child}"));
     std::thread::sleep(Duration::from_millis(500));
 
     session.write_all(&[0x03]).unwrap();
     session.flush().unwrap();
 
     let bytes = drain_window(&mut session, Duration::from_millis(900));
-    let parser = outer_grid(&bytes, 120, 40);
-    let text = grid_text(parser.screen(), 120, 40);
+    let text = band_text(&bytes);
     assert!(
         text.contains("GOTSIGINT"),
         "Ctrl-C must reach the child as 0x03 and raise SIGINT; grid was {text:?}"

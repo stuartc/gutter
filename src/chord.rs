@@ -200,21 +200,21 @@ fn number(bytes: &[u8]) -> Option<u32> {
 /// differ on which they send, so both are accepted. The gaps at 16 and 22 are
 /// real — getting them wrong is the classic F-key bug, so the numbers are
 /// written out rather than computed.
-fn f_key_forms(n: u8) -> Vec<&'static [u8]> {
+fn f_key_forms(n: u8) -> &'static [&'static [u8]] {
     match n {
-        1 => vec![b"\x1bOP", b"\x1b[11~"],
-        2 => vec![b"\x1bOQ", b"\x1b[12~"],
-        3 => vec![b"\x1bOR", b"\x1b[13~"],
-        4 => vec![b"\x1bOS", b"\x1b[14~"],
-        5 => vec![b"\x1b[15~"],
-        6 => vec![b"\x1b[17~"],
-        7 => vec![b"\x1b[18~"],
-        8 => vec![b"\x1b[19~"],
-        9 => vec![b"\x1b[20~"],
-        10 => vec![b"\x1b[21~"],
-        11 => vec![b"\x1b[23~"],
-        12 => vec![b"\x1b[24~"],
-        _ => Vec::new(),
+        1 => &[b"\x1bOP", b"\x1b[11~"],
+        2 => &[b"\x1bOQ", b"\x1b[12~"],
+        3 => &[b"\x1bOR", b"\x1b[13~"],
+        4 => &[b"\x1bOS", b"\x1b[14~"],
+        5 => &[b"\x1b[15~"],
+        6 => &[b"\x1b[17~"],
+        7 => &[b"\x1b[18~"],
+        8 => &[b"\x1b[19~"],
+        9 => &[b"\x1b[20~"],
+        10 => &[b"\x1b[21~"],
+        11 => &[b"\x1b[23~"],
+        12 => &[b"\x1b[24~"],
+        _ => &[],
     }
 }
 

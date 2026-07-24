@@ -16,75 +16,15 @@
 //! Headless: a real PTY, no display, `TERM=xterm-256color`.
 
 use std::io::Write;
-use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use expectrl::session::OsSession;
-
-/// Serialize every PTY test in this binary — run in parallel they flake under
-/// PTY/process contention (issue #1). Mirrors `tests/pty.rs`'s guard.
-fn pty_guard() -> MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Spawn gutter under a real 80x24 PTY wrapping `gutter_args` (a single string so
-/// the inner `sh` parses any nested quoting).
-fn spawn_gutter(gutter_args: &str) -> OsSession {
-    let script = format!(
-        "stty cols 80 rows 24; exec env GUTTER_FORCE_ANCHOR_ROW=0 TERM=xterm-256color {} {gutter_args}",
-        env!("CARGO_BIN_EXE_gutter")
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    OsSession::spawn(cmd).expect("spawn gutter under PTY")
-}
-
-/// Drain a bounded wall-clock window with non-blocking reads, returning every byte
-/// the outer terminal saw. Stops early on EOF.
-fn drain_window(session: &mut OsSession, window: Duration) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    let start = Instant::now();
-    while start.elapsed() < window {
-        match session.try_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
+mod common;
+use common::{drain_window, find, outer_bytes_for, pty_guard, spawn_gutter};
 
 /// The band as the outer terminal rendered it, for the cases that assert on what a
 /// child printed rather than on raw escape bytes.
 fn band_text(bytes: &[u8]) -> String {
-    let mut parser = vt100::Parser::new(24, 80, 0);
-    parser.process(bytes);
-    parser
-        .screen()
-        .rows(0, 80)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Run a child that emits `emit` and lingers, and return everything the outer
-/// terminal saw.
-fn outer_bytes_for(emit: &str) -> Vec<u8> {
-    let mut session = spawn_gutter(&format!(
-        "--width 40 sh -c 'printf \"{emit}\"; sleep 0.5'"
-    ));
-    let out = drain_window(&mut session, Duration::from_secs(2));
-    drop(session);
-    out
+    common::grid_text(bytes, 80, 24)
 }
 
 /// **A kitty push reaches the real terminal.** The child asks its terminal to start
@@ -126,7 +66,7 @@ fn modify_other_keys_reaches_the_outer_terminal() {
 fn the_kitty_query_is_forwarded_canonically_and_unanswered() {
     let _g = pty_guard();
     let child = "bash -c 'printf \"\\033[?u\"; if IFS= read -rs -d u -t 1 _; then printf REPLY; else printf NOREPLY; fi; sleep 0.4'";
-    let mut session = spawn_gutter(&format!("--width 40 {child}"));
+    let mut session = spawn_gutter(80, 24, &format!("--width 40 {child}"));
 
     let out = drain_window(&mut session, Duration::from_secs(3));
 
@@ -155,7 +95,7 @@ fn the_kitty_query_is_forwarded_canonically_and_unanswered() {
 #[test]
 fn a_terminal_reply_transits_back_to_the_child() {
     let _g = pty_guard();
-    let mut session = spawn_gutter("--width 40 sh -c 'stty raw -echo; exec cat -v'");
+    let mut session = spawn_gutter(80, 24, "--width 40 sh -c 'stty raw -echo; exec cat -v'");
     std::thread::sleep(Duration::from_millis(400));
 
     // What a terminal that speaks the protocol answers `CSI ? u` with.

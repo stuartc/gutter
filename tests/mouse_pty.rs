@@ -157,8 +157,8 @@ fn gutter_click_delivers_nothing() {
 /// **A Shift-click keeps its modifier bit.** The SGR button byte carries the
 /// modifiers in bits 2–4, and gutter forwards the byte verbatim rather than
 /// rebuilding it from a decoded button — so a Shift-click (button `0 | 4`) must
-/// reach the child as button 4, not as a plain click. The old decode/re-encode
-/// path dropped this.
+/// reach the child as button 4, not as a plain click. Rebuilding the byte from a
+/// decoded button is what loses it.
 #[test]
 fn shift_click_keeps_the_modifier_bit() {
     let child = sgr_mouse_child();
