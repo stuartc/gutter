@@ -90,8 +90,7 @@ impl Chord {
     }
 
     /// The classic byte form, when the modifier set has one. A Shift chord has
-    /// none: the legacy tables cannot express it, which is the whole reason this
-    /// effort exists.
+    /// none: the legacy tables cannot express it.
     fn legacy_bytes(&self) -> Option<Vec<u8>> {
         if self.mods & SHIFT != 0 {
             return None;

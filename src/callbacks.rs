@@ -154,7 +154,7 @@ impl vt100::Callbacks for GutterCallbacks {
     /// relay outward, and DA1/DSR device queries to answer inward. Each routes to
     /// its own field; the clipboard is untouched here.
     ///
-    /// gutter still implements no keyboard protocol (ADR-020) — the relay matches a
+    /// gutter implements no keyboard protocol (ADR-020) — the relay matches a
     /// closed list of shapes and forwards canonical bytes for them, so the child and
     /// the real terminal negotiate with each other (ADR-021). The child's `CSI ? u`
     /// is passed out as a question rather than answered here; a terminal that does
@@ -344,8 +344,8 @@ mod tests {
         assert_eq!(parser.callbacks_mut().drain_relay(), b"\x1b[>4;2m");
     }
 
-    /// Device queries are unaffected: gutter still answers DA1 itself and relays
-    /// nothing for it.
+    /// Device queries are not the relay's business: gutter answers DA1 itself and
+    /// relays nothing for it.
     #[test]
     fn device_queries_are_answered_not_relayed() {
         let mut parser = live_parser();

@@ -40,9 +40,10 @@ fn kitty_push_reaches_the_outer_terminal() {
     );
 }
 
-/// **modifyOtherKeys reaches the real terminal.** This is the sequence gutter
-/// dropped on the floor entirely, and the direct cause of the reported Shift+Enter
-/// bug: iTerm2 was never told, so it carried on sending a plain `\r`.
+/// **modifyOtherKeys reaches the real terminal.** The request that makes a terminal
+/// report Shift+Enter as something other than a plain `\r`. A terminal that is never
+/// told carries on sending the plain `\r`, and the child cannot tell the two Enters
+/// apart.
 #[test]
 fn modify_other_keys_reaches_the_outer_terminal() {
     let _g = pty_guard();
@@ -89,9 +90,9 @@ fn the_kitty_query_is_forwarded_canonically_and_unanswered() {
 
 /// **A terminal's answer transits back to the child.** The test writes the reply a
 /// kitty-capable terminal would send into gutter's input fd; the child echoes what
-/// reaches it in caret notation. This closes the loop the whole slice rests on, and
-/// it needs no relay code at all — the reply is just bytes on the input fd, and the
-/// raw passthrough (ADR-020) carries them.
+/// reaches it in caret notation. This is the inward half of the proxy, and it needs
+/// no relay code at all — the reply is just bytes on the input fd, and the raw
+/// passthrough (ADR-020) carries them.
 #[test]
 fn a_terminal_reply_transits_back_to_the_child() {
     let _g = pty_guard();

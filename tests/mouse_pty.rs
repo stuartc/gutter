@@ -13,7 +13,7 @@
 //! tty echo does that for free).
 //!
 //! The outer test writes a real SGR 1006 mouse sequence into the session — the
-//! very bytes gutter's scanner now parses — gutter subtracts the live
+//! very bytes gutter's scanner extracts — gutter subtracts the live
 //! `left_margin` and re-encodes, and the child's echoed bytes are the oracle.
 //! Eager capture (ADR-005) means the FIRST click after the child's negotiation is
 //! the one asserted — no dropped-first-click warm-up.

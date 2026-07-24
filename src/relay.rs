@@ -4,7 +4,7 @@
 //! gutter implements no keyboard protocol. It recognises a short, closed list of
 //! sequences whose only effect is on how the terminal *encodes* the keys it sends,
 //! passes them straight out, and keeps just enough to put the terminal back the way
-//! it found it. Every other unhandled CSI is dropped, as it always was.
+//! it found it. Every other unhandled CSI is dropped.
 //!
 //! Two rules here are load-bearing.
 //!
