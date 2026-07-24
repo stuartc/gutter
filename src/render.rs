@@ -242,8 +242,8 @@ where
         Msg::Pty(bytes) => {
             renderer.parser.process(&bytes);
             // Answer the child's device queries: parser.process surfaced any
-            // CSI c / CSI 5 n / CSI 6 n / CSI ? u through unhandled_csi, which
-            // buffered a spec-correct reply; drain it to the PTY master.
+            // CSI c / CSI 5 n / CSI 6 n through unhandled_csi, which buffered a
+            // spec-correct reply; drain it to the PTY master.
             let replies = renderer.parser.callbacks_mut().drain_replies();
             if !replies.is_empty() {
                 let _ = pty_writer.write_all(&replies);

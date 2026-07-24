@@ -238,6 +238,24 @@ mod tests {
         assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[1;1R");
     }
 
+    /// The kitty keyboard query (`CSI ? u`) is answered with silence — the
+    /// protocol's designed "I do not implement this" (ADR-020). gutter forwards
+    /// raw bytes and pushes nothing on the outer terminal, so any reply here
+    /// would claim a capability it does not have.
+    #[test]
+    fn kitty_query_gets_no_reply() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new());
+
+        parser.process(b"\x1b[?u");
+        assert!(parser.callbacks_mut().drain_replies().is_empty());
+
+        // The same after a push — the level stack is gone, so there is still
+        // nothing to report.
+        parser.process(b"\x1b[>1u\x1b[?u");
+        assert!(parser.callbacks_mut().drain_replies().is_empty());
+    }
+
     /// A test double for the OSC-52 hook: `copy_to_clipboard` records each
     /// `(ty, data)` into a `Vec` instead of writing a tty. Lets the dispatch tests
     /// drive `parser.process()` directly and assert what fired, with no PTY, no
