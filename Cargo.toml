@@ -19,7 +19,10 @@ pre-release-hook = ["bash", "-c", "git cliff -o CHANGELOG.md --tag v${NEW_VERSIO
 [dependencies]
 portable-pty = "0.9.0"
 vt100 = "0.16.2"
-crossterm = "0.29.0"
+# Raw mode, terminal size and the cursor/clear/alt-screen escapes only. The
+# `events` feature (and the mio / parking_lot / signal-hook 0.3 tree behind it)
+# is off: gutter reads the input fd itself (ADR-020).
+crossterm = { version = "0.29.0", default-features = false }
 signal-hook = "0.4.4"
 # Raw waitpid(WUNTRACED|WCONTINUED) and kill(2) for the suspend/resume cycle
 # (ADR-0018/0019). Already in the tree transitively via crossterm/portable-pty.
