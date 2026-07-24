@@ -2732,6 +2732,29 @@ mod tests {
         assert_eq!(pty, b"\x1b[?1;2c", "CSI c → DA1 reply");
     }
 
+    /// The relay through the same dispatch arm (ADR-021): the child's mode request
+    /// goes **outward** to the terminal, and nothing goes back to the child. The two
+    /// directions share the arm, so a wiring mistake would cross them — a mode
+    /// request echoed onto the PTY would arrive at the child as keystrokes.
+    #[test]
+    fn dispatch_relays_mode_requests_outward_and_answers_nothing() {
+        let script = vec![
+            (0u64, Msg::Pty(b"\x1b[>1u".to_vec())),
+            (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ];
+        let (_flushes, term, pty, ..) = run_with(script, 40, 24);
+
+        assert!(
+            term.calls.contains(&Call::Relay(b"\x1b[>1u".to_vec())),
+            "the child's kitty push reaches the outer terminal; calls were {:?}",
+            term.calls
+        );
+        assert!(
+            pty.is_empty(),
+            "a mode request is a question for the terminal, not the child: {pty:?}"
+        );
+    }
+
     // --- Mouse forwarding through the render-loop dispatch arm (ADR-005) ---
     //
     // These exercise the full Thread-2 wiring: a `Msg::Pty` carrying the child's DECSET

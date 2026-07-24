@@ -213,6 +213,32 @@ fn child_sigkilled_across_suspend_exits_137() {
     );
 }
 
+/// **Relayed keyboard modes are undone at park and replayed at resume (ADR-021).**
+/// The child pushes a kitty level before stopping. The shell that would inherit the
+/// terminal while gutter is suspended must get it back with that level popped, and
+/// the child must find it pushed again once it resumes — otherwise Shift+Enter works
+/// before a Ctrl-Z and not after.
+#[test]
+fn relayed_modes_are_reset_at_park_and_replayed_at_resume() {
+    let _g = pty_guard();
+    let mut s = spawn_gutter(
+        "--width 40 sh -c 'printf \"\\033[>1u\"; printf START; sleep 0.3; kill -STOP $$; printf RESUMED; sleep 0.2'",
+    );
+
+    let out = drain_window(&mut s, Duration::from_secs(5));
+
+    let push = find(&out, b"\x1b[>1u").expect("the child's push must be relayed");
+    let after_push = &out[push + 5..];
+    let reset = find(after_push, b"\x1b[<1u").expect("park must pop the child's level");
+    let after_reset = &after_push[reset + 5..];
+    assert!(
+        find(after_reset, b"\x1b[>1u").is_some(),
+        "resume must replay the level the child asked for"
+    );
+
+    let _ = wait_exit(&s, Duration::from_secs(5));
+}
+
 /// **Input liveness after resume.** After the park/resume cycle, a keystroke
 /// typed into gutter must still reach the child — proving the input path (Thread
 /// 3's read pump and the render thread's scanner) is live post-resume. The child stops,

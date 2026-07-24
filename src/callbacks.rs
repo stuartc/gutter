@@ -283,22 +283,100 @@ mod tests {
         assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[1;1R");
     }
 
-    /// The kitty keyboard query (`CSI ? u`) is answered with silence — the
-    /// protocol's designed "I do not implement this" (ADR-020). gutter forwards
-    /// raw bytes and pushes nothing on the outer terminal, so any reply here
-    /// would claim a capability it does not have.
+    /// A parser with the live callbacks — the only ones that relay.
+    fn live_parser() -> vt100::Parser<GutterCallbacks> {
+        vt100::Parser::new_with_callbacks(
+            24,
+            80,
+            0,
+            GutterCallbacks::live(Box::new(io::sink())),
+        )
+    }
+
+    /// The kitty keyboard query (`CSI ? u`) is relayed to the real terminal and
+    /// never answered here. gutter has no capability to report — any answer it
+    /// invented would be a claim about a terminal it had not asked — so the question
+    /// goes out and whatever comes back (including nothing, the protocol's "no")
+    /// reaches the child through the raw input passthrough.
+    ///
+    /// The relayed bytes are the spec's paramless `CSI ? u`. vte delivers the
+    /// child's query as `params == [[0]]`, so an emitter that re-serialised its
+    /// parameters would send `CSI ? 0 u`, whose meaning is undefined.
     #[test]
-    fn kitty_query_gets_no_reply() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::baseline());
+    fn kitty_query_is_relayed_and_never_answered() {
+        let mut parser = live_parser();
 
         parser.process(b"\x1b[?u");
-        assert!(parser.callbacks_mut().drain_replies().is_empty());
+        assert_eq!(parser.callbacks_mut().drain_relay(), b"\x1b[?u");
+        assert!(
+            parser.callbacks_mut().drain_replies().is_empty(),
+            "gutter answers the capability query itself under no circumstances"
+        );
+    }
 
-        // The same after a push — the level stack is gone, so there is still
-        // nothing to report.
-        parser.process(b"\x1b[>1u\x1b[?u");
-        assert!(parser.callbacks_mut().drain_replies().is_empty());
+    /// A paramless pop is one level, never zero. vte cannot tell `CSI < u` from
+    /// `CSI < 0 u`, and a relayed `CSI < 0 u` would pop nothing — leaving the
+    /// terminal in the mode the child had just left, with gutter's log saying
+    /// otherwise.
+    #[test]
+    fn paramless_pop_relays_exactly_one_level() {
+        let mut parser = live_parser();
+
+        parser.process(b"\x1b[>1u\x1b[<u");
+        assert_eq!(parser.callbacks_mut().drain_relay(), b"\x1b[>1u\x1b[<1u");
+        assert!(
+            parser
+                .callbacks()
+                .key_modes()
+                .expect("the live parser relays")
+                .reset_bytes()
+                .is_empty(),
+            "the child popped what it pushed, so teardown owes nothing"
+        );
+    }
+
+    /// xterm's modifyOtherKeys — the sequence gutter used to drop on the floor, and
+    /// the reason Shift+Enter reached the child as a plain `\r`.
+    #[test]
+    fn modify_other_keys_is_relayed_verbatim() {
+        let mut parser = live_parser();
+        parser.process(b"\x1b[>4;2m");
+        assert_eq!(parser.callbacks_mut().drain_relay(), b"\x1b[>4;2m");
+    }
+
+    /// Device queries are unaffected: gutter still answers DA1 itself and relays
+    /// nothing for it.
+    #[test]
+    fn device_queries_are_answered_not_relayed() {
+        let mut parser = live_parser();
+        parser.process(b"\x1b[c");
+        assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[?1;2c");
+        assert!(parser.callbacks_mut().drain_relay().is_empty());
+    }
+
+    /// The near misses, through the real parser. `CSI u` is the ANSI restore-cursor
+    /// and genuinely arrives here; relaying it would move the outer terminal's cursor
+    /// mid-frame and corrupt the band. The others are a secondary DA, an ordinary
+    /// SGR, and a DECSET gutter has no model of.
+    #[test]
+    fn sequences_off_the_allowlist_are_not_relayed() {
+        let mut parser = live_parser();
+        parser.process(b"\x1b[u\x1b[>0c\x1b[4m\x1b[?1004h");
+        assert!(
+            parser.callbacks_mut().drain_relay().is_empty(),
+            "only the allowlisted shapes reach the outer terminal"
+        );
+    }
+
+    /// The diff-baseline parsers are rebuilt from the live grid every frame, so a
+    /// relay on one would re-send the child's whole negotiation each repaint.
+    #[test]
+    fn a_baseline_parser_relays_nothing() {
+        let mut parser =
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::baseline());
+        parser.process(b"\x1b[>1u\x1b[?u\x1b[>4;2m");
+        assert!(parser.callbacks_mut().drain_relay().is_empty());
+        assert!(parser.callbacks().key_modes().is_none());
     }
 
     /// A test double for the OSC-52 hook: `copy_to_clipboard` records each
