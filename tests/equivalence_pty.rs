@@ -46,7 +46,7 @@ fn wide_edge_path() -> String {
 
 /// Run gutter inside an outer terminal of the given size, wrapping a shell child
 /// that emits the fixture bytes (via `cat`) then idles so the live frame is
-/// captured. `GUTTER_FORCE_KITTY=0` skips the kitty probe stall.
+/// captured.
 fn gutter_replaying_fixture(
     outer_cols: u16,
     outer_rows: u16,
@@ -57,7 +57,7 @@ fn gutter_replaying_fixture(
     // stays painted for the capture window.
     let child = format!("/bin/sh -c 'cat {fixture}; sleep 4'");
     let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_flags} {child}",
+        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_flags} {child}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -77,7 +77,7 @@ fn gutter_replaying_then_exit(
 ) -> OsSession {
     let child = format!("/bin/sh -c 'cat {fixture}; exit 0'");
     let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_flags} {child}",
+        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_flags} {child}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -147,7 +147,7 @@ fn reverse_video_statusline_highlight_stops_at_band_edge() {
     let child =
         "/bin/sh -c 'printf \"\\033[?1049h\\033[?25l\\033[1;1H\\033[7m\\033[K\"; sleep 4'";
     let script = format!(
-        "stty cols 80 rows 24; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} --width 60 --center {child}",
+        "stty cols 80 rows 24; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} --width 60 --center {child}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -346,7 +346,7 @@ fn child_exit_mid_alt_screen_restores_and_propagates_code() {
     // failure mode the ADR-010 restore must prevent.
     let child = "/bin/sh -c 'printf \"\\033[?1049h\\033[?25l\\033[1;1Hclaude\"; exit 7'";
     let script = format!(
-        "stty cols 100 rows 30; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} --width 70 --center {child}",
+        "stty cols 100 rows 30; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} --width 70 --center {child}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -384,7 +384,7 @@ fn child_sees_band_width_while_replaying_fixture() {
         fixture_path()
     );
     let script = format!(
-        "stty cols 120 rows 30; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} --width 80 --left {child}",
+        "stty cols 120 rows 30; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} --width 80 --left {child}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -414,7 +414,7 @@ fn inline_anchor_does_not_overpaint_history_above() {
     let child = "/bin/sh -c 'printf \"BAND-A\\nBAND-B\\nBAND-C\"; sleep 4'";
     let seed = "i=1; while [ $i -le 10 ]; do printf 'HIST-%02d\\n' \"$i\"; i=$((i+1)); done;";
     let script = format!(
-        "stty cols 80 rows 24; {seed} exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=10 {} --width 60 --left {child}",
+        "stty cols 80 rows 24; {seed} exec env GUTTER_FORCE_ANCHOR_ROW=10 {} --width 60 --left {child}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -463,7 +463,7 @@ fn inline_clean_hand_back_below_band() {
     for (exit_code, expect_status) in [(0i32, false), (5i32, true)] {
         let child = format!("/bin/sh -c \"printf 'HB-1\\nHB-2\\nHB-3'; exit {exit_code}\"");
         let script = format!(
-            "stty cols 80 rows 24; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=3 {} --width 60 --left {child}",
+            "stty cols 80 rows 24; exec env GUTTER_FORCE_ANCHOR_ROW=3 {} --width 60 --left {child}",
             gutter_bin()
         );
         let mut cmd = std::process::Command::new("/bin/sh");
@@ -522,7 +522,7 @@ fn inline_mid_screen_scroll_through_preserves_history() {
     let child = "/bin/sh -c 'i=0; while [ $i -lt 40 ]; do printf \"FLOW-%02d\\n\" \"$i\"; i=$((i+1)); done; sleep 1'";
     let seed = "i=1; while [ $i -le 12 ]; do printf 'OLD-%02d\\n' \"$i\"; i=$((i+1)); done;";
     let script = format!(
-        "stty cols 80 rows 24; {seed} exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=12 {} --width 60 --left {child}",
+        "stty cols 80 rows 24; {seed} exec env GUTTER_FORCE_ANCHOR_ROW=12 {} --width 60 --left {child}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
@@ -570,7 +570,7 @@ fn inline_mid_screen_scroll_through_preserves_history() {
 fn inline_alt_excursion_preserves_anchor() {
     let child = "/bin/sh -c \"printf 'PRE-1\\nPRE-2\\n'; sleep 0.3; printf '\\033[?1049h\\033[1;1HALT-FRAME'; sleep 0.3; printf '\\033[?1049l'; sleep 0.1; printf 'POST-1\\nPOST-2'; exit 0\"";
     let script = format!(
-        "stty cols 80 rows 24; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=5 {} --width 60 --left {child}",
+        "stty cols 80 rows 24; exec env GUTTER_FORCE_ANCHOR_ROW=5 {} --width 60 --left {child}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");

@@ -21,18 +21,6 @@ pub trait OuterTerminal {
     // --- Setup ---
     /// Enter raw mode. The first setup step once the PTY is up.
     fn enable_raw_mode(&mut self) -> io::Result<()>;
-    /// Probe whether the outer terminal supports the kitty keyboard protocol —
-    /// the inbound grant `vt100` cannot observe (ADR-003). The returned bool
-    /// clamps the child's kitty state and the encoder. Called once at startup,
-    /// after raw mode.
-    fn supports_keyboard_enhancement(&mut self) -> io::Result<bool>;
-    /// Push the kitty enhancement flags onto the outer terminal so crossterm
-    /// thereafter delivers `KeyEvent`s that distinguish Shift+Enter from Enter
-    /// (ADR-003). Called at startup only when the probe returned `true`; paired
-    /// with [`pop_keyboard_flags`] in teardown.
-    ///
-    /// [`pop_keyboard_flags`]: OuterTerminal::pop_keyboard_flags
-    fn push_keyboard_flags(&mut self) -> io::Result<()>;
     /// Enable mouse capture eagerly (ADR-005), emitting the fixed any-motion SGR
     /// bundle. Called once at startup; never re-issued to track the child's mode
     /// (the forwarding gate narrows in software). Paired with [`disable_mouse`].
@@ -109,9 +97,6 @@ pub trait OuterTerminal {
     /// being in it (ADR-012): a plain command never entered, so teardown skips the
     /// leave. Also called mid-run on the child's alt→primary edge.
     fn leave_alt_screen(&mut self) -> io::Result<()>;
-    /// Pop the kitty keyboard enhancement flags (teardown), only if they were
-    /// pushed.
-    fn pop_keyboard_flags(&mut self) -> io::Result<()>;
     /// Disable mouse capture (teardown). Pairs with [`enable_mouse`]. Runs via the
     /// explicit restore, not a `Drop` guard — `process::exit` skips destructors,
     /// which would leave the shell emitting mouse escapes after gutter dies.
@@ -139,9 +124,6 @@ const MOUSE_DISABLE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 /// The real outer terminal, backed by crossterm against stdout.
 pub struct CrosstermTerminal {
     out: io::Stdout,
-    /// Whether kitty flags were pushed at startup, so teardown pops only what it
-    /// set (ADR-003).
-    kitty_pushed: bool,
     /// Whether mouse capture was enabled at startup, so teardown disables only
     /// what it set.
     mouse_enabled: bool,
@@ -151,7 +133,6 @@ impl CrosstermTerminal {
     pub fn new() -> Self {
         Self {
             out: io::stdout(),
-            kitty_pushed: false,
             mouse_enabled: false,
         }
     }
@@ -166,25 +147,6 @@ impl Default for CrosstermTerminal {
 impl OuterTerminal for CrosstermTerminal {
     fn enable_raw_mode(&mut self) -> io::Result<()> {
         crossterm::terminal::enable_raw_mode()
-    }
-
-    fn supports_keyboard_enhancement(&mut self) -> io::Result<bool> {
-        crossterm::terminal::supports_keyboard_enhancement()
-    }
-
-    fn push_keyboard_flags(&mut self) -> io::Result<()> {
-        use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-        use crossterm::queue;
-        queue!(
-            self.out,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-            )
-        )?;
-        self.out.flush()?;
-        self.kitty_pushed = true;
-        Ok(())
     }
 
     fn enable_mouse(&mut self) -> io::Result<()> {
@@ -316,19 +278,6 @@ impl OuterTerminal for CrosstermTerminal {
         self.out.flush()
     }
 
-    fn pop_keyboard_flags(&mut self) -> io::Result<()> {
-        // Pop only what was pushed (ADR-003); popping flags we never set would
-        // corrupt unrelated terminal state.
-        if self.kitty_pushed {
-            use crossterm::event::PopKeyboardEnhancementFlags;
-            use crossterm::queue;
-            queue!(self.out, PopKeyboardEnhancementFlags)?;
-            self.out.flush()?;
-            self.kitty_pushed = false;
-        }
-        Ok(())
-    }
-
     fn disable_mouse(&mut self) -> io::Result<()> {
         // Disable only what was enabled. Emitting `DisableMouseCapture` when we
         // never captured would be harmless, but mirroring the push/pop rule keeps
@@ -366,8 +315,6 @@ pub mod mock {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Call {
         EnableRawMode,
-        SupportsKeyboardEnhancement,
-        PushKeyboardFlags,
         EnableMouse,
         EnterAltScreen,
         MoveTo(u16, u16),
@@ -388,7 +335,6 @@ pub mod mock {
         SetCursorShape(Vec<u8>),
         Flush,
         LeaveAltScreen,
-        PopKeyboardFlags,
         DisableMouse,
         ShowCursor,
         DisableRawMode,
@@ -404,12 +350,6 @@ pub mod mock {
     #[derive(Default)]
     pub struct MockTerminal {
         pub calls: Vec<Call>,
-        /// What the kitty-capability probe reports. Lets the teardown test drive
-        /// both the push-then-pop and neither paths without a real terminal.
-        pub supports_kitty: bool,
-        /// Tracks whether [`OuterTerminal::push_keyboard_flags`] was called, so
-        /// the mock pops only when flags were pushed — mirroring the real rule.
-        kitty_pushed: bool,
         /// Tracks whether [`OuterTerminal::enable_mouse`] was called, so the mock
         /// disables only when capture was enabled — mirroring the real rule.
         mouse_enabled: bool,
@@ -434,14 +374,6 @@ pub mod mock {
         pub fn with_log(log: std::rc::Rc<std::cell::RefCell<Vec<Call>>>) -> Self {
             Self {
                 log: Some(log),
-                ..Self::default()
-            }
-        }
-
-        /// A mock that reports the outer terminal as kitty-capable.
-        pub fn kitty_capable() -> Self {
-            Self {
-                supports_kitty: true,
                 ..Self::default()
             }
         }
@@ -475,7 +407,6 @@ pub mod mock {
                     matches!(
                         c,
                         Call::LeaveAltScreen
-                            | Call::PopKeyboardFlags
                             | Call::DisableMouse
                             | Call::ShowCursor
                             | Call::DisableRawMode
@@ -591,12 +522,6 @@ pub mod mock {
         fn enable_raw_mode(&mut self) -> io::Result<()> {
             Ok(())
         }
-        fn supports_keyboard_enhancement(&mut self) -> io::Result<bool> {
-            Ok(false)
-        }
-        fn push_keyboard_flags(&mut self) -> io::Result<()> {
-            Ok(())
-        }
         fn enable_mouse(&mut self) -> io::Result<()> {
             Ok(())
         }
@@ -703,9 +628,6 @@ pub mod mock {
         fn leave_alt_screen(&mut self) -> io::Result<()> {
             Ok(())
         }
-        fn pop_keyboard_flags(&mut self) -> io::Result<()> {
-            Ok(())
-        }
         fn disable_mouse(&mut self) -> io::Result<()> {
             Ok(())
         }
@@ -720,15 +642,6 @@ pub mod mock {
     impl OuterTerminal for MockTerminal {
         fn enable_raw_mode(&mut self) -> io::Result<()> {
             self.record(Call::EnableRawMode);
-            Ok(())
-        }
-        fn supports_keyboard_enhancement(&mut self) -> io::Result<bool> {
-            self.record(Call::SupportsKeyboardEnhancement);
-            Ok(self.supports_kitty)
-        }
-        fn push_keyboard_flags(&mut self) -> io::Result<()> {
-            self.record(Call::PushKeyboardFlags);
-            self.kitty_pushed = true;
             Ok(())
         }
         fn enable_mouse(&mut self) -> io::Result<()> {
@@ -792,14 +705,6 @@ pub mod mock {
         }
         fn leave_alt_screen(&mut self) -> io::Result<()> {
             self.record(Call::LeaveAltScreen);
-            Ok(())
-        }
-        fn pop_keyboard_flags(&mut self) -> io::Result<()> {
-            // Mirror the real impl: only pop what was actually pushed.
-            if self.kitty_pushed {
-                self.record(Call::PopKeyboardFlags);
-                self.kitty_pushed = false;
-            }
             Ok(())
         }
         fn disable_mouse(&mut self) -> io::Result<()> {

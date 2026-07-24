@@ -40,7 +40,6 @@ fn gutter_cmd(child_argv: &[&str]) -> Command {
     cmd.env("TERM", "xterm-256color");
     // A dumb test PTY can't answer the kitty probe; inject the known result to
     // skip the ~2s stall (slice 04's injectable-capability seam).
-    cmd.env("GUTTER_FORCE_KITTY", "0");
     cmd.env("GUTTER_FORCE_ANCHOR_ROW", "0");
     cmd
 }

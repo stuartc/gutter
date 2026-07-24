@@ -2,18 +2,16 @@
 //! place gutter hooks the parser.
 //!
 //! Independent concerns live here and must not reach into each other:
-//! `unhandled_csi` touches only `kitty_state`/`cursor_shape`/`replies`,
-//! `copy_to_clipboard` only `clipboard_out`. Callbacks fire inside
-//! `parser.process()` on the render thread, the only thread that touches the
-//! parser, so `kitty_state.current()` is read lock-free at encode time and the
-//! OSC-52 write runs inline on that thread. See ADR-003, ADR-004, ADR-009.
+//! `unhandled_csi` touches only `cursor_shape`/`replies`, `copy_to_clipboard`
+//! only `clipboard_out`. Callbacks fire inside `parser.process()` on the render
+//! thread, the only thread that touches the parser, so the OSC-52 write runs
+//! inline on that thread. See ADR-004, ADR-009.
 
 use std::fmt;
 use std::io::{self, Write};
 
 use crate::clipboard::forward_osc52;
 use crate::cursor::{is_decscusr, CursorShape};
-use crate::keyboard::{is_kitty_csi, KittyLevel, KittyState};
 
 /// The fixed DA1 identity gutter answers `CSI c` with (VT100 with Advanced Video
 /// Option). The exact identity doesn't matter — a child gating on the DA1
@@ -22,13 +20,9 @@ const DA1_REPLY: &[u8] = b"\x1b[?1;2c";
 
 /// The single callbacks struct the parser owns.
 ///
-/// Carries independent concerns — the kitty [`KittyState`], the cursor shape, the
-/// clipboard sink, and buffered device-query replies — side by side; no method
-/// reads another's field.
+/// Carries independent concerns — the cursor shape, the clipboard sink, and
+/// buffered device-query replies — side by side; no method reads another's field.
 pub struct GutterCallbacks {
-    /// The child's negotiated kitty keyboard level — driven by the
-    /// `unhandled_csi` watcher below, read by the encoder at keystroke time.
-    pub kitty_state: KittyState,
     /// The child's requested cursor shape (DECSCUSR / `CSI Ps SP q`) — driven by
     /// the same `unhandled_csi` watcher (vt100 surfaces DECSCUSR as an unhandled
     /// CSI), read by the render loop to mirror the shape on the outer terminal.
@@ -40,32 +34,27 @@ pub struct GutterCallbacks {
     /// callback is testable without a real tty. See ADR-004.
     clipboard_out: Box<dyn Write + Send>,
     /// Replies buffered for the child's device queries. gutter is the child's
-    /// emulator, so it answers `CSI c` / `CSI 5 n` / `CSI 6 n` / `CSI ? u` itself
-    /// rather than proxying them. `unhandled_csi` only *buffers* here — the render
+    /// emulator, so it answers `CSI c` / `CSI 5 n` / `CSI 6 n` itself rather than
+    /// proxying them. `unhandled_csi` only *buffers* here — the render
     /// loop drains this to the PTY master (the one writer it owns) right after
     /// `parser.process()`, so no reply leaves callbacks.
     replies: Vec<u8>,
 }
 
 impl GutterCallbacks {
-    /// Builds the callbacks with the outer terminal's kitty capability (the
-    /// startup `supports_keyboard_enhancement()` probe) and a discarding clipboard
-    /// sink. When `outer_supports` is `false`, the child's kitty enable is clamped
-    /// to a no-op.
-    ///
-    /// The `io::sink()` default is what the diff-baseline parsers use: they replay
-    /// formatted content and never carry the live clipboard fd. The live parser
-    /// injects a real sink via [`Self::with_clipboard`].
-    pub fn new(outer_supports: bool) -> Self {
-        Self::with_clipboard(outer_supports, Box::new(io::sink()))
+    /// Builds the callbacks with a discarding clipboard sink — what the
+    /// diff-baseline parsers use: they replay formatted content and never carry
+    /// the live clipboard fd. The live parser injects a real sink via
+    /// [`Self::with_clipboard`].
+    pub fn new() -> Self {
+        Self::with_clipboard(Box::new(io::sink()))
     }
 
     /// Builds the callbacks with a specific clipboard sink injected. Production
     /// passes the real `/dev/tty` handle; the OSC-52 dispatch and end-to-end
     /// tests pass a recording buffer.
-    pub fn with_clipboard(outer_supports: bool, clipboard_out: Box<dyn Write + Send>) -> Self {
+    pub fn with_clipboard(clipboard_out: Box<dyn Write + Send>) -> Self {
         Self {
-            kitty_state: KittyState::new(outer_supports),
             cursor_shape: CursorShape::new(),
             clipboard_out,
             replies: Vec::new(),
@@ -79,18 +68,11 @@ impl GutterCallbacks {
     pub fn drain_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.replies)
     }
+}
 
-    /// Buffers the kitty keyboard-protocol report for `CSI ? u`: `CSI ? <flags> u`
-    /// carrying the child's **live** level (the top of the push/pop stack, `0`
-    /// when legacy). Reading the live level here is why a query issued after a
-    /// push reflects the state the child actually set.
-    fn buffer_kitty_report(&mut self) {
-        let flags = match self.kitty_state.current() {
-            KittyLevel::Legacy => 0,
-            KittyLevel::Kitty(f) => f,
-        };
-        self.replies
-            .extend_from_slice(format!("\x1b[?{flags}u").as_bytes());
+impl Default for GutterCallbacks {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -129,16 +111,19 @@ impl fmt::Debug for GutterCallbacks {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The clipboard sink is a `dyn Write` (no `Debug`); elide it.
         f.debug_struct("GutterCallbacks")
-            .field("kitty_state", &self.kitty_state)
+            .field("cursor_shape", &self.cursor_shape)
             .finish_non_exhaustive()
     }
 }
 
 impl vt100::Callbacks for GutterCallbacks {
-    /// vt100's catch-all for CSI sequences it doesn't implement. Three of those
-    /// matter to gutter: the kitty enable/disable family (`CSI > N u` / `CSI < u`,
-    /// see ADR-003), DECSCUSR cursor-shape requests, and DA1/DSR device queries.
-    /// Each routes to its own field; the clipboard is untouched here.
+    /// vt100's catch-all for CSI sequences it doesn't implement. Two of those
+    /// matter to gutter: DECSCUSR cursor-shape requests and DA1/DSR device
+    /// queries. Each routes to its own field; the clipboard is untouched here.
+    ///
+    /// The kitty keyboard family is deliberately absent: gutter implements no
+    /// keyboard protocol, so the child's `CSI ? u` query gets silence — the
+    /// protocol's designed "I do not do this" (ADR-020).
     fn unhandled_csi(
         &mut self,
         screen: &mut vt100::Screen,
@@ -147,15 +132,7 @@ impl vt100::Callbacks for GutterCallbacks {
         params: &[&[u16]],
         c: char,
     ) {
-        if is_kitty_csi(i1, c) {
-            // The query form `CSI ? u` asks for the live level — answer it; the
-            // enable/disable forms (`CSI > N u` / `CSI < u`) mutate the stack.
-            if i1 == Some(b'?') {
-                self.buffer_kitty_report();
-            } else {
-                self.kitty_state.apply_csi(i1, params, c);
-            }
-        } else if is_decscusr(i1, c) {
+        if is_decscusr(i1, c) {
             // vt100 doesn't implement DECSCUSR, so it lands here with the SP
             // intermediate in `i1`. Record the shape for the render loop to mirror.
             self.cursor_shape.apply_csi(params);
@@ -181,32 +158,6 @@ impl vt100::Callbacks for GutterCallbacks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keyboard::KittyLevel;
-
-    /// Tracks the child's kitty level through the real `vt100` callback path:
-    /// drive `parser.process()` with enable/disable bytes and assert
-    /// `kitty_state.current()` at each step.
-    #[test]
-    fn unhandled_csi_tracks_kitty_level_through_parser() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(true));
-
-        // Child enables kitty at level 1.
-        parser.process(b"\x1b[>1u");
-        assert_eq!(parser.callbacks().kitty_state.current(), KittyLevel::Kitty(1));
-
-        // Nest a deeper level.
-        parser.process(b"\x1b[>5u");
-        assert_eq!(parser.callbacks().kitty_state.current(), KittyLevel::Kitty(5));
-
-        // Pop returns to the previous level.
-        parser.process(b"\x1b[<u");
-        assert_eq!(parser.callbacks().kitty_state.current(), KittyLevel::Kitty(1));
-
-        // Pop to empty → legacy.
-        parser.process(b"\x1b[<u");
-        assert_eq!(parser.callbacks().kitty_state.current(), KittyLevel::Legacy);
-    }
 
     /// Tracks the child's DECSCUSR through the real `vt100` callback path: drive
     /// `parser.process()` with a `CSI Ps SP q` and assert the callbacks recorded a
@@ -214,7 +165,7 @@ mod tests {
     #[test]
     fn decscusr_tracked_through_parser() {
         let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(true));
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new());
 
         // Child requests a steady bar cursor (CSI 6 SP q).
         parser.process(b"\x1b[6 q");
@@ -240,7 +191,7 @@ mod tests {
     #[test]
     fn da1_query_buffers_fixed_identity() {
         let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(true));
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new());
 
         parser.process(b"\x1b[c");
         assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[?1;2c");
@@ -258,7 +209,7 @@ mod tests {
     #[test]
     fn dsr_status_buffers_ok() {
         let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(true));
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new());
         parser.process(b"\x1b[5n");
         assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[0n");
     }
@@ -271,7 +222,7 @@ mod tests {
     #[test]
     fn cursor_position_reply_uses_w_grid_coords() {
         let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(true));
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new());
 
         // Move the cursor to row 3, col 7 (1-based), then query.
         parser.process(b"\x1b[3;7H\x1b[6n");
@@ -287,84 +238,22 @@ mod tests {
         assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[1;1R");
     }
 
-    /// The kitty query (`CSI ? u`) is answered with the child's **live** level —
-    /// the top of the push/pop stack — so a query after a push reflects the state
-    /// the child actually set, and the query itself never mutates the stack.
-    #[test]
-    fn kitty_query_reports_live_level() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(true));
-
-        // Legacy floor: no level pushed → flags 0.
-        parser.process(b"\x1b[?u");
-        assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[?0u");
-
-        // Push a level, then query: the reply reflects the live top of stack.
-        parser.process(b"\x1b[>5u\x1b[?u");
-        assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[?5u");
-        // The query did not mutate the stack — the live level is unchanged.
-        assert_eq!(parser.callbacks().kitty_state.current(), KittyLevel::Kitty(5));
-    }
-
-    /// With the outer terminal unable to source kitty, the child's enable is
-    /// neutralised through the real callback path.
-    #[test]
-    fn clamp_neutralises_enable_through_parser() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(false));
-        parser.process(b"\x1b[>1u");
-        assert_eq!(
-            parser.callbacks().kitty_state.current(),
-            KittyLevel::Legacy,
-            "outer can't source kitty → child stays legacy"
-        );
-    }
-
-    /// A non-kitty unhandled CSI (e.g. a stray `CSI > 0 c` device attributes
-    /// query, or a non-`u` final) must not touch the kitty stack.
-    #[test]
-    fn non_kitty_csi_leaves_stack_untouched() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(true));
-        // CSI > 0 c — secondary device attributes, NOT kitty.
-        parser.process(b"\x1b[>0c");
-        assert_eq!(parser.callbacks().kitty_state.current(), KittyLevel::Legacy);
-    }
-
-    /// A test double with the same two concerns as [`GutterCallbacks`] — the kitty
-    /// watcher and the OSC-52 hook — but `copy_to_clipboard` records each
-    /// `(ty, data)` into a `Vec` instead of writing a tty. Lets the dispatch and
-    /// coexistence tests drive `parser.process()` directly and assert what fired,
-    /// with no PTY, no `/dev/tty`, no threads. The kitty watcher body is identical
-    /// to production's; only the clipboard body differs (record vs forward).
+    /// A test double for the OSC-52 hook: `copy_to_clipboard` records each
+    /// `(ty, data)` into a `Vec` instead of writing a tty. Lets the dispatch tests
+    /// drive `parser.process()` directly and assert what fired, with no PTY, no
+    /// `/dev/tty`, no threads.
+    #[derive(Default)]
     struct RecordingCallbacks {
-        kitty_state: KittyState,
         recorded: Vec<(Vec<u8>, Vec<u8>)>,
     }
 
     impl RecordingCallbacks {
-        fn new(outer_supports: bool) -> Self {
-            Self {
-                kitty_state: KittyState::new(outer_supports),
-                recorded: Vec::new(),
-            }
+        fn new() -> Self {
+            Self::default()
         }
     }
 
     impl vt100::Callbacks for RecordingCallbacks {
-        fn unhandled_csi(
-            &mut self,
-            _: &mut vt100::Screen,
-            i1: Option<u8>,
-            _i2: Option<u8>,
-            params: &[&[u16]],
-            c: char,
-        ) {
-            if is_kitty_csi(i1, c) {
-                self.kitty_state.apply_csi(i1, params, c);
-            }
-        }
-
         fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
             self.recorded.push((ty.to_vec(), data.to_vec()));
         }
@@ -394,7 +283,7 @@ mod tests {
     #[test]
     fn osc52_dispatch_confirmation_against_pinned_vte() {
         let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, RecordingCallbacks::new(true));
+            vt100::Parser::new_with_callbacks(24, 80, 0, RecordingCallbacks::new());
 
         // 1. BEL (0x07) terminator.
         parser.process(b"\x1b]52;c;QUJD\x07");
@@ -429,7 +318,7 @@ mod tests {
         // It is absorbed into the payload, so nothing dispatches until a real
         // terminator arrives.
         let mut c1 =
-            vt100::Parser::new_with_callbacks(24, 80, 0, RecordingCallbacks::new(true));
+            vt100::Parser::new_with_callbacks(24, 80, 0, RecordingCallbacks::new());
         c1.process(b"\x1b]52;c;R0hJ\x9c");
         assert!(
             c1.callbacks().recorded.is_empty(),
@@ -439,7 +328,7 @@ mod tests {
 
         // Finding 2: CAN 0x18 dispatches the partial OSC, it does not abort it.
         let mut can =
-            vt100::Parser::new_with_callbacks(24, 80, 0, RecordingCallbacks::new(true));
+            vt100::Parser::new_with_callbacks(24, 80, 0, RecordingCallbacks::new());
         can.process(b"\x1b]52;c;aGV\x18");
         assert_eq!(
             can.callbacks().recorded,
@@ -449,36 +338,10 @@ mod tests {
         );
     }
 
-    /// On one recording callbacks instance, drive a stream carrying both a kitty
-    /// enable (`CSI > 1 u`) and an OSC-52 write, then assert the kitty level
-    /// updated and `copy_to_clipboard` fired — proving the struct carries both
-    /// concerns and neither method touched the other's state.
-    #[test]
-    fn kitty_watcher_and_clipboard_coexist_without_coupling() {
-        let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, RecordingCallbacks::new(true));
-
-        // Child enables kitty, then copies to the clipboard.
-        parser.process(b"\x1b[>1u");
-        parser.process(b"\x1b]52;c;aGVsbG8=\x07");
-
-        let cb = parser.callbacks();
-        assert_eq!(
-            cb.kitty_state.current(),
-            KittyLevel::Kitty(1),
-            "the kitty watcher tracked the enable"
-        );
-        assert_eq!(
-            cb.recorded,
-            vec![(b"c".to_vec(), b"aGVsbG8=".to_vec())],
-            "the clipboard hook fired on the SAME struct, independently"
-        );
-    }
-
     /// The production [`GutterCallbacks`] writes the reconstructed OSC 52 to its
-    /// injected sink (here a captured `Vec` standing in for `/dev/tty`), and the
-    /// kitty watcher on the same struct stays functional. Proves the production
-    /// `copy_to_clipboard` body forwards verbatim through the real callback path.
+    /// injected sink (here a captured `Vec` standing in for `/dev/tty`). Proves the
+    /// production `copy_to_clipboard` body forwards verbatim through the real
+    /// callback path.
     #[test]
     fn production_callbacks_forward_osc52_to_injected_sink() {
         use std::io::Write;
@@ -504,18 +367,11 @@ mod tests {
             24,
             80,
             0,
-            GutterCallbacks::with_clipboard(true, Box::new(sink)),
+            GutterCallbacks::with_clipboard(Box::new(sink)),
         );
 
-        // Kitty enable then a clipboard write, on the production struct.
-        parser.process(b"\x1b[>1u");
         parser.process(b"\x1b]52;c;aGVsbG8=\x07");
 
-        assert_eq!(
-            parser.callbacks().kitty_state.current(),
-            KittyLevel::Kitty(1),
-            "the kitty watcher still works on the production struct"
-        );
         assert_eq!(
             *captured.lock().unwrap(),
             b"\x1b]52;c;aGVsbG8=\x07",

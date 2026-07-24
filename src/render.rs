@@ -115,19 +115,16 @@ impl Renderer {
     /// outer terminal.
     ///
     /// `width` is the resolved initial `W`; `width_config` is kept so resize can
-    /// recompute it for the proportional path (ADR-011). `outer_supports_kitty`
-    /// clamps the child's kitty negotiation (ADR-003); `clipboard_out` is the OSC-52
-    /// sink (ADR-004). Both ride only the live `parser` — `prev` is a diff-only
-    /// baseline that runs neither the kitty nor the clipboard path. `base_row` is the
-    /// launch cursor row (ADR-013).
-    #[allow(clippy::too_many_arguments)]
+    /// recompute it for the proportional path (ADR-011). `clipboard_out` is the
+    /// OSC-52 sink (ADR-004), riding only the live `parser` — `prev` is a diff-only
+    /// baseline that never runs the clipboard path. `base_row` is the launch cursor
+    /// row (ADR-013).
     pub fn new(
         width: u16,
         rows: u16,
         real_cols: u16,
         layout: Layout,
         width_config: Width,
-        outer_supports_kitty: bool,
         clipboard_out: Box<dyn Write + Send>,
         base_row: u16,
     ) -> Self {
@@ -136,21 +133,16 @@ impl Renderer {
                 rows,
                 width,
                 0,
-                GutterCallbacks::with_clipboard(outer_supports_kitty, clipboard_out),
+                GutterCallbacks::with_clipboard(clipboard_out),
             ),
-            prev: vt100::Parser::new_with_callbacks(
-                rows,
-                width,
-                0,
-                GutterCallbacks::new(false),
-            ),
+            prev: vt100::Parser::new_with_callbacks(rows, width, 0, GutterCallbacks::new()),
             // Mirrors the band's geometry with a bounded scrollback so vt100 records
             // the lines that scroll off the top (ADR-013). Diff-only like `prev`.
             scroll_tracker: vt100::Parser::new_with_callbacks(
                 rows,
                 width,
                 SCROLL_TRACKER_SCROLLBACK,
-                GutterCallbacks::new(false),
+                GutterCallbacks::new(),
             ),
             width,
             width_config,
@@ -205,7 +197,6 @@ impl Renderer {
             width,
             Layout::Left,
             Width::Cols(width),
-            false,
             Box::new(std::io::sink()),
             0,
         );
@@ -1127,7 +1118,7 @@ impl Renderer {
         // Reset prev to a blank grid of the same size before replaying, so stale cells
         // from a shrunk region don't linger.
         let (rows, cols) = self.parser.screen().size();
-        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::new(false));
+        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::new());
         self.prev.process(&formatted);
     }
 
@@ -1137,7 +1128,7 @@ impl Renderer {
     /// scroll detection stays sound across the change.
     fn reset_prev_baseline(&mut self) {
         let (rows, cols) = self.parser.screen().size();
-        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::new(false));
+        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::new());
         self.reset_scroll_tracker();
     }
 
@@ -1181,7 +1172,7 @@ impl Renderer {
             rows,
             cols,
             SCROLL_TRACKER_SCROLLBACK,
-            GutterCallbacks::new(false),
+            GutterCallbacks::new(),
         );
         self.scroll_tracker.process(&formatted);
     }
@@ -1583,8 +1574,8 @@ where
 }
 
 /// Park the outer terminal (ADR-0019 step 3): leave alt (or hand the shell a fresh
-/// line below the inline band), reset attributes and cursor shape, pop kitty,
-/// disable mouse, show the cursor, and drop raw mode LAST — then flush so it all
+/// line below the inline band), reset attributes and cursor shape, disable mouse,
+/// show the cursor, and drop raw mode LAST — then flush so it all
 /// lands before the self-stop. Deliberately does NOT clear `outer_alt_active`: it
 /// stays as "the child's screen is alt" for the resume re-derivation (the
 /// double-meaning note in ADR-0019).
@@ -1592,7 +1583,7 @@ fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Res
     // Best-effort per step (ADR-010's "restore by hand, each step conditional"):
     // attempt EVERY restore step even if an earlier one errors, so an early failure
     // (e.g. a flush inside leave_alt_screen) can't short-circuit the rest and strand
-    // the shell in raw mode / mouse / kitty. disable_raw_mode in particular MUST run
+    // the shell in raw mode or mouse reporting. disable_raw_mode in particular MUST run
     // before the self-stop. The first error is remembered and returned for logging.
     let mut first_err: std::io::Result<()> = Ok(());
     let mut record = |r: std::io::Result<()>| {
@@ -1611,7 +1602,6 @@ fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Res
     }
     record(term.write_row(b"\x1b[0m")); // drop any leftover attribute run
     record(term.set_cursor_shape(b"\x1b[0 q")); // hand the shell a default cursor shape
-    record(term.pop_keyboard_flags()); // conditional on kitty_pushed
     record(term.disable_mouse()); // conditional on mouse_enabled
     record(term.show_cursor());
     renderer.cursor_visible = true;
@@ -1622,14 +1612,10 @@ fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Res
 
 /// Unpark the outer terminal (ADR-0019 step 5): re-take it after the self-stop
 /// returns, in inverse order — raw mode FIRST, shrinking the cooked-mode window the
-/// already-running input thread could read canonical input in. No kitty re-probe: a
-/// `CSI ? u` round-trip would be eaten by Thread 3, which owns the tty read fd, so
-/// re-push from the stored startup capability instead.
+/// already-running input thread could read canonical input in. There is no keyboard
+/// mode to re-assert: gutter asks the outer terminal for none of its own (ADR-020).
 fn unpark<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
     retry_enable_raw(term)?;
-    if renderer.parser.callbacks().kitty_state.outer_supports() {
-        let _ = term.push_keyboard_flags();
-    }
     term.enable_mouse()?;
     let child_alt = renderer.parser.screen().alternate_screen();
     if child_alt {
@@ -1704,8 +1690,8 @@ fn drain_pty_path<C, T, P, R>(
 }
 
 /// The explicit, ordered terminal restore (ADR-010), mode-aware (ADR-012/013):
-/// conditional alt-leave / inline hand-back → pop kitty flags → disable mouse → show
-/// cursor → disable raw mode. Each step undoes only what was actually set up.
+/// conditional alt-leave / inline hand-back → disable mouse → show cursor → disable
+/// raw mode. Each step undoes only what was actually set up.
 ///
 /// The discriminator is the live `outer_alt_active`: a child that exits in the alt
 /// screen takes the leave-alt path; one that exits inline hands back below the band. The
@@ -1722,7 +1708,6 @@ fn run_teardown<T: OuterTerminal>(
     } else if renderer.ever_painted_inline {
         hand_back_inline(renderer, term, exit_code)?;
     }
-    term.pop_keyboard_flags()?;
     term.disable_mouse()?;
     term.show_cursor()?;
     term.disable_raw_mode()?;
@@ -1857,14 +1842,13 @@ mod tests {
 
     /// Build a left-aligned, fixed-`width` renderer (margin 0) — the absolute-width,
     /// left-aligned baseline.
-    fn left_renderer(width: u16, rows: u16, outer_kitty: bool) -> Renderer {
+    fn left_renderer(width: u16, rows: u16) -> Renderer {
         Renderer::new(
             width,
             rows,
             width, // real_cols == width → margin 0 for both Left and Center
             Layout::Left,
             Width::Cols(width),
-            outer_kitty,
             Box::new(std::io::sink()),
             0, // base_row 0 → absolute paint, the baseline
         )
@@ -1876,7 +1860,7 @@ mod tests {
         rows: u16,
     ) -> (usize, MockTerminal, Vec<u8>, Renderer, Option<i32>) {
         let mut clock = VirtualClock::new(script);
-        let mut renderer = left_renderer(width, rows, false);
+        let mut renderer = left_renderer(width, rows);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         let resizer = NoopResizer;
@@ -1917,7 +1901,7 @@ mod tests {
 
         // Completeness: replay every PTY byte into a fresh parser; same grid.
         let mut reference: vt100::Parser<GutterCallbacks> =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(false));
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new());
         for p in &payloads {
             reference.process(p);
         }
@@ -1961,7 +1945,7 @@ mod tests {
     #[test]
     fn idle_park_zero_renders_zero_wakeups() {
         let mut clock = VirtualClock::new(vec![]);
-        let mut renderer = left_renderer(80, 24, false);
+        let mut renderer = left_renderer(80, 24);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
 
@@ -1999,7 +1983,7 @@ mod tests {
         // 16ms window — we assert the writer is non-empty immediately after the
         // run and that it landed before the burst's end is processed.
         let mut clock = VirtualClock::new(script);
-        let mut renderer = left_renderer(80, 24, false);
+        let mut renderer = left_renderer(80, 24);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
@@ -2018,19 +2002,17 @@ mod tests {
     /// fire in order, the loop exits, and the exit code matches `status.exit_code()`.
     /// `LeaveAltScreen` must not fire; the hand-back drops the cursor below the band and
     /// emits the dim `Exited with: 42` status line before the remaining restore steps.
-    /// On a non-kitty outer terminal `PopKeyboardFlags` must not fire — we only pop what
-    /// we pushed (ADR-003).
     #[test]
-    fn child_exit_restores_in_order_no_kitty_pop_when_not_pushed() {
+    fn child_exit_restores_in_order() {
         use crate::terminal::OuterTerminal;
         let mut clock = VirtualClock::new(vec![
             (0u64, Msg::Pty(b"report".to_vec())),
             (1, Msg::ChildExited(ExitStatus::with_exit_code(42))),
         ]);
-        let mut renderer = left_renderer(80, 24, false);
+        let mut renderer = left_renderer(80, 24);
         let mut term = MockTerminal::new();
-        // Model the eager startup mouse capture main.rs performs (no kitty push
-        // on this non-kitty path). `DisableMouse` must then fire in teardown.
+        // Model the eager startup mouse capture main.rs performs; `DisableMouse`
+        // must then fire in teardown.
         term.enable_mouse().unwrap();
         let mut pty: Vec<u8> = Vec::new();
 
@@ -2051,7 +2033,7 @@ mod tests {
                 Call::ShowCursor,
                 Call::DisableRawMode,
             ],
-            "restore order: NO LeaveAltScreen (never entered), NO kitty pop"
+            "restore order: NO LeaveAltScreen (the child never entered it)"
         );
 
         // The dim status line is recorded as a `write_row` carrying the
@@ -2087,26 +2069,21 @@ mod tests {
         );
     }
 
-    /// Child-exit restore with a kitty-capable outer terminal, for a TUI in the alt
-    /// screen at exit (`?1049h` then exit): the startup kitty push must be paired with a
-    /// `PopKeyboardFlags` in the right slot — after the leave-alt-screen, before
-    /// disable-raw-mode (ADR-010/003/012). Because the child exits in the alt screen,
-    /// `LeaveAltScreen` fires and the inline hand-back is skipped, so teardown emits no
-    /// hand-back rows and no status line, even on a zero exit.
+    /// Child-exit restore for a TUI in the alt screen at exit (`?1049h` then exit).
+    /// `LeaveAltScreen` fires in the ADR-010 slot and the inline hand-back is
+    /// skipped, so teardown emits no hand-back rows and no status line, even on a
+    /// zero exit (ADR-010/012).
     #[test]
-    fn child_exit_pops_kitty_flags_when_pushed_at_startup() {
+    fn child_exit_leaves_alt_screen_then_restores_in_order() {
         use crate::terminal::OuterTerminal;
         let mut clock = VirtualClock::new(vec![
             // The child enters the alt screen (a TUI), then exits while still in it.
             (0u64, Msg::Pty(b"\x1b[?1049h".to_vec())),
             (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ]);
-        let mut renderer = left_renderer(80, 24, true);
-        let mut term = MockTerminal::kitty_capable();
-        // Simulate the startup probe + push + eager mouse capture main.rs
-        // performs, in that order (kitty push, then EnableMouse).
-        assert!(term.supports_keyboard_enhancement().unwrap());
-        term.push_keyboard_flags().unwrap();
+        let mut renderer = left_renderer(80, 24);
+        let mut term = MockTerminal::new();
+        // Model the eager startup mouse capture main.rs performs.
         term.enable_mouse().unwrap();
         let mut pty: Vec<u8> = Vec::new();
 
@@ -2128,12 +2105,11 @@ mod tests {
             term.restore_calls(),
             vec![
                 Call::LeaveAltScreen,
-                Call::PopKeyboardFlags,
                 Call::DisableMouse,
                 Call::ShowCursor,
                 Call::DisableRawMode,
             ],
-            "an alt-screen TUI leaves the alt screen, then pops kitty in the ADR-010 slot"
+            "an alt-screen TUI leaves the alt screen, then restores in the ADR-010 order"
         );
 
         // A TUI exits in alt → the leave-alt path runs, the hand-back is skipped:
@@ -2164,10 +2140,8 @@ mod tests {
             (0, Msg::Pty(b"\x1b[?1049h".to_vec())),
             (0, Msg::PtyEof),
         ]);
-        let mut renderer = left_renderer(80, 24, true);
-        let mut term = MockTerminal::kitty_capable();
-        assert!(term.supports_keyboard_enhancement().unwrap());
-        term.push_keyboard_flags().unwrap();
+        let mut renderer = left_renderer(80, 24);
+        let mut term = MockTerminal::new();
         term.enable_mouse().unwrap();
         let mut pty: Vec<u8> = Vec::new();
 
@@ -2193,16 +2167,14 @@ mod tests {
     /// still completes and returns the exit code.
     #[test]
     fn shutdown_drain_caps_at_grace_when_no_eof() {
-        use crate::terminal::OuterTerminal;
         let grace_ms = TEARDOWN_DRAIN_GRACE.as_millis() as u64;
         let mut clock = VirtualClock::new(vec![
             (0u64, Msg::ChildExited(ExitStatus::with_exit_code(0))),
             // A straggler arriving well past the grace window: never reached.
             (grace_ms + 500, Msg::Pty(b"\x1b[?1049h".to_vec())),
         ]);
-        let mut renderer = left_renderer(80, 24, true);
-        let mut term = MockTerminal::kitty_capable();
-        term.push_keyboard_flags().unwrap();
+        let mut renderer = left_renderer(80, 24);
+        let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
 
         let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
@@ -2224,15 +2196,13 @@ mod tests {
     /// screen the (already processed) `?1049h` put us in.
     #[test]
     fn pty_eof_before_child_exit_short_circuits_drain() {
-        use crate::terminal::OuterTerminal;
         let mut clock = VirtualClock::new(vec![
             (0u64, Msg::Pty(b"\x1b[?1049h".to_vec())),
             (1, Msg::PtyEof),
             (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ]);
-        let mut renderer = left_renderer(80, 24, true);
-        let mut term = MockTerminal::kitty_capable();
-        term.push_keyboard_flags().unwrap();
+        let mut renderer = left_renderer(80, 24);
+        let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
 
         let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
@@ -2255,7 +2225,7 @@ mod tests {
     fn run_teardown_replays_dim_status_on_primary_only_on_nonzero() {
         // Non-zero on a primary (never-alt) renderer that painted inline: the dim
         // line is handed back, with no alt-leave, before the remaining restore steps.
-        let mut renderer = left_renderer(80, 24, false); // outer_alt_active == false
+        let mut renderer = left_renderer(80, 24); // outer_alt_active == false
         renderer.ever_painted_inline = true; // it printed inline content this run
         let mut term = MockTerminal::new();
         run_teardown(&renderer, &mut term, 1).unwrap();
@@ -2295,7 +2265,7 @@ mod tests {
         );
 
         // Zero exit: no status-line write_row at all — just a Newline below the band.
-        let mut renderer0 = left_renderer(80, 24, false);
+        let mut renderer0 = left_renderer(80, 24);
         renderer0.ever_painted_inline = true;
         let mut term0 = MockTerminal::new();
         run_teardown(&renderer0, &mut term0, 0).unwrap();
@@ -2509,7 +2479,7 @@ mod tests {
             (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ];
         let mut clock = VirtualClock::new(script);
-        let mut renderer = left_renderer(20, 5, false);
+        let mut renderer = left_renderer(20, 5);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
@@ -2547,7 +2517,7 @@ mod tests {
             (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ];
         let mut clock = VirtualClock::new(script);
-        let mut renderer = left_renderer(20, 24, false);
+        let mut renderer = left_renderer(20, 24);
         // The scripted content sits on grid row 0, so make-room never scrolls and
         // base_row stays 5 through the resize (5 < 29, the height clamp is a no-op).
         renderer.base_row = 5;
@@ -2575,7 +2545,7 @@ mod tests {
             (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ];
         let mut clock = VirtualClock::new(script);
-        let mut renderer = left_renderer(20, 24, false);
+        let mut renderer = left_renderer(20, 24);
         let mut term = MockTerminal::new();
         term.set_terminal_size(100, 30);
         let mut pty: Vec<u8> = Vec::new();
@@ -3082,7 +3052,7 @@ line two\r\n\
             (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ];
         let mut clock = VirtualClock::new(script);
-        let mut renderer = left_renderer(width, 5, false);
+        let mut renderer = left_renderer(width, 5);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
@@ -3175,7 +3145,7 @@ line two\r\n\
             fn new() -> Self {
                 Self {
                     clock: VirtualClock::new(vec![]),
-                    renderer: left_renderer(80, 24, false),
+                    renderer: left_renderer(80, 24),
                     resize: ResizeCtl::inactive(),
                     input: InputCtl::new(),
                     term: MockTerminal::new(),
@@ -3385,7 +3355,6 @@ line two\r\n\
                 real_cols,
                 Layout::Center,
                 cfg,
-                false,
                 Box::new(std::io::sink()),
                 0,
             )
@@ -3712,8 +3681,6 @@ line two\r\n\
                         c,
                         Call::EnterAltScreen
                             | Call::LeaveAltScreen
-                            | Call::PushKeyboardFlags
-                            | Call::PopKeyboardFlags
                             | Call::EnableMouse
                             | Call::DisableMouse
                             | Call::EnableRawMode
@@ -3727,20 +3694,17 @@ line two\r\n\
                 .collect()
         }
 
-        /// Build a shared-log terminal + renderer, simulate main.rs's eager setup
-        /// (mouse capture, and kitty flags when capable) so park has something to
-        /// pop/disable, then clear the log so only the cycle is recorded.
-        fn harness(kitty: bool) -> (OrderLog, MockTerminal, Renderer) {
+        /// Build a shared-log terminal + renderer, simulate main.rs's eager mouse
+        /// capture so park has something to disable, then clear the log so only the
+        /// cycle is recorded.
+        fn harness() -> (OrderLog, MockTerminal, Renderer) {
             let log: OrderLog = Rc::new(RefCell::new(Vec::new()));
             let mut term = MockTerminal::with_log(log.clone());
             // Report the renderer's own size so the resume resize-catch-up is a no-op
             // unless a test deliberately flips it.
             term.set_terminal_size(40, 10);
             term.enable_mouse().unwrap();
-            if kitty {
-                term.push_keyboard_flags().unwrap();
-            }
-            let renderer = left_renderer(40, 10, kitty);
+            let renderer = left_renderer(40, 10);
             log.borrow_mut().clear();
             term.calls.clear();
             (log, term, renderer)
@@ -3769,7 +3733,7 @@ line two\r\n\
         /// `dispatch(ChildStopped)` maps to `Flow::Suspend`.
         #[test]
         fn child_stopped_dispatches_to_suspend() {
-            let mut renderer = left_renderer(40, 10, false);
+            let mut renderer = left_renderer(40, 10);
             let mut term = MockTerminal::new();
             let mut pty: Vec<u8> = Vec::new();
             let flow = dispatch(
@@ -3786,7 +3750,7 @@ line two\r\n\
         /// with the full restore-before-self-stop / raw-first-on-resume ordering.
         #[test]
         fn ordering_child_in_alt() {
-            let (log, mut term, mut renderer) = harness(true);
+            let (log, mut term, mut renderer) = harness();
             // Child (and outer) already in the alt screen — no step-2 enter edge.
             renderer.parser.process(b"\x1b[?1049h");
             renderer.outer_alt_active = true;
@@ -3798,13 +3762,11 @@ line two\r\n\
                 significant(&log.borrow()),
                 vec![
                     Call::LeaveAltScreen,
-                    Call::PopKeyboardFlags,
                     Call::DisableMouse,
                     Call::ShowCursor,
                     Call::DisableRawMode,
                     Call::SuspendSelf,
                     Call::EnableRawMode,
-                    Call::PushKeyboardFlags,
                     Call::EnableMouse,
                     Call::EnterAltScreen,
                     Call::ContinueChild,
@@ -3817,7 +3779,7 @@ line two\r\n\
         /// re-setup.
         #[test]
         fn ordering_primary_inline() {
-            let (log, mut term, mut renderer) = harness(true);
+            let (log, mut term, mut renderer) = harness();
             renderer.ever_painted_inline = true;
 
             let outcome = drive(&log, &mut term, &mut renderer);
@@ -3826,13 +3788,11 @@ line two\r\n\
             assert_eq!(
                 significant(&log.borrow()),
                 vec![
-                    Call::PopKeyboardFlags,
                     Call::DisableMouse,
                     Call::ShowCursor,
                     Call::DisableRawMode,
                     Call::SuspendSelf,
                     Call::EnableRawMode,
-                    Call::PushKeyboardFlags,
                     Call::EnableMouse,
                     Call::ContinueChild,
                 ],
@@ -3848,26 +3808,11 @@ line two\r\n\
             );
         }
 
-        /// Non-kitty outer terminal: no keyboard-flag push/pop anywhere in the cycle.
-        #[test]
-        fn ordering_non_kitty_skips_keyboard_flags() {
-            let (log, mut term, mut renderer) = harness(false);
-            renderer.ever_painted_inline = true;
-
-            drive(&log, &mut term, &mut renderer);
-
-            let sig = significant(&log.borrow());
-            assert!(
-                !sig.contains(&Call::PushKeyboardFlags) && !sig.contains(&Call::PopKeyboardFlags),
-                "a non-kitty outer terminal never pushes/pops keyboard flags: {sig:?}"
-            );
-        }
-
         /// Suspend while resize mode is active: the overlay is cleared (step 0)
         /// before the terminal is parked, and the mode is left.
         #[test]
         fn resize_mode_overlay_cleared_before_park() {
-            let (log, mut term, mut renderer) = harness(false);
+            let (log, mut term, mut renderer) = harness();
             renderer.ever_painted_inline = true;
 
             let mut clock = VirtualClock::new(vec![]);
@@ -3903,7 +3848,7 @@ line two\r\n\
         /// without ever self-stopping or parking the terminal (no double restore).
         #[test]
         fn abort_when_child_dies_in_drain() {
-            let (log, mut term, mut renderer) = harness(false);
+            let (log, mut term, mut renderer) = harness();
             renderer.ever_painted_inline = true;
 
             let mut clock =
@@ -3939,7 +3884,7 @@ line two\r\n\
         /// size.
         #[test]
         fn missed_resize_catch_up_before_continue() {
-            let (log, mut term, mut renderer) = harness(false);
+            let (log, mut term, mut renderer) = harness();
             renderer.ever_painted_inline = true;
 
             // The shell resized the terminal to 50x12 while gutter was stopped.
@@ -3988,7 +3933,7 @@ line two\r\n\
         /// `[stale_base_row, rows)` span that still holds the user's shell output.
         #[test]
         fn resume_resize_interior_clear_spares_shell_history() {
-            let (log, mut term, mut renderer) = harness(false);
+            let (log, mut term, mut renderer) = harness();
             renderer.ever_painted_inline = true;
             // The band was anchored mid-screen before the stop; the shell then scrolled
             // under it, leaving base_row pointing into live shell output.
@@ -4040,7 +3985,7 @@ line two\r\n\
         /// the next frame to fully repaint.
         #[test]
         fn child_continued_forces_repaint_no_suspend() {
-            let mut renderer = left_renderer(40, 3, false);
+            let mut renderer = left_renderer(40, 3);
             let mut term = MockTerminal::new();
             let mut pty: Vec<u8> = Vec::new();
 
@@ -4072,7 +4017,7 @@ line two\r\n\
         /// is stale after park).
         #[test]
         fn cursor_shape_reasserted_on_resume() {
-            let (log, mut term, mut renderer) = harness(false);
+            let (log, mut term, mut renderer) = harness();
             renderer.ever_painted_inline = true;
 
             // Child requested a steady bar (CSI 6 SP q); mirror it once, then isolate.
@@ -4110,7 +4055,7 @@ line two\r\n\
             let mut term = MockTerminal::with_log(log.clone());
             // Match the renderer's size so the resume resize-catch-up is a no-op.
             term.set_terminal_size(40, 10);
-            let mut renderer = left_renderer(40, 10, false);
+            let mut renderer = left_renderer(40, 10);
             let mut pty: Vec<u8> = Vec::new();
             let suspender = MockSuspender::new(log.clone());
 
@@ -5128,16 +5073,7 @@ mod resize {
         layout: Layout,
         cfg: Width,
     ) -> Renderer {
-        Renderer::new(
-            width,
-            rows,
-            real_cols,
-            layout,
-            cfg,
-            false,
-            Box::new(std::io::sink()),
-            0,
-        )
+        Renderer::new(width, rows, real_cols, layout, cfg, Box::new(std::io::sink()), 0)
     }
 
     /// Resize ordering (ADR-008 gate). Drive one resize and assert `master.resize` was
@@ -5226,7 +5162,7 @@ mod resize {
         // Reference: a fresh parser at the new size fed only the post-resize
         // stream (the clear wipes the transient, so the settled grids match).
         let mut reference: vt100::Parser<GutterCallbacks> =
-            vt100::Parser::new_with_callbacks(24, w, 0, GutterCallbacks::new(false));
+            vt100::Parser::new_with_callbacks(24, w, 0, GutterCallbacks::new());
         reference.process(new_bytes);
 
         assert_eq!(r.parser.screen().size(), (24, w), "COLUMNS == W after settle");
@@ -5624,7 +5560,7 @@ mod margins {
     /// Build a renderer for the margins tests with an explicit layout + width
     /// config, sized to `width × rows` in a `real_cols`-wide terminal.
     fn renderer(width: u16, rows: u16, real_cols: u16, layout: Layout, cfg: Width) -> Renderer {
-        Renderer::new(width, rows, real_cols, layout, cfg, false, Box::new(std::io::sink()), 0)
+        Renderer::new(width, rows, real_cols, layout, cfg, Box::new(std::io::sink()), 0)
     }
 
     /// Alt screen: the clear spans the whole grid, `0..rows` (gutter owns the whole

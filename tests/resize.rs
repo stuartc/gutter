@@ -27,12 +27,10 @@ fn gutter_bin() -> String {
 }
 
 /// Run gutter inside an outer terminal of the given size:
-/// `sh -c 'stty cols C rows R; exec env GUTTER_FORCE_KITTY=0 gutter <args>'`.
-/// `GUTTER_FORCE_KITTY=0` skips the ~2s kitty probe stall a dumb test PTY can't
-/// answer (this suite is not about the keyboard).
+/// `sh -c 'stty cols C rows R; exec env gutter <args>'`.
 fn gutter_in_terminal(outer_cols: u16, outer_rows: u16, gutter_args: &str) -> std::process::Command {
     let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
+        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");

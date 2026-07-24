@@ -29,7 +29,6 @@ mod clock;
 mod cursor;
 mod geometry;
 mod input;
-mod keyboard;
 mod mouse;
 mod msg;
 mod pty;
@@ -141,32 +140,14 @@ fn run() -> i32 {
         thread::spawn(move || waiter::run(child_pid, child, merged_tx));
     }
 
-    // Outer terminal setup: raw mode, kitty probe, eager mouse capture. No forced
-    // alt screen (ADR-012): the render thread mirrors the child's mode.
+    // Outer terminal setup: raw mode, then eager mouse capture. No forced alt
+    // screen (ADR-012): the render thread mirrors the child's mode. gutter asks
+    // the outer terminal for no keyboard mode of its own — that is the child's to
+    // negotiate (ADR-020).
     let mut terminal = CrosstermTerminal::new();
     if let Err(e) = terminal.enable_raw_mode() {
         eprintln!("gutter: failed to enable raw mode: {e}");
         return 1;
-    }
-
-    // Probe kitty keyboard capability AFTER raw mode — the probe does a `CSI ? u`
-    // round-trip on the real terminal (ADR-003). If the outer terminal supports
-    // kitty, push the disambiguation flags (paired with a pop in teardown) so
-    // crossterm distinguishes Shift+Enter from Enter; the result clamps the
-    // child's kitty state.
-    //
-    // A test harness can't make a dumb PTY answer the round-trip, so
-    // `GUTTER_FORCE_KITTY` overrides the probe: `1` forces true, `0` forces false.
-    // Absent the env var, the real probe decides.
-    let outer_supports_kitty = match std::env::var("GUTTER_FORCE_KITTY").ok().as_deref() {
-        Some("1") => true,
-        Some("0") => false,
-        _ => terminal.supports_keyboard_enhancement().unwrap_or(false),
-    };
-    if outer_supports_kitty {
-        if let Err(e) = terminal.push_keyboard_flags() {
-            eprintln!("gutter: failed to push keyboard enhancement flags: {e}");
-        }
     }
 
     // The tty gutter reads input from. Opened ONCE here: the CPR probe below and
@@ -239,7 +220,6 @@ fn run() -> i32 {
         real_cols,
         config.layout,
         width_config,
-        outer_supports_kitty,
         clipboard_out,
         anchor_row,
     );

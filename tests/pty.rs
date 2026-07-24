@@ -57,12 +57,8 @@ fn gutter_in_terminal(
     outer_rows: u16,
     gutter_args: &str,
 ) -> std::process::Command {
-    // `GUTTER_FORCE_KITTY=0`: a dumb test PTY can't answer the kitty probe, so
-    // the real `supports_keyboard_enhancement()` would stall ~2s before
-    // returning false. This suite is not about the keyboard; inject the known
-    // result to skip the stall (slice 04's injectable-capability seam).
     let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
+        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");

@@ -55,11 +55,10 @@ fn gutter_bin() -> String {
 
 /// Spawn gutter under a real 80x24 PTY wrapping `gutter_args` (a single string so
 /// the inner `sh` parses any nested quoting). `stty` pins the size before gutter
-/// reads it; `GUTTER_FORCE_KITTY=0` skips the ~2s kitty-probe stall a dumb PTY
-/// can't answer, `GUTTER_FORCE_ANCHOR_ROW=0` pins the inline anchor.
+/// reads it; `GUTTER_FORCE_ANCHOR_ROW=0` pins the inline anchor.
 fn spawn_gutter(gutter_args: &str) -> OsSession {
     let script = format!(
-        "stty cols 80 rows 24; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
+        "stty cols 80 rows 24; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
         gutter_bin()
     );
     let mut cmd = std::process::Command::new("/bin/sh");
