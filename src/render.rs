@@ -284,9 +284,10 @@ where
             Flow::Continue
         }
         // Input reaches the child through `apply_message`'s scanner, which is the
-        // only caller that owns the scanner state. This arm is reached solely from
-        // the teardown drain, where dropping keystrokes typed during the ~100 ms
-        // shutdown window is deliberate (ADR-016).
+        // only caller that owns the scanner state. This arm is reached from the two
+        // bounded drains — the shutdown drain (ADR-013) and the suspend cycle's
+        // pre-stop drain (ADR-0019) — where a keystroke is dropped rather than
+        // forwarded unscanned.
         Msg::Input(_) => Flow::Continue,
         Msg::ChildExited(status) => Flow::Exit(status.exit_code() as i32),
         // The child stopped (ADR-0018): drive the suspend/resume cycle. `sig` is
@@ -4003,8 +4004,8 @@ line two\r\n\
         }
 
         /// The gate is a gate. Without the mirror the same span is ordinary input, so
-        /// the `0x1C` still enters resize mode and the mouse report is still extracted
-        /// and translated — today's behaviour, unchanged.
+        /// the `0x1C` enters resize mode and the mouse report is extracted and
+        /// translated.
         #[test]
         fn the_same_span_is_scanned_normally_with_the_mirror_off() {
             let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));

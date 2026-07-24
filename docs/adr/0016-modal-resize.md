@@ -32,11 +32,12 @@ Three supporting choices:
   mid-sequence.
 - **Release-form guard.** gutter no longer pushes `REPORT_EVENT_TYPES` itself, so
   releases only arrive when the *child* asked for them. When that happens, the
-  chord's release form (`ESC[92:3;5u`) must not be matched as a second chord
-  press, or the mode would toggle straight back out on key-up. The matcher
-  recognises the press forms only. Step keys are the opposite: they act on
-  repeats (hold `h` to keep shrinking), which falls out for free, since an
-  auto-repeating legacy key simply sends its byte again.
+  chord's release form must not be matched as a second chord press, or the mode
+  would toggle straight back out on key-up. kitty carries the event type as a
+  sub-parameter of the *modifier* field, not the key field, so that form is
+  `ESC[92;5:3u`. The matcher recognises the press forms only. Step keys are the
+  opposite: they act on repeats (hold `h` to keep shrinking), which falls out for
+  free, since an auto-repeating legacy key simply sends its byte again.
 - **Unit-preserving steps.** `step_width` nudges a `Width` in its own unit — columns
   for `Cols`, percent for `Percent` — and never converts between them, clamped to
   `[MIN_W, real_cols]`. The floor never exceeds the *current* effective width, so a
