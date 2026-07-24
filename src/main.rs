@@ -32,6 +32,7 @@ mod input;
 mod mouse;
 mod msg;
 mod pty;
+mod relay;
 mod render;
 mod rowclip;
 mod scan;

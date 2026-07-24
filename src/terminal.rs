@@ -92,6 +92,18 @@ pub trait OuterTerminal {
     /// Flush the queued frame to the real terminal. Exactly once per frame.
     fn flush(&mut self) -> io::Result<()>;
 
+    // --- Child-driven keyboard modes (ADR-021) ---
+    /// Write child-originated keyboard-mode bytes to the real terminal verbatim, and
+    /// flush them: the child may be blocked waiting on the round trip, and crossterm's
+    /// stdout is buffered. The bytes are the relay's canonical forms, so this method
+    /// neither builds nor inspects them.
+    ///
+    /// Distinct from [`write_row`] so the recorded call log keeps relay bytes apart
+    /// from row paints — the ADR-010 and ADR-019 ordering assertions read that log.
+    ///
+    /// [`write_row`]: OuterTerminal::write_row
+    fn relay(&mut self, bytes: &[u8]) -> io::Result<()>;
+
     // --- Teardown (ADR-010 order) ---
     /// Leave the alternate screen — conditional on the outer terminal actually
     /// being in it (ADR-012): a plain command never entered, so teardown skips the
@@ -272,6 +284,11 @@ impl OuterTerminal for CrosstermTerminal {
         self.out.flush()
     }
 
+    fn relay(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.out.write_all(bytes)?;
+        self.out.flush()
+    }
+
     fn leave_alt_screen(&mut self) -> io::Result<()> {
         use crossterm::{queue, terminal::LeaveAlternateScreen};
         queue!(self.out, LeaveAlternateScreen)?;
@@ -333,6 +350,11 @@ pub mod mock {
         SetCursorVisible(bool),
         /// `set_cursor_shape(bytes)` — the mirrored `CSI Ps SP q`.
         SetCursorShape(Vec<u8>),
+        /// `relay(bytes)` — a keyboard-mode request forwarded on the child's behalf,
+        /// or the reset/replay that undoes and re-applies them (ADR-021). Its own
+        /// variant so the ordering filters can see it without confusing it with a
+        /// row paint.
+        Relay(Vec<u8>),
         Flush,
         LeaveAltScreen,
         DisableMouse,
@@ -407,6 +429,7 @@ pub mod mock {
                     matches!(
                         c,
                         Call::LeaveAltScreen
+                            | Call::Relay(_)
                             | Call::DisableMouse
                             | Call::ShowCursor
                             | Call::DisableRawMode
@@ -625,6 +648,12 @@ pub mod mock {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+        fn relay(&mut self, _bytes: &[u8]) -> io::Result<()> {
+            // Keyboard-mode requests change how the terminal encodes the keys it
+            // sends and paint nothing — the premise of the allowlist (ADR-021) — so
+            // the physical-cell recorder has nothing to record.
+            Ok(())
+        }
         fn leave_alt_screen(&mut self) -> io::Result<()> {
             Ok(())
         }
@@ -701,6 +730,10 @@ pub mod mock {
         }
         fn flush(&mut self) -> io::Result<()> {
             self.record(Call::Flush);
+            Ok(())
+        }
+        fn relay(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.record(Call::Relay(bytes.to_vec()));
             Ok(())
         }
         fn leave_alt_screen(&mut self) -> io::Result<()> {

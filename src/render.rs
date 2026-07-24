@@ -133,16 +133,16 @@ impl Renderer {
                 rows,
                 width,
                 0,
-                GutterCallbacks::with_clipboard(clipboard_out),
+                GutterCallbacks::live(clipboard_out),
             ),
-            prev: vt100::Parser::new_with_callbacks(rows, width, 0, GutterCallbacks::new()),
+            prev: vt100::Parser::new_with_callbacks(rows, width, 0, GutterCallbacks::baseline()),
             // Mirrors the band's geometry with a bounded scrollback so vt100 records
             // the lines that scroll off the top (ADR-013). Diff-only like `prev`.
             scroll_tracker: vt100::Parser::new_with_callbacks(
                 rows,
                 width,
                 SCROLL_TRACKER_SCROLLBACK,
-                GutterCallbacks::new(),
+                GutterCallbacks::baseline(),
             ),
             width,
             width_config,
@@ -241,6 +241,15 @@ where
     match msg {
         Msg::Pty(bytes) => {
             renderer.parser.process(&bytes);
+            // Carry the child's keyboard-mode requests out to the real terminal
+            // (ADR-021), before the inward replies: a relayed `CSI ? u` has a round
+            // trip ahead of it and the head start is free. Safe outside a frame —
+            // `render_once` queues and flushes within one call, so no half-built
+            // frame is ever outstanding when a message is dispatched.
+            let relayed = renderer.parser.callbacks_mut().drain_relay();
+            if !relayed.is_empty() {
+                let _ = term.relay(&relayed);
+            }
             // Answer the child's device queries: parser.process surfaced any
             // CSI c / CSI 5 n / CSI 6 n through unhandled_csi, which buffered a
             // spec-correct reply; drain it to the PTY master.
@@ -1119,7 +1128,7 @@ impl Renderer {
         // Reset prev to a blank grid of the same size before replaying, so stale cells
         // from a shrunk region don't linger.
         let (rows, cols) = self.parser.screen().size();
-        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::new());
+        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::baseline());
         self.prev.process(&formatted);
     }
 
@@ -1129,7 +1138,7 @@ impl Renderer {
     /// scroll detection stays sound across the change.
     fn reset_prev_baseline(&mut self) {
         let (rows, cols) = self.parser.screen().size();
-        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::new());
+        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::baseline());
         self.reset_scroll_tracker();
     }
 
@@ -1173,7 +1182,7 @@ impl Renderer {
             rows,
             cols,
             SCROLL_TRACKER_SCROLLBACK,
-            GutterCallbacks::new(),
+            GutterCallbacks::baseline(),
         );
         self.scroll_tracker.process(&formatted);
     }
@@ -1902,7 +1911,7 @@ mod tests {
 
         // Completeness: replay every PTY byte into a fresh parser; same grid.
         let mut reference: vt100::Parser<GutterCallbacks> =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new());
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::baseline());
         for p in &payloads {
             reference.process(p);
         }
@@ -5163,7 +5172,7 @@ mod resize {
         // Reference: a fresh parser at the new size fed only the post-resize
         // stream (the clear wipes the transient, so the settled grids match).
         let mut reference: vt100::Parser<GutterCallbacks> =
-            vt100::Parser::new_with_callbacks(24, w, 0, GutterCallbacks::new());
+            vt100::Parser::new_with_callbacks(24, w, 0, GutterCallbacks::baseline());
         reference.process(new_bytes);
 
         assert_eq!(r.parser.screen().size(), (24, w), "COLUMNS == W after settle");

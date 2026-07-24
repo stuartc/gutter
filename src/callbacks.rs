@@ -2,16 +2,17 @@
 //! place gutter hooks the parser.
 //!
 //! Independent concerns live here and must not reach into each other:
-//! `unhandled_csi` touches only `cursor_shape`/`replies`, `copy_to_clipboard`
-//! only `clipboard_out`. Callbacks fire inside `parser.process()` on the render
-//! thread, the only thread that touches the parser, so the OSC-52 write runs
-//! inline on that thread. See ADR-004, ADR-009.
+//! `unhandled_csi` touches only `cursor_shape`/`key_modes`/`replies`,
+//! `copy_to_clipboard` only `clipboard_out`. Callbacks fire inside
+//! `parser.process()` on the render thread, the only thread that touches the
+//! parser, so the OSC-52 write runs inline on that thread. See ADR-004, ADR-009.
 
 use std::fmt;
 use std::io::{self, Write};
 
 use crate::clipboard::forward_osc52;
 use crate::cursor::{is_decscusr, CursorShape};
+use crate::relay::KeyModeRelay;
 
 /// The fixed DA1 identity gutter answers `CSI c` with (VT100 with Advanced Video
 /// Option). The exact identity doesn't matter — a child gating on the DA1
@@ -20,8 +21,9 @@ const DA1_REPLY: &[u8] = b"\x1b[?1;2c";
 
 /// The single callbacks struct the parser owns.
 ///
-/// Carries independent concerns — the cursor shape, the clipboard sink, and
-/// buffered device-query replies — side by side; no method reads another's field.
+/// Carries independent concerns — the cursor shape, the clipboard sink, the
+/// keyboard-mode relay and buffered device-query replies — side by side; no method
+/// reads another's field.
 pub struct GutterCallbacks {
     /// The child's requested cursor shape (DECSCUSR / `CSI Ps SP q`) — driven by
     /// the same `unhandled_csi` watcher (vt100 surfaces DECSCUSR as an unhandled
@@ -39,25 +41,40 @@ pub struct GutterCallbacks {
     /// loop drains this to the PTY master (the one writer it owns) right after
     /// `parser.process()`, so no reply leaves callbacks.
     replies: Vec<u8>,
+    /// The keyboard-mode relay (ADR-021), on the live parser only. The
+    /// diff-baseline parsers are rebuilt from the live grid every frame and would
+    /// relay the same request again each time, so they carry `None`.
+    key_modes: Option<KeyModeRelay>,
+    /// Mode requests matched for relaying, buffered exactly as `replies` is: the
+    /// callback owns no terminal handle, so the render loop drains this to the
+    /// outer terminal right after `parser.process()`.
+    relay_out: Vec<u8>,
 }
 
 impl GutterCallbacks {
-    /// Builds the callbacks with a discarding clipboard sink — what the
-    /// diff-baseline parsers use: they replay formatted content and never carry
-    /// the live clipboard fd. The live parser injects a real sink via
-    /// [`Self::with_clipboard`].
-    pub fn new() -> Self {
-        Self::with_clipboard(Box::new(io::sink()))
-    }
-
-    /// Builds the callbacks with a specific clipboard sink injected. Production
-    /// passes the real `/dev/tty` handle; the OSC-52 dispatch and end-to-end
-    /// tests pass a recording buffer.
-    pub fn with_clipboard(clipboard_out: Box<dyn Write + Send>) -> Self {
+    /// The live parser's callbacks: a real clipboard sink and a relay. Production
+    /// passes the `/dev/tty` handle; the OSC-52 dispatch and end-to-end tests pass a
+    /// recording buffer.
+    pub fn live(clipboard_out: Box<dyn Write + Send>) -> Self {
         Self {
             cursor_shape: CursorShape::new(),
             clipboard_out,
             replies: Vec::new(),
+            key_modes: Some(KeyModeRelay::new()),
+            relay_out: Vec::new(),
+        }
+    }
+
+    /// The diff-baseline parsers' callbacks: a discarding clipboard sink and no
+    /// relay. They replay formatted content, never carry the live clipboard fd, and
+    /// must never speak to the outer terminal.
+    pub fn baseline() -> Self {
+        Self {
+            cursor_shape: CursorShape::new(),
+            clipboard_out: Box::new(io::sink()),
+            replies: Vec::new(),
+            key_modes: None,
+            relay_out: Vec::new(),
         }
     }
 
@@ -68,11 +85,25 @@ impl GutterCallbacks {
     pub fn drain_replies(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.replies)
     }
+
+    /// Takes the mode requests matched for relaying since the last drain. Drained in
+    /// the same arm as [`Self::drain_replies`] and written to the outer terminal
+    /// first, so a proxied query gets the longest possible head start on its round
+    /// trip. Empty when the child negotiated nothing this frame.
+    pub fn drain_relay(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.relay_out)
+    }
+
+    /// The relay's record of what the child asked the outer terminal for, read by
+    /// teardown and the suspend cycle. `None` on a baseline parser.
+    pub fn key_modes(&self) -> Option<&KeyModeRelay> {
+        self.key_modes.as_ref()
+    }
 }
 
 impl Default for GutterCallbacks {
     fn default() -> Self {
-        Self::new()
+        Self::baseline()
     }
 }
 
@@ -112,23 +143,27 @@ impl fmt::Debug for GutterCallbacks {
         // The clipboard sink is a `dyn Write` (no `Debug`); elide it.
         f.debug_struct("GutterCallbacks")
             .field("cursor_shape", &self.cursor_shape)
+            .field("key_modes", &self.key_modes)
             .finish_non_exhaustive()
     }
 }
 
 impl vt100::Callbacks for GutterCallbacks {
-    /// vt100's catch-all for CSI sequences it doesn't implement. Two of those
-    /// matter to gutter: DECSCUSR cursor-shape requests and DA1/DSR device
-    /// queries. Each routes to its own field; the clipboard is untouched here.
+    /// vt100's catch-all for CSI sequences it doesn't implement. Three of those
+    /// matter to gutter: DECSCUSR cursor-shape requests, keyboard-mode requests to
+    /// relay outward, and DA1/DSR device queries to answer inward. Each routes to
+    /// its own field; the clipboard is untouched here.
     ///
-    /// The kitty keyboard family is deliberately absent: gutter implements no
-    /// keyboard protocol, so the child's `CSI ? u` query gets silence — the
-    /// protocol's designed "I do not do this" (ADR-020).
+    /// gutter still implements no keyboard protocol (ADR-020) — the relay matches a
+    /// closed list of shapes and forwards canonical bytes for them, so the child and
+    /// the real terminal negotiate with each other (ADR-021). The child's `CSI ? u`
+    /// is passed out as a question rather than answered here; a terminal that does
+    /// not speak kitty stays silent, which is the protocol's "no".
     fn unhandled_csi(
         &mut self,
         screen: &mut vt100::Screen,
         i1: Option<u8>,
-        _i2: Option<u8>,
+        i2: Option<u8>,
         params: &[&[u16]],
         c: char,
     ) {
@@ -136,7 +171,17 @@ impl vt100::Callbacks for GutterCallbacks {
             // vt100 doesn't implement DECSCUSR, so it lands here with the SP
             // intermediate in `i1`. Record the shape for the render loop to mirror.
             self.cursor_shape.apply_csi(params);
-        } else if let Some(reply) = device_query_reply(i1, params, c, screen) {
+            return;
+        }
+        if let Some(bytes) = self
+            .key_modes
+            .as_mut()
+            .and_then(|relay| relay.observe(i1, i2, params, c))
+        {
+            self.relay_out.extend_from_slice(&bytes);
+            return;
+        }
+        if let Some(reply) = device_query_reply(i1, params, c, screen) {
             // gutter answers device queries itself; buffer the reply for the
             // render loop to drain to the PTY master.
             self.replies.extend_from_slice(&reply);
@@ -165,7 +210,7 @@ mod tests {
     #[test]
     fn decscusr_tracked_through_parser() {
         let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new());
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::baseline());
 
         // Child requests a steady bar cursor (CSI 6 SP q).
         parser.process(b"\x1b[6 q");
@@ -191,7 +236,7 @@ mod tests {
     #[test]
     fn da1_query_buffers_fixed_identity() {
         let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new());
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::baseline());
 
         parser.process(b"\x1b[c");
         assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[?1;2c");
@@ -209,7 +254,7 @@ mod tests {
     #[test]
     fn dsr_status_buffers_ok() {
         let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new());
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::baseline());
         parser.process(b"\x1b[5n");
         assert_eq!(parser.callbacks_mut().drain_replies(), b"\x1b[0n");
     }
@@ -222,7 +267,7 @@ mod tests {
     #[test]
     fn cursor_position_reply_uses_w_grid_coords() {
         let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new());
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::baseline());
 
         // Move the cursor to row 3, col 7 (1-based), then query.
         parser.process(b"\x1b[3;7H\x1b[6n");
@@ -245,7 +290,7 @@ mod tests {
     #[test]
     fn kitty_query_gets_no_reply() {
         let mut parser =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new());
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::baseline());
 
         parser.process(b"\x1b[?u");
         assert!(parser.callbacks_mut().drain_replies().is_empty());
@@ -385,7 +430,7 @@ mod tests {
             24,
             80,
             0,
-            GutterCallbacks::with_clipboard(Box::new(sink)),
+            GutterCallbacks::live(Box::new(sink)),
         );
 
         parser.process(b"\x1b]52;c;aGVsbG8=\x07");
