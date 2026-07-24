@@ -39,22 +39,24 @@ Integration tests drive a **real PTY** via `expectrl` and assert on what the out
 
 ## Architecture
 
-**Five threads, one merged unbounded channel (`std::sync::mpsc`), no async.** Messages are a single enum (`src/msg.rs`): `Pty(Vec<u8>)`, `Input(Vec<u8>)`, `Resize`, `ChildExited(ExitStatus)`.
+**Five threads, one merged unbounded channel (`std::sync::mpsc`), no async.** Messages are a single enum (`src/msg.rs`): `Pty(Vec<u8>)`, `Input(Vec<u8>)`, `Resize` (payload-free), `ChildExited(ExitStatus)`, `ChildStopped`, `ChildContinued`, `PtyEof`.
 
 - **Thread 1 — PTY reader (`src/pty.rs`):** dumb byte pump. Reads the child's output in bounded chunks through a backpressure seam (`sync_channel(STAGING_DEPTH=64)`), forwards as `Msg::Pty`. Never writes the PTY, never scans bytes, stops on EOF.
-- **Thread 2 — render loop (`src/render.rs`):** owns the `vt100::Parser`, the outer terminal handle, and the PTY master writer — **exclusively, no mutex**. It is the only thread that writes output. Dispatches every message; runs the coalescing loop (see *Invariants to respect*).
-- **Thread 3 — input reader (`src/input.rs`):** owns the outer tty read fd exclusively. A dumb `read()` pump: it forwards raw chunks as `Msg::Input(Vec<u8>)` and interprets nothing — the scanner lives on Thread 2 (ADR-020). Detached at spawn (`read()` is un-interruptible), reaped by `process::exit`.
+- **Thread 2 — render loop (`src/render.rs`):** owns the `vt100::Parser`, the outer terminal handle, the PTY master writer and the input scanner (`src/scan.rs`) — **exclusively, no mutex**. The scanner sits here because the ESC-hold deadline runs on the loop's own injected clock and the token walk feeds the chord and resize-mode state the loop already owns. It is the only thread that writes output. Dispatches every message; runs the coalescing loop (see *Invariants to respect*).
+- **Thread 3 — input reader (`src/input.rs`):** owns the outer tty read fd exclusively — two readers on one fd steal bytes from each other. A dumb `read()` pump: it forwards raw chunks as `Msg::Input(Vec<u8>)` and interprets nothing — the scanner lives on Thread 2 (ADR-020). Detached at spawn (`read()` is un-interruptible), reaped by `process::exit`.
 - **Thread 4 — waiter (`src/waiter.rs`):** on unix, loops on raw `waitpid(pid, …, WUNTRACED|WCONTINUED)`, surviving the child's stop/continue events and only ending the thread on real death. This — not PTY EOF — is the authoritative shutdown trigger; it sends `Msg::ChildExited` on death, and `Msg::ChildStopped`/`Msg::ChildContinued` on stop/continue (see *Invariants to respect*).
 - **Thread 5 — SIGWINCH (`src/sigwinch.rs`):** signal-hook's iterator turns each `SIGWINCH` into a payload-free `Msg::Resize`; Thread 2 reads the real size when it handles it.
 
-**Channel topology:** the PTY path is throttled upstream (bounded `sync_channel`) but the merged channel is unbounded, so a keystroke `send()` never blocks under a multi-MB PTY flood. Because Thread 2 alone owns the parser, there is no shared mutable state and no parser mutex.
+**Channel topology:** four sources feed the one channel — the PTY reader, the input reader, the waiter and the SIGWINCH thread. The PTY path is throttled upstream (bounded `sync_channel`) but the merged channel is unbounded, so a keystroke `send()` never blocks under a multi-MB PTY flood. Because Thread 2 alone owns the parser, there is no shared mutable state and no parser mutex.
 
 **Data flow (output):** child PTY → Thread 1 bounded staging → merged channel → Thread 2 `parser.process()` → `W`-column vt100 grid → `rows_diff` per-row byte runs → Thread 2 emits `MoveTo(left_margin, row)` + row bytes → outer terminal.
 
-**Data flow (input):** outer tty → Thread 3 `read()` → merged channel → Thread 2 `Scanner::feed` → tokens → `write_all` to the PTY master, except mouse reports (translated by the gate) and the reserved chord / in-mode resize keys (consumed).
+**Data flow (input):** outer tty → Thread 3 `read()` → merged channel → Thread 2 `Scanner::feed` → tokens → `write_all` to the PTY master, except mouse reports (translated by the gate) and the reserved chord / in-mode resize keys (consumed). Between bracketed-paste guards nothing is extracted at all.
+
+**Data flow (mode negotiation):** the child's keyboard-mode requests reach `unhandled_csi` → matched against the relay's allowlist (`src/relay.rs`) → emitted outward as canonical bytes; the three modes vt100 absorbs instead reach the outer terminal through `src/modes.rs`'s per-frame poll-diff. The terminal's reply comes back on the input fd and reaches the child by ordinary passthrough.
 
 **Render model.** Thread 2 holds three parsers (`src/render.rs`):
-- `parser` — live, carries callbacks (cursor-shape watcher, OSC-52 clipboard sink).
+- `parser` — live, carries callbacks (cursor-shape watcher, OSC-52 clipboard sink, device-query replies, keyboard-mode relay).
 - `prev` — diff baseline, no callbacks; `rows_diff(prev, 0, W)` yields the per-row byte runs to repaint.
 - `scroll_tracker` — a band-sized mirror with bounded scrollback (4096), fed the same bytes, used to count lines that scrolled off the top so they reach the real terminal's scrollback.
 
@@ -70,9 +72,13 @@ Most files map one-to-one onto a concern; the non-obvious split:
 | `src/cli.rs` | Hand-rolled arg parse (no clap). `--width N\|Npct\|N%`, `--center`/`--left`. |
 | `src/geometry.rs` | Pure layout maths: `margin()`, `resolve_width()` (absolute vs proportional), `physical_col()`. No I/O; property-tested. |
 | `src/terminal.rs` | `OuterTerminal` trait abstracting every outer side effect; crossterm impl + a recording mock for restore-order / column assertions. |
-| `src/callbacks.rs` | `vt100::Callbacks` impl holding the DECSCUSR cursor-shape watcher, the device-query replies and the OSC-52 hook. |
-| `src/scan.rs` | The input scanner: raw bytes → tokens (forwarded runs, whole escape sequences, SGR-1006 mouse reports, paste spans) plus the `ESC_HOLD` constant. Pure. |
+| `src/callbacks.rs` | `vt100::Callbacks` impl holding the DECSCUSR cursor-shape watcher, the device-query replies, the keyboard-mode relay hook and the OSC-52 hook. |
+| `src/input.rs` | Thread 3 — the dumb outer-tty read pump. Owns the read fd, interprets nothing. |
+| `src/scan.rs` | The input scanner, on the render thread: raw bytes → tokens (forwarded runs, whole escape sequences, SGR-1006 mouse reports, paste spans) plus the `ESC_HOLD` constant. Pure — no I/O, no clock, no terminal. Everything it does not extract is forwarded verbatim. |
+| `src/sigwinch.rs` | signal-hook's `SIGWINCH` → `Msg::Resize`. |
 | `src/chord.rs` | The reserved `--resize-key` chord and the byte forms it matches. |
+| `src/relay.rs` | The child's keyboard-mode relay and its undo log: a closed allowlist of sequences forwarded outward as canonical bytes. |
+| `src/modes.rs` | The three modes vt100 absorbs into screen state (DECCKM, application keypad, bracketed paste), mirrored onto the outer terminal by poll-diff. |
 | `src/mouse.rs` | Pure forwarding gate: live `(mode, encoding)` in, translated/down-filtered SGR-1006 out. |
 | `src/clipboard.rs` | OSC-52 wire reconstruction → separate `/dev/tty` (so clipboard write and frame repaint don't fight over fd state). |
 | `src/cursor.rs` | DECSCUSR cursor-shape mirroring to the outer terminal. |
@@ -87,10 +93,13 @@ the one-liners below are the quick reference.
 - **Coalescing loop.** Fixed-deadline ~60fps coalescer; the explicit `now >= deadline` burst-exit check is mandatory. See [ADR-007](docs/adr/0007-coalescing-loop.md).
 - **Resize order (on the render thread).** Recompute `W` → `resizer.resize(W, rows)` (TIOCSWINSZ first) → `parser.set_size(rows, W)` (mind the `(rows, cols)` order) → recompute margin → baseline reset. See [ADR-008](docs/adr/0008-resize-ordering.md).
 - **Teardown is explicit and ordered.** No destructors after `process::exit`; restore by hand, each step conditional on what was set up. See [ADR-010](docs/adr/0010-ordered-teardown.md).
-- **Keyboard is never re-encoded.** Raw bytes in, raw bytes out; the scanner extracts only mouse reports, the reserved chord and the in-mode resize keys, and holds an incomplete sequence for `ESC_HOLD` before flushing it verbatim. See [ADR-020](docs/adr/0020-raw-input-passthrough.md), which supersedes ADR-002.
-- **Mouse: eager capture.** One enable at startup, one disable at teardown; a per-frame poll-diff gate translates and re-encodes SGR-1006. See [ADR-005](docs/adr/0005-mouse-eager-capture-poll-gate.md).
+- **Keyboard is never interpreted.** Bytes from the outer tty go to the child untouched, except SGR mouse reports (translated), the reserved chord, the in-mode resize keys and the paste guards. The child's mode requests are relayed out so the child and the terminal negotiate directly. See [ADR-020](docs/adr/0020-raw-input-passthrough.md) and [ADR-021](docs/adr/0021-child-driven-mode-relay.md).
+- **The ESC-hold flushes whole, never split.** An ambiguous `ESC` prefix is withheld until the sequence completes or the timeout fires; on timeout the entire pending buffer is flushed verbatim and in order. Splitting it leaks escape-sequence fragments into the child's prompt. Nothing overtakes the hold buffer. See [ADR-020](docs/adr/0020-raw-input-passthrough.md).
+- **Relayed bytes are canonical, never re-serialised from parameters.** vte cannot tell an omitted CSI parameter from an explicit `0`, so joining parameters back together turns the kitty query `CSI ? u` into `CSI ? 0 u` and a bare pop into a zero-level pop. Each matched shape emits a fixed string. See [ADR-021](docs/adr/0021-child-driven-mode-relay.md).
+- **No DECSET is ever relayed.** The three absorbed modes are mirrored by poll-diff; nothing else crosses. Modes with a display side effect, and modes ADR-005 or ADR-012 already own, are never touched. See [ADR-022](docs/adr/0022-absorbed-mode-mirroring.md).
+- **Mouse: eager capture.** One enable at startup, one disable at teardown, both written by gutter itself; a per-frame poll-diff gate translates and re-encodes the SGR-1006 reports the scanner extracts. See [ADR-005](docs/adr/0005-mouse-eager-capture-poll-gate.md).
 - **Width.** `--width N` is absolute, `--width Npct`/`N%` proportional; the child is always told it owns `W` columns. See [ADR-011](docs/adr/0011-width-resolution.md).
-- **Outer screen mirrors the child.** Mirror the child's alt-screen on its edges; the band anchors at `base_row` and flows inline on the primary screen. See [ADR-012](docs/adr/0012-screen-mode-mirroring.md) and [ADR-013](docs/adr/0013-inline-anchor-scroll-paint.md).
+- **Outer screen mirrors the child.** Mirror the child's alt-screen on its edges; the band anchors at `base_row` and flows inline on the primary screen. See [ADR-012](docs/adr/0012-screen-mode-mirroring.md), [ADR-013](docs/adr/0013-inline-anchor-scroll-paint.md) and [ADR-022](docs/adr/0022-absorbed-mode-mirroring.md).
 - **Child stop is detected via `waitpid(WUNTRACED)`, never a signal handler.** Raw mode strips `ISIG` on the outer tty and the child's SIGTSTP is scoped to its own session — gutter's process can never receive it directly. See [ADR-018](docs/adr/0018-stop-aware-waiter.md).
 - **Suspend/resume is straight-line code on the render thread.** Park the outer terminal (ADR-010 order) → `kill(0, SIGTSTP)` → the process freezes until `fg` → unpark (raw mode first) → continue the child's group. No SIGCONT handler. See [ADR-019](docs/adr/0019-suspend-resume-cycle-ordering.md).
 
@@ -105,7 +114,7 @@ The declared width a fixture is captured at **must** equal the `W` the gate repl
 
 ## Working conventions
 
-Work proceeds in thin **vertical slices**, each cutting through every layer it touches and leaving the binary runnable and green. Commits are prefixed with the slice number: `feat(04): …`, `test(06): … (A2)`, `docs(05): …`.
+Work proceeds in thin **vertical slices**, each cutting through every layer it touches and leaving the binary runnable and green. Commits carry an effort-scoped slice tag — `feat(kbd-1): …`, `test(kbd-3): …`, `docs(kbd-4): …` — where the word names the effort and the number the slice within it. (The first iteration used bare slice numbers, `feat(04): …`; those are still in the log.)
 
 ## Agent skills
 

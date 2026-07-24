@@ -119,7 +119,9 @@ A few things worth knowing:
 ## What passes through
 
 - **Keyboard**, byte for byte: whatever your terminal sends is what the child
-  receives, with only the reserved resize chord held back.
+  receives, with only the reserved resize chord held back. The child's protocol
+  requests go back out to your terminal, so the two negotiate directly and
+  whatever your terminal supports is what the child gets.
 - **Mouse**, with coordinates translated into the band.
 - **Clipboard**, via OSC 52.
 - **Resizes** — the child is told its new size, and proportional widths
