@@ -68,7 +68,7 @@ Most files map one-to-one onto a concern; the non-obvious split:
 
 | File | Responsibility |
 |------|----------------|
-| `src/main.rs` | Orchestration: spawn PTY, hand-rolled startup CPR probe, eager mouse capture, open `/dev/tty` clipboard sink, start threads, run Thread 2. |
+| `src/main.rs` | Orchestration: spawn PTY, read the startup CPR anchor by hand, eager mouse capture, open `/dev/tty` clipboard sink, start threads, run Thread 2. |
 | `src/cli.rs` | Hand-rolled arg parse (no clap). `--width N\|Npct\|N%`, `--center`/`--left`. |
 | `src/geometry.rs` | Pure layout maths: `margin()`, `resolve_width()` (absolute vs proportional), `physical_col()`. No I/O; property-tested. |
 | `src/terminal.rs` | `OuterTerminal` trait abstracting every outer side effect; crossterm impl + a recording mock for restore-order / column assertions. |

@@ -1,6 +1,6 @@
 //! Thread 5 — terminal resize. `SIGWINCH` is delivered to gutter's process
-//! group; with crossterm out of the input path (ADR-020) nothing else installs a
-//! handler, so gutter registers its own through `signal-hook`.
+//! group and nothing else in the binary installs a handler for it, so gutter
+//! registers its own through `signal-hook` (ADR-020).
 //!
 //! The message carries no payload. The render thread queries the real size
 //! itself when it handles it, so two rapid resizes that coalesce into one signal

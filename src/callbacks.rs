@@ -335,8 +335,8 @@ mod tests {
         );
     }
 
-    /// xterm's modifyOtherKeys — the sequence gutter used to drop on the floor, and
-    /// the reason Shift+Enter reached the child as a plain `\r`.
+    /// xterm's modifyOtherKeys — the request that makes a terminal report Shift+Enter
+    /// as something other than a plain `\r`, and the reason the relay exists.
     #[test]
     fn modify_other_keys_is_relayed_verbatim() {
         let mut parser = live_parser();

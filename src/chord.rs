@@ -1,17 +1,15 @@
 //! The reserved `--resize-key` chord and the byte forms it matches.
 //!
 //! gutter reserves exactly one chord from the child (PRD 0001, Feature 2);
-//! everything else is only interpreted while resize mode is active. Under raw
-//! passthrough (ADR-020) there is no decoded key event to compare against, so a
-//! chord is a base key plus a modifier mask that knows how to render itself as
-//! the byte forms a terminal can send it in.
+//! everything else is only interpreted while resize mode is active. The input
+//! path is raw bytes (ADR-020), so a chord is a base key plus a modifier mask
+//! that knows how to render itself as the byte forms a terminal can send it in.
 //!
 //! One physical key has several encodings depending on what the child has asked
-//! the terminal for: the legacy control byte, kitty's `CSI <code> ; <mods> u`,
-//! and xterm's modifyOtherKeys `CSI 27 ; <mods> ; <code> ~`. All three are
-//! matched. Only the legacy form is reachable in this slice — gutter pushes no
-//! keyboard mode of its own — but the others become live as soon as the child's
-//! negotiation is relayed outward.
+//! the terminal for (ADR-021): the legacy control byte, kitty's
+//! `CSI <code> ; <mods> u`, and xterm's modifyOtherKeys
+//! `CSI 27 ; <mods> ; <code> ~`. All three are matched; only the press forms,
+//! because a release must not toggle the mode back out (ADR-016).
 
 /// Modifier bits, kitty's convention: the wire parameter is `1 + mask`.
 const SHIFT: u8 = 1;

@@ -192,8 +192,8 @@ fn run() -> i32 {
         eprintln!("gutter: /dev/tty unavailable, keyboard input is disabled");
     }
 
-    // Thread 5: SIGWINCH → Msg::Resize. Detached like Thread 3; crossterm no longer
-    // installs a handler, so this is the only resize source (ADR-020).
+    // Thread 5: SIGWINCH → Msg::Resize. Detached like Thread 3, and the only
+    // resize source there is (ADR-020).
     thread::spawn(move || sigwinch::run(merged_tx));
 
     // Eager outer mouse capture (ADR-005): enable ONCE here, before the alt

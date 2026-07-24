@@ -3387,8 +3387,8 @@ line two\r\n\
             .is_empty());
         }
 
-        /// This slice ships no relay path for private modes at all, so the assertion is
-        /// the strongest available form: no DECSET is ever forwarded, whether vt100
+        /// There is no relay path for private modes at all, so the assertion takes the
+        /// strongest available form: no DECSET is ever forwarded, whether vt100
         /// implements it or drops it through `unhandled_csi`.
         #[test]
         fn no_decset_is_relayed() {

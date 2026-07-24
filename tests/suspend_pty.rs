@@ -110,9 +110,9 @@ fn wait_exit(session: &OsSession, timeout: Duration) -> Option<i32> {
     }
 }
 
-// The tail of crossterm's `DisableMouseCapture` and the cursor-show — both part
-// of the park restore (and again at final teardown). Finding them BEFORE the
-// resume marker is what distinguishes a real park from ordinary teardown.
+// The head of gutter's mouse disable and the cursor-show — both part of the park
+// restore (and again at final teardown). Finding them BEFORE the resume marker is
+// what distinguishes a real park from ordinary teardown.
 const MOUSE_OFF: &[u8] = b"\x1b[?1000l";
 const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 const MOUSE_ON: &[u8] = b"\x1b[?1000h";

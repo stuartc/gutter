@@ -633,8 +633,9 @@ mod tests {
         );
     }
 
-    /// The dead keys this slice brings back: each must scan as one forwarded
-    /// unit, never a mouse report and never anything gutter consumes.
+    /// The navigation and function keys: each must scan as one forwarded unit,
+    /// never a mouse report and never anything gutter consumes. A failure here is
+    /// a key that reaches the child as nothing at all.
     #[test]
     fn the_silently_dead_keys_scan_as_plain_sequences() {
         for seq in [

@@ -136,10 +136,10 @@ fn a_mouse_mode_never_reaches_the_outer_terminal() {
     );
 }
 
-/// **The no-relay negative, end to end.** This slice ships no forwarding path for
-/// private modes, so a DECSET vt100 does not implement is dropped rather than
-/// forwarded — and `?1047` in particular would take the outer alt screen away from
-/// the mirror that owns it (ADR-012).
+/// **The no-relay negative, end to end.** There is no forwarding path for private
+/// modes, so a DECSET vt100 does not implement is dropped rather than forwarded —
+/// and `?1047` in particular would take the outer alt screen away from the mirror
+/// that owns it (ADR-012).
 #[test]
 fn an_unimplemented_decset_is_not_relayed() {
     let _g = pty_guard();

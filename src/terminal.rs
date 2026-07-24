@@ -32,9 +32,9 @@ pub trait OuterTerminal {
     /// child enters it.
     fn enter_alt_screen(&mut self) -> io::Result<()>;
     /// The outer terminal's current size as `(cols, rows)`. Read on resume to catch
-    /// a resize that happened while gutter was suspended (ADR-0019): crossterm's
-    /// pending SIGWINCH can coalesce a resize-and-back to a stale event, so the
-    /// cycle queries the real size explicitly.
+    /// a resize that happened while gutter was suspended (ADR-0019): a pending
+    /// SIGWINCH can coalesce a resize-and-back to a stale event, so the cycle
+    /// queries the real size explicitly.
     fn terminal_size(&mut self) -> io::Result<(u16, u16)>;
 
     // --- Render output (per frame) ---

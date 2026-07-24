@@ -226,7 +226,7 @@ const PASTE_ECHO_CHILD: &str =
 
 /// **A pasted chord byte is text.** Under the guards nothing is interpreted, so the
 /// `0x1C` that would otherwise open resize mode mid-paste reaches the child like any
-/// other pasted byte — the live misbehaviour this slice removes.
+/// other pasted byte.
 #[test]
 fn a_pasted_chord_byte_reaches_the_child() {
     let text = echo_transcript(PASTE_ECHO_CHILD, b"\x1b[200~abc\x1cdef\x1b[201~");
