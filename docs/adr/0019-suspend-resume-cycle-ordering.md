@@ -35,10 +35,11 @@ thread's process, not the group a shell's job control watches.
 
 **Restore before self-stop.** The shell that gets the terminal back after `[1]+
 Stopped` must inherit a sane state: cooked mode, cursor shown and default-shaped,
-mouse off, kitty popped, alt screen left (or an inline hand-back newline emitted).
-`park()` runs this in ADR-010's order — leave-alt-or-hand-back, reset attributes,
-default cursor shape, pop kitty, disable mouse, show cursor, disable raw mode
-**last** — then flushes, so every byte lands before `suspend_self()` freezes the
+mouse off, the child's keyboard modes undone, alt screen left (or an inline
+hand-back newline emitted). `park()` runs this in ADR-010's order —
+leave-alt-or-hand-back, reset attributes, default cursor shape, reset the relayed
+keyboard modes, disable mouse, show cursor, disable raw mode **last** — then
+flushes, so every byte lands before `suspend_self()` freezes the
 process. This is the entire point of the fix: today's bug is exactly *not* doing
 this.
 
@@ -52,9 +53,13 @@ input.
 already owns and never releases during suspend (it freezes with the process but
 never joins or restarts), so the reply would be eaten silently. There is no
 keyboard capability to re-probe either — gutter asks the outer terminal for no
-keyboard mode of its own (ADR-020) — so `unpark()` re-takes raw mode, mouse and
-the alt screen and nothing else. The inline anchor is not re-queried at all:
-**`base_row` is reseeded to the bottom
+keyboard mode of its own (ADR-020). What `unpark()` does re-assert is what the
+*child* asked for, replayed from the relay's log (ADR-021), oldest first and
+before mouse: a set mutates whichever level was on top when it was issued, so the
+order is load-bearing. `park` deliberately leaves that log alone — it is a park,
+not a teardown, and the same double-meaning trap as `outer_alt_active` applies.
+Beyond raw mode, the replay, mouse and the alt screen, nothing else is re-taken.
+The inline anchor is not re-queried at all: **`base_row` is reseeded to the bottom
 (`rows.saturating_sub(1)`)** for primary-screen (non-alt) children, on the
 assumption that the shell scrolled the screen while gutter slept, making the old
 `base_row` meaningless. `render_once`'s make-room scroll then re-lays the band at
@@ -73,9 +78,9 @@ again a moment later.
 
 **`continue_child` last.** `suspender.continue_child()` — `kill(-child_pgid,
 SIGCONT)`, `ESRCH` ignored (the child may have died while gutter was stopped) —
-only runs after the outer terminal is fully raw, kitty-pushed, mouse-enabled and
-alt-screen-correct. The child's post-continue repaint bytes must never race an
-un-raw or wrong-mode terminal.
+only runs after the outer terminal is fully raw, keyboard-modes-replayed,
+mouse-enabled and alt-screen-correct. The child's post-continue repaint bytes must
+never race an un-raw or wrong-mode terminal.
 
 **`outer_alt_active`'s double meaning.** During park, the flag is *not* cleared
 after `leave_alt_screen()` — it deliberately keeps meaning "the child's screen is
@@ -114,9 +119,9 @@ confirm against both `zsh` and `bash`.
    any) fires here, keeping `outer_alt_active` truthful for park.
 3. **Park** (`park()`).
 4. **`suspender.suspend_self()`** — the process stops here until `fg`.
-5. **Unpark** (`unpark()`) — raw mode first, then kitty/mouse/alt, cursor shape
-   `rearm()`ed for the next repaint (park reset the outer cursor to default,
-   staling the cursor-shape watcher's dedup state).
+5. **Unpark** (`unpark()`) — raw mode first, then the mode replay, mouse and alt,
+   cursor shape `rearm()`ed for the next repaint (park reset the outer cursor to
+   default, staling the cursor-shape watcher's dedup state).
 6. **Inline anchor reseed** — `base_row` reset to the bottom for primary-screen
    children, seeded from the post-resize row count read via `term.terminal_size()`.
 7. **Missed-resize catch-up** — `term.terminal_size()` vs. the parser's current
@@ -148,7 +153,8 @@ no guard against a double call was needed.
 - A `Suspender` trait (`src/suspend.rs`) makes the two syscalls injectable —
   `RealSuspender` in production, a recording `MockSuspender` in tests that shares an
   ordered call log with `MockTerminal` so park/self-stop/unpark/continue-child
-  interleaving is asserted as one sequence.
+  interleaving is asserted as one sequence. The filter that log is read through has
+  to admit `Call::Relay`, or the two mode steps are invisible to the assertion.
 - `Flow::Suspend` is ignored inside `drain_pty_path` (the shutdown drain never
   recurses into a fresh suspend).
 - On resume, `continue 'frames` in `run`'s loop ensures the next coalescing frame
@@ -165,6 +171,7 @@ no guard against a double call was needed.
 
 - `src/render.rs` — `suspend_cycle`, `park`, `unpark`, `retry_enable_raw`,
   `SuspendOutcome`, `Flow::Suspend`
+- `src/relay.rs` — the mode log park resets and unpark replays
 - `src/suspend.rs` — the `Suspender` trait, `RealSuspender`, `MockSuspender`
 - `src/cursor.rs` — the cursor-shape watcher's `rearm()`
 - `src/terminal.rs` — `OuterTerminal::terminal_size()`

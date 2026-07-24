@@ -1,6 +1,6 @@
 # ADR-003: Two independent kitty states
 
-Status: Accepted
+Status: Superseded by [ADR-021](0021-child-driven-mode-relay.md)
 
 ## Context
 
@@ -35,9 +35,9 @@ touches only `kitty_state`, never the clipboard.
 
 ---
 
-**Amended by [ADR-020](0020-raw-input-passthrough.md).** Both states are gone.
-gutter no longer probes the outer terminal's capability, no longer pushes flags
-of its own, and no longer tracks or clamps the child's level — under raw
-passthrough there is nothing to encode at, so there is nothing to know. What
-remains of this record is the reasoning for why the two sides were ever
-independent, which is still the right frame for the relay that replaces them.
+Superseded by [ADR-021](0021-child-driven-mode-relay.md). gutter no longer holds
+a kitty state of its own on either side: the outer terminal's capability is never
+probed, and the child's requests are relayed out rather than clamped. In place of
+the two clamped states there is one byte log of what the child asked for, so
+teardown can undo exactly that and nothing more. Everything above is kept for the
+record; none of it describes current behaviour.

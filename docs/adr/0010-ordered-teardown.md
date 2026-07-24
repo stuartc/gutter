@@ -20,9 +20,10 @@ actually set up.
 - All cleanup is in one teardown path; nothing relies on `Drop`.
 - The alt-leave only fires if the child exited in the alt screen. A plain command's
   output is left on the primary screen.
-- gutter never resets a mode it did not set. Under raw passthrough (ADR-020) it
-  sets no keyboard mode of its own at all, so that slot is currently empty; the
-  rule is what keeps it honest when the child's own requests start being relayed.
+- gutter never resets a mode it did not set. It sets no keyboard mode of its own
+  (ADR-020), so what that slot undoes is what the child asked the terminal for
+  (ADR-021): the kitty stack pops back to the depth the child opened and
+  `CSI > 4 ; 0 m` turns modifyOtherKeys off, both only if gutter relayed them.
 - Disabling mouse, showing the cursor, and disabling raw mode are always safe to
   call unconditionally.
 
