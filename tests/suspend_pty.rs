@@ -214,8 +214,8 @@ fn child_sigkilled_across_suspend_exits_137() {
 }
 
 /// **Input liveness after resume.** After the park/resume cycle, a keystroke
-/// typed into gutter must still reach the child — proving the input path (and
-/// crossterm's event source on Thread 3) is live post-resume. The child stops,
+/// typed into gutter must still reach the child — proving the input path (Thread
+/// 3's read pump and the render thread's scanner) is live post-resume. The child stops,
 /// then (once resumed) `read`s a line; we send one and expect the child to echo
 /// it back through gutter.
 #[test]

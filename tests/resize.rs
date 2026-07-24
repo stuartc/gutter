@@ -10,7 +10,8 @@
 //! - **Outer size** is set by `sh -c 'stty cols C rows R; exec gutter ...'` so
 //!   gutter reads the intended size at startup with no race. For the resize
 //!   tests the outer PTY is then resized live via `set_window_size`, which sends
-//!   SIGWINCH to gutter's process group (crossterm surfaces it as `Event::Resize`).
+//!   SIGWINCH to gutter's process group; gutter's own signal thread turns that
+//!   into a `Msg::Resize` (ADR-020).
 //! - **Capture the LIVE alt-screen frame**, not the post-exit primary screen
 //!   (leaving the alt screen on exit discards its content) — so the wrapped
 //!   children stay alive (a long `sleep`) and the harness drains a bounded window
