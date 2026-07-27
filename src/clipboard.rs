@@ -1,5 +1,5 @@
-//! OSC-52 clipboard write: reconstruct the wire sequence and send it to a
-//! separate `/dev/tty`. See ADR-004.
+//! OSC-52 clipboard write: reconstruct the wire sequence and send it through a
+//! separate open of the terminal gutter resolved. See ADR-004.
 //!
 //! gutter does NOT scan bytes for OSC 52. vt100 owns the full OSC
 //! termination/abort rule set and hands us the already-reassembled `ty` and
@@ -57,7 +57,7 @@ pub fn reconstruct_osc52(ty: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// Writes the reconstructed OSC 52 to `out` and flushes.
 ///
-/// `out` is `&mut impl Write` so production injects the real `/dev/tty` and
+/// `out` is `&mut impl Write` so production injects the real terminal handle and
 /// tests inject a buffer. Returns the `io::Result` so the caller can log it: a
 /// failed clipboard write must not unwind out of `parser.process()` and desync
 /// the parser.

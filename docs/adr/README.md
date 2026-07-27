@@ -8,7 +8,7 @@ The decisions behind gutter's design. Code comments reference these by number
 | [001](0001-two-emulator-equivalence-gate.md) | Two-emulator equivalence gate |
 | [002](0002-keyboard-always-re-encoded.md) | Keyboard always re-encoded — superseded by [020](0020-raw-input-passthrough.md) |
 | [003](0003-two-independent-kitty-states.md) | Two independent kitty states — superseded by [021](0021-child-driven-mode-relay.md) |
-| [004](0004-osc52-clipboard-separate-tty.md) | OSC-52 clipboard to a separate `/dev/tty` |
+| [004](0004-osc52-clipboard-separate-tty.md) | OSC-52 clipboard on its own open of the terminal |
 | [005](0005-mouse-eager-capture-poll-gate.md) | Mouse eager capture and poll-diff gate |
 | [006](0006-band-fit-margin-rule.md) | Band-fit margin rule |
 | [007](0007-coalescing-loop.md) | 60fps coalescing loop |

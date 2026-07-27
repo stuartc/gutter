@@ -11,9 +11,9 @@ after disabling raw mode and the terminal is left corrupted.
 ## Decision
 
 Restore explicitly, in order, before exiting: leave the alt screen (or hand back
-inline) → undo whatever input modes gutter set on the child's behalf → disable
-mouse → show cursor → disable raw mode. Each step is conditional on what was
-actually set up.
+inline) → drop the attribute run and the cursor shape → undo whatever input modes
+gutter set on the child's behalf → disable mouse → show cursor → disable raw mode.
+Each step is conditional on what was actually set up.
 
 ## Consequences
 
@@ -31,6 +31,13 @@ actually set up.
   never turned off, so a shell with its own paste protection keeps it.
 - Disabling mouse, showing the cursor, and disabling raw mode are always safe to
   call unconditionally.
+- The two resets before them undo what the child's output left on the outer terminal,
+  which is why they are on this list at all: `CSI 0 m` because the band's last painted
+  row leaves its own attributes live, and `CSI 0 SP q` because a DECSCUSR the child
+  emitted was mirrored outward. Without them the shell comes back tinted, or wearing
+  the child's cursor. The attribute reset is unconditional — gutter painted the band,
+  so there is always an attribute run to end. The cursor reset is not: a child that
+  never asked for a shape leaves the user's own untouched.
 
 ## Amendment — the order is fixed, the steps are best-effort
 
@@ -41,19 +48,24 @@ user's shell back in raw mode. The failure worth protecting against is exactly t
 that leaves the terminal unusable.
 
 So every restore step is attempted regardless of what an earlier one returned, and the
-first error is kept and returned for the caller to log. The order does not change and
-must not: it is what makes the restore correct when everything succeeds, which is every
-run but the pathological one. Only the error handling is different.
+first error is kept and returned. Nothing logs it: the exit path discards it, there being
+no terminal left worth printing on when the restore itself is failing. The return value is
+for the tests, which assert which step broke. The order does not change and must not: it
+is what makes the restore correct when everything succeeds, which is every run but the
+pathological one. Only the error handling is different.
 
 The park half of the suspend/resume cycle ([ADR-019](0019-suspend-resume-cycle-ordering.md))
 already worked this way — `disable_raw_mode` has to run before the self-stop or the shell
-gets a raw terminal — so the two paths now share one shape (`BestEffort` in
-`src/render.rs`) rather than disagreeing.
+gets a raw terminal — so the two paths share one shape (`BestEffort` in `src/render.rs`)
+and one step list: the attribute and cursor-shape resets park emitted are on the exit
+path too.
 
 The exit path leans on this for its bytes too: `show_cursor` flushes, so reaching it
 unconditionally is what lands the hand-back line and anything else the restore queued.
-Nothing writes to the sink after teardown returns, and `process::exit` runs no destructor
-that would land a straggler.
+Nothing writes to the sink after teardown returns. The `BufWriter` is a local of `run()`,
+so its drop-flush does still run before `main` reaches `process::exit` — but it swallows
+whatever it returns and lands the bytes after the restore has stopped being in charge of
+ordering, which is why the flush inside `show_cursor` is the one that counts.
 
 ## Code anchors
 

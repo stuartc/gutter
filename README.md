@@ -140,7 +140,8 @@ keyboard from. Like `tmux`, it needs one to run and it ignores where descriptor
 - Started without a controlling terminal but with one on its input — `setsid
   gutter claude`, or a launcher that hands over a pseudo-terminal without making
   it the controlling one — gutter names that terminal, reopens it, and paints
-  there.
+  there. Window resizes never reach a process in that position, so the band and
+  the child stay at the size they started at.
 - With no terminal at all — cron, CI, a pipeline — gutter prints
   `gutter: no controlling terminal: …` and exits 1 without starting the child.
 

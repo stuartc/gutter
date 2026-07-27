@@ -72,11 +72,12 @@ ran first would take the CPR reply, and the other would sit waiting for bytes al
 gone. Extra *write* handles to the same device raise no such question and are expected:
 the render sink and the clipboard sink are two of them, deliberately (ADR-004).
 
-**The sink is buffered, so the flush is correctness, not tidiness.** `io::Stdout`
-flushed itself as the process ended; a `BufWriter<File>` does not, and `process::exit`
-runs no destructors (ADR-010). The ordered restore's last byte-producing step,
-`show_cursor`, flushes, and teardown is best-effort per step so it is reached whatever
-else failed; `park` flushes before the self-stop (ADR-019).
+**The sink is buffered, so the flush is correctness, not tidiness.** A `BufWriter<File>`
+holds bytes until something asks it not to, and the restore path is the last thing that
+writes. The ordered restore's last byte-producing step, `show_cursor`, flushes,
+and teardown is best-effort per step so it is reached whatever else failed; `park`
+flushes before the self-stop (ADR-019). The sink's own drop-flush at the end of `run()`
+is a backstop that discards its result, not the mechanism (ADR-010).
 
 ### The precedent: tmux and screen
 
@@ -151,7 +152,16 @@ case above; it is left as tmux's behaviour, not gutter's.
   On the fallback route it is what answers, and it lands on the right terminal because
   the shape that gets there is a terminal on 0/1/2. A run that reaches the fallback with
   stdout redirected elsewhere gets `tput`, or the `80×24` default: the band paints
-  correctly and is sized for a terminal that may not be this one.
+  correctly and is sized for a terminal that may not be this one. Measured: `setsid`,
+  a 200×50 terminal on stdin, stdout to a file, `--width 40 --center` centres for 80
+  columns and gives the child 24 rows.
+- The fallback route also never sees a resize. `SIGWINCH` goes to the foreground process
+  group of the terminal's session, and a process that reached this route is by definition
+  in neither — so Thread 5 never fires, `handle_resize` never runs, and both the band and
+  the child's PTY stay at the size the launch resolved. A `--width Npct` band silently
+  stops tracking the window. This is the other half of the `O_NOCTTY` trade-off: on Linux,
+  dropping it would let gutter adopt a terminal no session owns and get the signal back,
+  at the cost of adopting terminals it should not.
 
 ### The one thing still not on the controlling terminal
 
@@ -160,6 +170,13 @@ which uses **stdin** whenever stdin is a terminal and only opens `/dev/tty` othe
 So with stdin on one terminal and `/dev/tty` on another, the termios flags are set on
 stdin while everything else in this record talks to `/dev/tty` — the same shape of bug,
 in the one corner crossterm still owns.
+
+The cost is not cosmetic in that shape: the terminal gutter paints on and reads the
+keyboard from is left cooked, so keystrokes echo over the band and only reach the child
+on Enter, and a second terminal gutter otherwise never touches is left in raw mode for
+the whole run — a launcher reading it loses its own line discipline. Measured on a pair
+of PTYs: the band lands on `/dev/tty`, `ECHO` is still set there and clear on the stdin
+terminal. gutter is effectively unusable when the two differ.
 
 On the fallback route the exception disappears of its own accord: the device gutter
 resolved is the terminal on stdin, so crossterm sets the flags on the same one.
