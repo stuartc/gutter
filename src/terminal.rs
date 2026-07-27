@@ -15,6 +15,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::queue;
+use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+
 use crate::geometry::Rails;
 use crate::mouse::{MOUSE_DISABLE, MOUSE_ENABLE};
 
@@ -47,7 +51,7 @@ pub trait OuterTerminal {
     /// Move the cursor to physical `(col, row)`, emitted before each repainted
     /// row so the row's bytes land at the band's left margin.
     fn move_to(&mut self, col: u16, row: u16) -> io::Result<()>;
-    /// Write a row's `rows_diff` byte run verbatim — `prepare_row` has made it
+    /// Write a row's `rows_diff` byte run verbatim — `prepare_row_into` has made it
     /// self-contained, so it carries its own intra-row SGR and relative cursor
     /// moves, scoped to `[0, W)` (ADR-014).
     fn write_row(&mut self, bytes: &[u8]) -> io::Result<()>;
@@ -176,7 +180,6 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn enter_alt_screen(&mut self) -> io::Result<()> {
-        use crossterm::{queue, terminal::EnterAlternateScreen};
         queue!(self.out, EnterAlternateScreen)?;
         self.out.flush()
     }
@@ -186,7 +189,6 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
-        use crossterm::{cursor::MoveTo, queue};
         queue!(self.out, MoveTo(col, row))
     }
 
@@ -208,8 +210,9 @@ impl OuterTerminal for CrosstermTerminal {
         row_start: u16,
         row_end: u16,
     ) -> io::Result<()> {
-        use crossterm::{cursor::MoveTo, queue};
         let band_end = margin.saturating_add(width).min(real_cols);
+        let left = b" ".repeat(margin as usize);
+        let right = b" ".repeat(real_cols.saturating_sub(band_end) as usize);
         // Reset SGR first so the blanks are painted with the default background
         // (a leftover colour run would tint the gutter).
         self.out.write_all(b"\x1b[0m")?;
@@ -217,24 +220,18 @@ impl OuterTerminal for CrosstermTerminal {
             // Left gutter: physical columns [0, margin).
             if margin > 0 {
                 queue!(self.out, MoveTo(0, row))?;
-                self.out.write_all(&b" ".repeat(margin as usize))?;
+                self.out.write_all(&left)?;
             }
             // Right gutter: physical columns [band_end, real_cols).
             if real_cols > band_end {
                 queue!(self.out, MoveTo(band_end, row))?;
-                self.out
-                    .write_all(&b" ".repeat((real_cols - band_end) as usize))?;
+                self.out.write_all(&right)?;
             }
         }
         Ok(())
     }
 
     fn clear_row_span(&mut self, row_start: u16, row_end: u16) -> io::Result<()> {
-        use crossterm::{
-            cursor::MoveTo,
-            queue,
-            terminal::{Clear, ClearType},
-        };
         // Reset SGR first so the cleared rows carry the default background (a leftover
         // colour run would tint them), matching clear_gutter.
         self.out.write_all(b"\x1b[0m")?;
@@ -245,7 +242,6 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn draw_rails(&mut self, rails: &Rails) -> io::Result<()> {
-        use crossterm::{cursor::MoveTo, queue};
         self.out.write_all(b"\x1b[0m")?; // drop any leftover attribute run
         for row in rails.row_start..rails.row_end {
             if let Some(c) = rails.left_col {
@@ -266,15 +262,10 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {
-        use crossterm::{cursor::MoveTo, queue};
-        queue!(self.out, MoveTo(col, row))
+        self.move_to(col, row)
     }
 
     fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
-        use crossterm::{
-            cursor::{Hide, Show},
-            queue,
-        };
         if visible {
             queue!(self.out, Show)
         } else {
@@ -297,7 +288,6 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn leave_alt_screen(&mut self) -> io::Result<()> {
-        use crossterm::{queue, terminal::LeaveAlternateScreen};
         queue!(self.out, LeaveAlternateScreen)?;
         self.out.flush()
     }
@@ -315,7 +305,6 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn show_cursor(&mut self) -> io::Result<()> {
-        use crossterm::{cursor::Show, queue};
         queue!(self.out, Show)?;
         self.out.flush()
     }
@@ -578,6 +567,12 @@ pub mod mock {
             }
         }
 
+        /// Feed a CUP to the physical parser. vt100 is 1-based, gutter's API 0-based.
+        fn goto(&mut self, col: u16, row: u16) {
+            self.parser
+                .process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+        }
+
         /// The trimmed contents of physical cell `(row, col)` — `""` when blank.
         /// The edge-of-band assertion reads `(row, margin + W)` and expects `""`.
         pub fn cell_contents(&self, row: u16, col: u16) -> String {
@@ -671,9 +666,7 @@ pub mod mock {
             Ok((cols, rows))
         }
         fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
-            // CSI row+1 ; col+1 H — vt100 is 1-based, gutter's API 0-based.
-            let seq = format!("\x1b[{};{}H", row + 1, col + 1);
-            self.parser.process(seq.as_bytes());
+            self.goto(col, row);
             Ok(())
         }
         fn write_row(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -700,13 +693,11 @@ pub mod mock {
             self.parser.process(b"\x1b[0m");
             for row in row_start..row_end {
                 if margin > 0 {
-                    let seq = format!("\x1b[{};1H", row + 1);
-                    self.parser.process(seq.as_bytes());
+                    self.goto(0, row);
                     self.parser.process(&b" ".repeat(margin as usize));
                 }
                 if real_cols > band_end {
-                    let seq = format!("\x1b[{};{}H", row + 1, band_end + 1);
-                    self.parser.process(seq.as_bytes());
+                    self.goto(band_end, row);
                     self.parser.process(&b" ".repeat((real_cols - band_end) as usize));
                 }
             }
@@ -717,8 +708,8 @@ pub mod mock {
             // readback sees the band interior cleared.
             self.parser.process(b"\x1b[0m");
             for row in row_start..row_end {
-                let seq = format!("\x1b[{};1H\x1b[2K", row + 1);
-                self.parser.process(seq.as_bytes());
+                self.goto(0, row);
+                self.parser.process(b"\x1b[2K");
             }
             Ok(())
         }
@@ -728,27 +719,23 @@ pub mod mock {
             self.parser.process(b"\x1b[0m");
             for row in rails.row_start..rails.row_end {
                 if let Some(c) = rails.left_col {
-                    let seq = format!("\x1b[{};{}H", row + 1, c + 1);
-                    self.parser.process(seq.as_bytes());
+                    self.goto(c, row);
                     self.parser.process("\x1b[2m\u{258f}\x1b[0m".as_bytes());
                 }
                 if let Some(c) = rails.right_col {
-                    let seq = format!("\x1b[{};{}H", row + 1, c + 1);
-                    self.parser.process(seq.as_bytes());
+                    self.goto(c, row);
                     self.parser.process("\x1b[2m\u{2595}\x1b[0m".as_bytes());
                 }
             }
             if let Some(r) = &rails.readout {
-                let seq = format!("\x1b[{};{}H", r.row + 1, r.col + 1);
-                self.parser.process(seq.as_bytes());
+                self.goto(r.col, r.row);
                 self.parser
                     .process(format!("\x1b[2m{}\x1b[0m", r.text).as_bytes());
             }
             Ok(())
         }
         fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {
-            let seq = format!("\x1b[{};{}H", row + 1, col + 1);
-            self.parser.process(seq.as_bytes());
+            self.goto(col, row);
             Ok(())
         }
         fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()> {

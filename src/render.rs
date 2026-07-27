@@ -214,10 +214,9 @@ impl Renderer {
     }
 }
 
-/// What one dispatched message tells the render loop to do next. Replaces the old
-/// `Option<i32>` return so a stopped child (`ChildStopped`) is distinct from an
-/// exited one: `Exit(code)` tears down, `Suspend` runs the suspend/resume cycle,
-/// `Continue` is the ordinary path.
+/// What one dispatched message tells the render loop to do next. `Exit(code)`
+/// tears down, `Suspend` runs the suspend/resume cycle, `Continue` is the
+/// ordinary path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flow {
     Continue,
@@ -255,9 +254,7 @@ where
             // `render_once` queues and flushes within one call, so no half-built
             // frame is ever outstanding when a message is dispatched.
             let relayed = renderer.parser.callbacks_mut().drain_relay();
-            if !relayed.is_empty() {
-                let _ = term.relay(&relayed);
-            }
+            let _ = relay_if_any(term, &relayed);
             // Answer the child's device queries: parser.process surfaced any
             // CSI c / CSI 5 n / CSI 6 n through unhandled_csi, which buffered a
             // spec-correct reply; drain it to the PTY master.
@@ -336,10 +333,12 @@ fn classify_unit(unit: &[u8], chord: &Chord, in_mode: bool) -> KeyAction {
     if !in_mode {
         return KeyAction::PassThrough;
     }
+    // A bare Escape, whether resolved by the hold or arriving as one of the
+    // disambiguated forms a relayed keyboard mode produces.
+    if Chord::ESC.matches(unit) {
+        return KeyAction::Exit;
+    }
     match unit {
-        // A bare Escape, whether resolved by the hold or arriving as one of the
-        // disambiguated forms a relayed keyboard mode produces.
-        b"\x1b" | b"\x1b[27u" | b"\x1b[27;1u" | b"\x1b[27;1;27~" => KeyAction::Exit,
         b"h" | b"-" => KeyAction::Step(-1),
         b"l" | b"+" | b"=" => KeyAction::Step(1),
         b"H" => KeyAction::Step(-10),
@@ -354,10 +353,9 @@ fn classify_unit(unit: &[u8], chord: &Chord, in_mode: bool) -> KeyAction {
 /// The resize handler — the ADR-008 ordering plus the ADR-011 proportional-width
 /// recompute, in one render-thread turn. Recompute `W` → resize the PTY → resize the
 /// parser (`set_size(rows, W)` — param order is the trap) → recompute the margin →
-/// reset the diff baseline, clearing the band's row-span across both screen modes
-/// (ADR-0017, generalising ADR-008 step 5's alt-only clear).
+/// reset the diff baseline, clearing the band's row-span across both screen modes.
 ///
-/// The clear is uniform now (ADR-0017): alt clears `0..rows`, primary clears
+/// The clear is uniform (ADR-0017): alt clears `0..rows`, primary clears
 /// `base_row..rows` so shell history above the inline band is never touched.
 fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     renderer: &mut Renderer,
@@ -631,17 +629,28 @@ fn apply_key_action<C, T, R>(
             resize.arm(clock.deadline(now, RESIZE_IDLE)); // a resize key = activity
             apply_resize_step(renderer, resizer, term, delta);
         }
-        KeyAction::Exit => {
-            resize.disarm();
-            renderer.end_resize();
-            let _ = clear_resize_overlay(renderer, term);
-            renderer.reset_prev_baseline();
-        }
+        KeyAction::Exit => leave_resize_mode(resize, renderer, term),
         // Consumed but NOT counted as activity: a swallowed stray key must not
         // keep the mode alive forever (PRD 0001: idle = "no resize key").
         KeyAction::Swallow => {}
         KeyAction::PassThrough => {}
     }
+}
+
+/// Leave resize mode: disarm the idle window, un-suppress the mirrored cursor, erase
+/// the overlay and force a full band repaint. Queued, not flushed — the caller renders.
+fn leave_resize_mode<T: OuterTerminal, I: Copy + Ord>(
+    resize: &mut ResizeCtl<I>,
+    renderer: &mut Renderer,
+    term: &mut T,
+) {
+    if !resize.active() {
+        return;
+    }
+    resize.disarm();
+    renderer.end_resize();
+    let _ = clear_resize_overlay(renderer, term);
+    renderer.reset_prev_baseline();
 }
 
 /// Write bytes to the child, the default action for everything the scanner did
@@ -869,53 +878,18 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
     // margin-offset rectangle (ADR-014), and mode bytes between a `move_to` and its row
     // would break that for nothing.
     let mode_bytes = renderer.mode_mirror.take_pending(renderer.parser.screen());
-    if !mode_bytes.is_empty() {
-        term.relay(&mode_bytes)?;
-    }
+    relay_if_any(term, &mode_bytes)?;
 
     // Scroll emit (ADR-013): on the primary screen, advance each line that left the
-    // top of the W-window this frame into the terminal's own scrollback. The alt
-    // screen never scrolls the outer terminal, so this is gated on the primary branch.
-    let departed = if renderer.outer_alt_active {
-        // Reset the tracker without emitting — an alt frame must drop any scroll the
-        // tracker saw, never advance the outer terminal.
-        renderer.drain_scrolled_off();
-        Vec::new()
-    } else {
-        renderer.drain_scrolled_off()
-    };
-
-    // Make room as the band grows inline (ADR-013, primary only). If the deepest live
-    // row would run past the bottom, scroll the real terminal up by the overshoot (a
-    // newline per line, pushing history into the terminal's own scrollback) and drop
-    // base_row by the same delta. Scrolling up by delta shifts every already-painted
-    // row up too, so the diff-skipped rows are already in place and only changed rows
-    // repaint. When the grid is full this has driven base_row to 0.
-    if !renderer.outer_alt_active && renderer.base_row > 0 {
-        let real_rows = renderer.parser.screen().size().0;
-        // A non-empty `departed` proves vt100's W-window filled and scrolled this
-        // frame, which only happens once the band spans the whole screen — so base_row
-        // MUST reach 0 before the scroll-emit branch paints [0, rows), or it overwrites
-        // the pre-launch history. The settled grid can read near-blank (a coalesced
-        // seq … clear in one frame), so the overshoot would under-scroll; the departed
-        // signal is the authority, and scrolling the full base_row drives it to 0.
-        let delta = if departed.is_empty() {
-            let bottom = renderer.deepest_live_row();
-            renderer
-                .base_row
-                .saturating_add(bottom)
-                .saturating_sub(real_rows.saturating_sub(1))
-        } else {
-            renderer.base_row
-        };
-        if delta > 0 {
-            term.move_to(0, real_rows.saturating_sub(1))?;
-            for _ in 0..delta {
-                term.newline()?;
-            }
-            renderer.base_row -= delta;
-        }
+    // top of the W-window this frame into the terminal's own scrollback. The tracker
+    // is drained every frame either way; an alt frame discards the result rather than
+    // advancing the outer terminal, which never scrolls under the alt screen.
+    let mut departed = renderer.drain_scrolled_off();
+    if renderer.outer_alt_active {
+        departed.clear();
     }
+
+    scroll_to_make_room(renderer, term, departed.is_empty())?;
 
     let offset = renderer.span_offset();
 
@@ -923,6 +897,7 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
         // No scroll: the ordinary per-row diff paint. Only rows changed since the last
         // frame are re-emitted, at offset + row.
         let mut painted = false;
+        let mut row_buf = Vec::new();
         let screen = renderer.parser.screen();
         let prev_screen = renderer.prev.screen();
         for (row, line) in screen.rows_diff(prev_screen, 0, renderer.width).enumerate() {
@@ -931,7 +906,8 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
             }
             let row = row as u16;
             term.move_to(renderer.left_margin, offset.saturating_add(row))?;
-            term.write_row(&prepare_row(&line, renderer.width))?;
+            prepare_row_into(&line, renderer.width, &mut row_buf);
+            term.write_row(&row_buf)?;
             painted = true;
         }
         // Record that inline content reached the primary screen, so teardown hands
@@ -948,34 +924,7 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
         renderer.ever_painted_inline = true;
     }
 
-    // Mirror the child's cursor — unless resize mode owns the band, where the block
-    // cursor would flicker at the band edge as the child re-homes during redraws. The
-    // outer cursor is hidden on mode enter and re-asserted from the child's live state
-    // on exit (see `Renderer::end_resize`), so the whole tail is skipped while active.
-    if !renderer.resize_active {
-        // Capture the cursor state from the live screen for the tail below.
-        let screen = renderer.parser.screen();
-        let visible = !screen.hide_cursor();
-        let (crow, ccol) = screen.cursor_position();
-
-        // Mirror DECTCEM: only emit a show/hide when the state actually changed.
-        if visible != renderer.cursor_visible {
-            term.set_cursor_visible(visible)?;
-            renderer.cursor_visible = visible;
-        }
-
-        // Mirror DECSCUSR cursor shape: the callbacks watcher recorded any CSI Ps SP q
-        // the child emitted; emit it to the outer terminal, de-duped by the watcher.
-        if let Some(shape) = renderer.parser.callbacks_mut().cursor_shape.take_pending() {
-            term.set_cursor_shape(&shape)?;
-        }
-
-        // Reposition the real cursor inside the band at `offset + grid_cursor_row`.
-        term.place_cursor(
-            geometry::physical_col(renderer.left_margin, ccol),
-            offset.saturating_add(crow),
-        )?;
-    }
+    mirror_cursor(renderer, term, offset)?;
 
     term.flush()?;
 
@@ -985,15 +934,89 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
     Ok(())
 }
 
+/// Make room as the band grows inline (ADR-013, primary only). If the deepest live
+/// row would run past the bottom, scroll the real terminal up by the overshoot (a
+/// newline per line, pushing history into the terminal's own scrollback) and drop
+/// base_row by the same delta. Scrolling up by delta shifts every already-painted
+/// row up too, so the diff-skipped rows are already in place and only changed rows
+/// repaint. When the grid is full this has driven base_row to 0.
+fn scroll_to_make_room<T: OuterTerminal>(
+    renderer: &mut Renderer,
+    term: &mut T,
+    departed_empty: bool,
+) -> std::io::Result<()> {
+    if renderer.outer_alt_active || renderer.base_row == 0 {
+        return Ok(());
+    }
+    let real_rows = renderer.parser.screen().size().0;
+    // A non-empty `departed` proves vt100's W-window filled and scrolled this
+    // frame, which only happens once the band spans the whole screen — so base_row
+    // MUST reach 0 before the scroll-emit branch paints [0, rows), or it overwrites
+    // the pre-launch history. The settled grid can read near-blank (a coalesced
+    // seq … clear in one frame), so the overshoot would under-scroll; the departed
+    // signal is the authority, and scrolling the full base_row drives it to 0.
+    let delta = if departed_empty {
+        let bottom = renderer.deepest_live_row();
+        renderer
+            .base_row
+            .saturating_add(bottom)
+            .saturating_sub(real_rows.saturating_sub(1))
+    } else {
+        renderer.base_row
+    };
+    if delta > 0 {
+        term.move_to(0, real_rows.saturating_sub(1))?;
+        for _ in 0..delta {
+            term.newline()?;
+        }
+        renderer.base_row -= delta;
+    }
+    Ok(())
+}
+
+/// Mirror the child's cursor visibility, shape and position — unless resize mode owns
+/// the band, where the block cursor would flicker at the band edge as the child
+/// re-homes during redraws. The outer cursor is hidden on mode enter and re-asserted
+/// from the child's live state on exit (see [`Renderer::end_resize`]).
+fn mirror_cursor<T: OuterTerminal>(
+    renderer: &mut Renderer,
+    term: &mut T,
+    offset: u16,
+) -> std::io::Result<()> {
+    if renderer.resize_active {
+        return Ok(());
+    }
+    let screen = renderer.parser.screen();
+    let visible = !screen.hide_cursor();
+    let (crow, ccol) = screen.cursor_position();
+
+    // Mirror DECTCEM: only emit a show/hide when the state actually changed.
+    if visible != renderer.cursor_visible {
+        term.set_cursor_visible(visible)?;
+        renderer.cursor_visible = visible;
+    }
+
+    // Mirror DECSCUSR cursor shape: the callbacks watcher recorded any CSI Ps SP q
+    // the child emitted; emit it to the outer terminal, de-duped by the watcher.
+    if let Some(shape) = renderer.parser.callbacks_mut().cursor_shape.take_pending() {
+        term.set_cursor_shape(&shape)?;
+    }
+
+    // Reposition the real cursor inside the band at `offset + grid_cursor_row`.
+    term.place_cursor(
+        geometry::physical_col(renderer.left_margin, ccol),
+        offset.saturating_add(crow),
+    )
+}
+
 /// Make a vt100 row run self-contained within its `W`-wide, margin-offset rectangle
 /// before painting (ADR-014): prepend `ESC[m` so it doesn't inherit the previous row's
 /// trailing attribute across the bare `move_to`, and clip the row-final `ESC[K` to
 /// column `W` so its erase can't flood the gutter.
-fn prepare_row(line: &[u8], width: u16) -> Vec<u8> {
-    let mut out = Vec::with_capacity(line.len() + 3);
+fn prepare_row_into(line: &[u8], width: u16, out: &mut Vec<u8>) {
+    out.clear();
     out.extend_from_slice(b"\x1b[m");
-    clip_row_to_width_into(line, width, &mut out);
-    out
+    clip_row_to_width_into(line, width, out);
 }
 
 /// Paint a scrolling frame: stream the `departed` lines then the current band down the
@@ -1020,6 +1043,7 @@ fn emit_scroll_stream<T: OuterTerminal>(
         .rows_formatted(0, renderer.width)
         .collect();
 
+    let mut row_buf = Vec::new();
     for (i, line) in departed.iter().chain(band.iter()).enumerate() {
         let i = i as u16;
         if i <= bottom {
@@ -1030,7 +1054,8 @@ fn emit_scroll_stream<T: OuterTerminal>(
             term.newline()?;
             term.move_to(renderer.left_margin, bottom)?;
         }
-        term.write_row(&prepare_row(line, renderer.width))?;
+        prepare_row_into(line, renderer.width, &mut row_buf);
+        term.write_row(&row_buf)?;
     }
     Ok(())
 }
@@ -1081,7 +1106,7 @@ fn render_cell_walk<T: OuterTerminal>(
     Ok(())
 }
 
-/// Repaint the band chrome after a geometry change (ADR-008 step 5, generalised).
+/// Repaint the band chrome after a geometry change (ADR-008/0017).
 /// Clears the vacated gutter strip across the band's row span — `0..rows` on the alt
 /// screen, `base_row..rows` on the primary screen, so shell history above the inline
 /// band is preserved (ADR-012/013) — and, when `resize_active`, draws the faint rails
@@ -1151,12 +1176,21 @@ impl Renderer {
     /// `clone`, so feed `prev` the current screen's `contents_formatted()` —
     /// a full state replay that leaves `prev` cell-identical to `parser`.
     fn sync_prev(&mut self) {
-        let formatted = self.parser.screen().contents_formatted();
-        // Reset prev to a blank grid of the same size before replaying, so stale cells
-        // from a shrunk region don't linger.
+        self.prev = self.live_mirror(0);
+    }
+
+    /// A callback-free parser sized to the live grid — the shape both diff mirrors take.
+    fn blank_mirror(&self, scrollback: usize) -> vt100::Parser<GutterCallbacks> {
         let (rows, cols) = self.parser.screen().size();
-        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::baseline());
-        self.prev.process(&formatted);
+        vt100::Parser::new_with_callbacks(rows, cols, scrollback, GutterCallbacks::baseline())
+    }
+
+    /// A blank mirror replayed up to the live grid's current content. vt100 exposes no
+    /// `clone`, so `contents_formatted()` is the replay.
+    fn live_mirror(&self, scrollback: usize) -> vt100::Parser<GutterCallbacks> {
+        let mut p = self.blank_mirror(scrollback);
+        p.process(&self.parser.screen().contents_formatted());
+        p
     }
 
     /// Drop the diff baseline to a blank grid of the live size, so the next rows_diff
@@ -1164,8 +1198,7 @@ impl Renderer {
     /// the alt→primary edge). Re-seeds the scroll tracker to the live grid too, so its
     /// scroll detection stays sound across the change.
     fn reset_prev_baseline(&mut self) {
-        let (rows, cols) = self.parser.screen().size();
-        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::baseline());
+        self.prev = self.blank_mirror(0);
         self.reset_scroll_tracker();
     }
 
@@ -1203,15 +1236,7 @@ impl Renderer {
     /// empty. Used after a drain and after a resize/baseline reset so the tracker
     /// always mirrors the live grid's content at the band's current size.
     fn reset_scroll_tracker(&mut self) {
-        let formatted = self.parser.screen().contents_formatted();
-        let (rows, cols) = self.parser.screen().size();
-        self.scroll_tracker = vt100::Parser::new_with_callbacks(
-            rows,
-            cols,
-            SCROLL_TRACKER_SCROLLBACK,
-            GutterCallbacks::baseline(),
-        );
-        self.scroll_tracker.process(&formatted);
+        self.scroll_tracker = self.live_mirror(SCROLL_TRACKER_SCROLLBACK);
     }
 
     /// The deepest grid row holding live content this frame — whichever reaches further
@@ -1305,10 +1330,7 @@ where
         // before doing anything else this frame.
         if let Some(dl) = resize.idle_deadline {
             if clock.now() >= dl {
-                resize.disarm();
-                renderer.end_resize();
-                let _ = clear_resize_overlay(renderer, term);
-                renderer.reset_prev_baseline();
+                leave_resize_mode(&mut resize, renderer, term);
                 let _ = render_once(renderer, term); // erase rails this frame
                 continue 'frames;
             }
@@ -1331,10 +1353,7 @@ where
                     }
                     if resize.idle_deadline.is_some_and(|d| now >= d) {
                         // ~3 s idle elapsed.
-                        resize.disarm();
-                        renderer.end_resize();
-                        let _ = clear_resize_overlay(renderer, term);
-                        renderer.reset_prev_baseline();
+                        leave_resize_mode(&mut resize, renderer, term);
                     }
                     // Both paths may have queued an overlay clear; flush it here
                     // rather than waiting for a child that may never write again.
@@ -1351,38 +1370,29 @@ where
             }
         };
         let mut shutdown = false;
-        match apply_message(
+        let exiting = match apply_message(
             first, clock, renderer, &mut resize, &mut input, term, pty_writer, resizer,
         ) {
-            Flow::Continue => {}
-            Flow::Exit(code) => {
-                exit_code = Some(code);
-                drain_pty_path(clock, renderer, pty_writer, resizer, term);
-                shutdown = true;
-            }
+            Flow::Continue => None,
+            Flow::Exit(code) => Some(code),
             // The child stopped (ADR-0019): run the reversible park → self-stop →
-            // unpark → continue cycle. `continue 'frames` on resume so the next
-            // frame captures a fresh deadline — no stale pre-stop deadline survives
-            // the (arbitrarily long) suspension.
-            Flow::Suspend => {
-                match suspend_cycle(
-                    clock, renderer, &mut resize, term, pty_writer, resizer, suspender,
-                ) {
-                    SuspendOutcome::Resumed => continue 'frames,
-                    SuspendOutcome::ChildExited(code) => {
-                        // Aborted before park (child SIGKILLed right after stopping):
-                        // the terminal was never parked, so fall through to the one
-                        // normal teardown in run's tail. Drain the PTY path first, like
-                        // the Flow::Exit arms, so any trailing bytes still queued behind
-                        // the ChildExited land before teardown reads outer_alt_active
-                        // (ADR-013's teardown race); the child is dead, so PtyEof arrives
-                        // and the drain terminates promptly.
-                        exit_code = Some(code);
-                        drain_pty_path(clock, renderer, pty_writer, resizer, term);
-                        shutdown = true;
-                    }
-                }
-            }
+            // unpark → continue cycle. `continue 'frames` on resume so the next frame
+            // captures a fresh deadline — no stale pre-stop deadline survives the
+            // (arbitrarily long) suspension. An abort (the child SIGKILLed right after
+            // stopping) never parked the terminal, so it joins the ordinary shutdown.
+            Flow::Suspend => match suspend_cycle(
+                clock, renderer, &mut resize, term, pty_writer, resizer, suspender,
+            ) {
+                SuspendOutcome::Resumed => continue 'frames,
+                SuspendOutcome::ChildExited(code) => Some(code),
+            },
+        };
+        if let Some(code) = exiting {
+            exit_code = Some(code);
+            // Trailing bytes queued behind the ChildExited must land before teardown
+            // reads `outer_alt_active` (ADR-013's teardown race).
+            drain_pty_path(clock, renderer, pty_writer, resizer, term);
+            shutdown = true;
         }
 
         let frame_start = clock.now();
@@ -1399,36 +1409,25 @@ where
                 }
                 match clock.recv_until(deadline) {
                     Recv::Msg(m) => {
-                        match apply_message(
+                        let exiting = match apply_message(
                             m, clock, renderer, &mut resize, &mut input, term, pty_writer,
                             resizer,
                         ) {
-                            Flow::Continue => {}
-                            Flow::Exit(code) => {
-                                exit_code = Some(code);
-                                drain_pty_path(clock, renderer, pty_writer, resizer, term);
-                                shutdown = true;
-                                break;
-                            }
-                            Flow::Suspend => {
-                                match suspend_cycle(
-                                    clock, renderer, &mut resize, term, pty_writer, resizer,
-                                    suspender,
-                                ) {
-                                    SuspendOutcome::Resumed => continue 'frames,
-                                    SuspendOutcome::ChildExited(code) => {
-                                        // Abort (as in Phase A): drain the PTY path so
-                                        // trailing bytes behind the ChildExited land
-                                        // before teardown (ADR-013).
-                                        exit_code = Some(code);
-                                        drain_pty_path(
-                                            clock, renderer, pty_writer, resizer, term,
-                                        );
-                                        shutdown = true;
-                                        break;
-                                    }
-                                }
-                            }
+                            Flow::Continue => None,
+                            Flow::Exit(code) => Some(code),
+                            Flow::Suspend => match suspend_cycle(
+                                clock, renderer, &mut resize, term, pty_writer, resizer,
+                                suspender,
+                            ) {
+                                SuspendOutcome::Resumed => continue 'frames,
+                                SuspendOutcome::ChildExited(code) => Some(code),
+                            },
+                        };
+                        if let Some(code) = exiting {
+                            exit_code = Some(code);
+                            drain_pty_path(clock, renderer, pty_writer, resizer, term);
+                            shutdown = true;
+                            break;
                         }
                     }
                     Recv::Timeout => break, // idle-gap exit
@@ -1504,12 +1503,7 @@ where
     // Step 0 — resize-mode teardown (same as run's shutdown tail). `end_resize`
     // clears `resize_active`, or the cursor tail would stay suppressed after resume;
     // park/unpark re-mirror the cursor themselves from there.
-    if resize.active() {
-        resize.disarm();
-        renderer.end_resize();
-        let _ = clear_resize_overlay(renderer, term);
-        renderer.reset_prev_baseline();
-    }
+    leave_resize_mode(resize, renderer, term);
 
     // Step 1 — pre-stop drain: bounded quiet-gap drain of the child's terminal-
     // restore bytes. Aborts to a normal shutdown if the child died right after
@@ -1686,11 +1680,16 @@ fn unpark<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::R
 /// launched. A shell whose paste protection is clobbered by this re-asserts its input
 /// modes at its next prompt, so the blast radius is one prompt.
 fn mode_reset<T: OuterTerminal>(renderer: &Renderer, term: &mut T) -> std::io::Result<()> {
-    let bytes = renderer.mode_mirror.reset_bytes();
+    relay_if_any(term, &renderer.mode_mirror.reset_bytes())
+}
+
+/// Relay bytes to the outer terminal, skipping the call entirely when there are none —
+/// `relay` flushes, so an empty write would cost a syscall for nothing.
+fn relay_if_any<T: OuterTerminal>(term: &mut T, bytes: &[u8]) -> std::io::Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
-    term.relay(&bytes)
+    term.relay(bytes)
 }
 
 /// Undo the keyboard modes the child asked the outer terminal for (ADR-021), in the
@@ -1721,10 +1720,7 @@ fn relay_write<T: OuterTerminal>(
         .key_modes()
         .map(bytes)
         .unwrap_or_default();
-    if out.is_empty() {
-        return Ok(());
-    }
-    term.relay(&out)
+    relay_if_any(term, &out)
 }
 
 /// Re-enter raw mode on resume, retrying a bounded number of times on `EINTR`: the
@@ -1834,23 +1830,10 @@ fn hand_back_inline<T: OuterTerminal>(
         .min(real_rows.saturating_sub(1));
     term.move_to(0, phys_bottom)?;
     if exit_code == 0 {
-        term.newline()?;
+        term.newline()
     } else {
-        write_exit_status(term, exit_code)?;
+        term.write_row(format!("\r\n\x1b[2mExited with: {exit_code}\x1b[0m").as_bytes())
     }
-    Ok(())
-}
-
-/// Emit the dim `Exited with: N` status line below the band, on a non-zero exit only
-/// (success is silent). The leading `\r\n` drops it onto a fresh line below the band's
-/// last content, scrolling the primary screen if it was at the bottom. Called only from
-/// the inline hand-back (ADR-013).
-fn write_exit_status<T: OuterTerminal>(term: &mut T, exit_code: i32) -> std::io::Result<()> {
-    if exit_code == 0 {
-        return Ok(());
-    }
-    let line = format!("\r\n\x1b[2mExited with: {exit_code}\x1b[0m");
-    term.write_row(line.as_bytes())
 }
 
 #[cfg(test)]

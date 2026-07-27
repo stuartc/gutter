@@ -48,11 +48,15 @@ impl Default for Chord {
 }
 
 impl Chord {
+    /// A bare Escape, in every form a terminal can report it. The in-mode exit
+    /// key (ADR-016), which is not the configurable chord.
+    pub const ESC: Chord = Chord { key: ChordKey::Esc, mods: 0 };
+
     /// The single legacy byte this chord produces, when it has one. The
     /// classifier scans an ordinary byte run for exactly this.
     pub fn single_byte(&self) -> Option<u8> {
-        match self.legacy_bytes()? {
-            b if b.len() == 1 => Some(b[0]),
+        match self.legacy_bytes()?.as_slice() {
+            [b] => Some(*b),
             _ => None,
         }
     }
@@ -64,29 +68,18 @@ impl Chord {
     /// the mode on every repeat and its own key-up would undo the press that
     /// entered it (ADR-016).
     pub fn matches(&self, unit: &[u8]) -> bool {
-        if let ChordKey::F(n) = self.key {
-            // Modified F-key chords do not parse, so the unmodified forms are
-            // the whole story.
-            return f_key_forms(n).contains(&unit);
-        }
-        if self.legacy_bytes().is_some_and(|b| b == unit) {
-            return true;
-        }
-        let Some(code) = self.codepoint() else {
-            return false;
-        };
-        matches_kitty(unit, code, self.mods) || matches_modify_other_keys(unit, code, self.mods)
-    }
-
-    /// The Unicode codepoint the CSI-u forms report this key as.
-    fn codepoint(&self) -> Option<u32> {
-        Some(match self.key {
+        // The Unicode codepoint the CSI-u forms report this key as.
+        let code = match self.key {
+            ChordKey::F(n) => return f_key_forms(n).contains(&unit),
             ChordKey::Char(c) => c.to_ascii_lowercase() as u32,
             ChordKey::Esc => 27,
             ChordKey::Tab => 9,
             ChordKey::Enter => 13,
-            ChordKey::F(_) => return None,
-        })
+        };
+        if self.legacy_bytes().is_some_and(|b| b == unit) {
+            return true;
+        }
+        matches_kitty(unit, code, self.mods) || matches_modify_other_keys(unit, code, self.mods)
     }
 
     /// The classic byte form, when the modifier set has one. A Shift chord has
@@ -139,14 +132,11 @@ fn c0_byte(c: char) -> Option<u8> {
 
 /// kitty's `CSI <code> [; <mods+1> [: <event>]] u`.
 fn matches_kitty(unit: &[u8], code: u32, mods: u8) -> bool {
-    let Some(body) = strip(unit, b"\x1b[", b"u") else {
+    let Some(body) = csi_body(unit, b'u') else {
         return false;
     };
     let mut fields = body.split(|&b| b == b';');
-    let Some(code_field) = fields.next() else {
-        return false;
-    };
-    if number(code_field) != Some(code) {
+    if fields.next().and_then(number) != Some(code) {
         return false;
     }
     match fields.next() {
@@ -169,7 +159,7 @@ fn matches_kitty(unit: &[u8], code: u32, mods: u8) -> bool {
 
 /// xterm modifyOtherKeys: `CSI 27 ; <mods+1> ; <code> ~`.
 fn matches_modify_other_keys(unit: &[u8], code: u32, mods: u8) -> bool {
-    let Some(body) = strip(unit, b"\x1b[", b"~") else {
+    let Some(body) = csi_body(unit, b'~') else {
         return false;
     };
     let fields: Vec<&[u8]> = body.split(|&b| b == b';').collect();
@@ -179,10 +169,9 @@ fn matches_modify_other_keys(unit: &[u8], code: u32, mods: u8) -> bool {
         && number(fields[2]) == Some(code)
 }
 
-/// The parameter body of `unit` when it starts with `prefix` and ends with
-/// `suffix`.
-fn strip<'a>(unit: &'a [u8], prefix: &[u8], suffix: &[u8]) -> Option<&'a [u8]> {
-    unit.strip_prefix(prefix)?.strip_suffix(suffix)
+/// The parameter body of a CSI sequence ending in `final_byte`.
+fn csi_body(unit: &[u8], final_byte: u8) -> Option<&[u8]> {
+    unit.strip_prefix(b"\x1b[")?.strip_suffix(&[final_byte])
 }
 
 /// A non-empty run of ASCII digits.

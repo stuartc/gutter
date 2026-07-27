@@ -26,6 +26,10 @@ pub const MOUSE_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
 /// The matching reset forms, in the same order.
 pub const MOUSE_DISABLE: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 
+/// The SGR button-byte flags: bit 5 is motion, bit 6 is the wheel.
+const MOTION: u16 = 32;
+const WHEEL: u16 = 64;
+
 /// What the render loop should do with one decoded outer mouse event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MouseDecision {
@@ -60,10 +64,8 @@ struct ButtonFacts {
 /// `ButtonMotion` filter.
 ///
 /// [`forward`]: MouseGate::forward
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct MouseGate {
-    /// Whether any mouse button is held, tracked from decoded press/release
-    /// events. Drives the `ButtonMotion` motion filter.
     button_held: bool,
 }
 
@@ -88,9 +90,6 @@ impl MouseGate {
     ) -> MouseDecision {
         let c = classify(report);
 
-        // Track button-held on every press/release before any swallow path: a
-        // press that lands while the child is in None still means the button is
-        // down when a later ButtonMotion frame arrives.
         if let Some(now_held) = c.press_transition {
             self.button_held = now_held;
         }
@@ -99,9 +98,6 @@ impl MouseGate {
             return MouseDecision::Swallow;
         }
         if encoding != MouseProtocolEncoding::Sgr {
-            // Non-Sgr encoding is out of v1 scope. Forwarding a best-effort SGR
-            // event would desync the child's mouse parser (ADR-005), so fail loud
-            // upstream instead.
             return MouseDecision::BailNonSgr;
         }
 
@@ -110,7 +106,7 @@ impl MouseGate {
         }
 
         // Rows pass through unchanged — the band spans the full height, only
-        // columns carry the margin. translate_col discards gutter / out-of-band.
+        // columns carry the margin.
         match translate_col(report.col, left_margin, w) {
             Some(col0) => MouseDecision::Forward(encode_sgr(
                 report.button,
@@ -140,14 +136,10 @@ fn translate_col(event_col: u16, left_margin: u16, w: u16) -> Option<u16> {
     }
 }
 
-/// The down-filter decision: should a motion event be forwarded given the child's
-/// mode and whether a button is held?
-///
-/// - `None` — unreachable here (the gate swallows `None` before motion filtering),
-///   but total: no motion.
-/// - `Press` (X10, mode 9) / `PressRelease` (mode 1000) — drop all motion.
-/// - `ButtonMotion` (1002) — motion only while a button is held.
-/// - `AnyMotion` (1003) — forward all motion.
+/// Should a motion event be forwarded, given the child's mode and whether a
+/// button is held? `Press` is X10 (mode 9), `PressRelease` 1000, `ButtonMotion`
+/// 1002, `AnyMotion` 1003. `None` is unreachable — the gate swallows it before
+/// motion filtering — but the arm is kept so the match stays total.
 fn should_forward_motion(mode: MouseProtocolMode, button_held: bool) -> bool {
     match mode {
         MouseProtocolMode::None
@@ -169,9 +161,6 @@ fn should_forward_motion(mode: MouseProtocolMode, button_held: bool) -> bool {
 /// reports are neither, and counting them would invert the `ButtonMotion`
 /// down-filter (ADR-005).
 fn classify(report: &MouseReport) -> ButtonFacts {
-    const MOTION: u16 = 32;
-    const WHEEL: u16 = 64;
-
     let is_motion = report.button & MOTION != 0;
     let is_wheel = report.button & WHEEL != 0;
     ButtonFacts {
@@ -202,9 +191,6 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// The SGR wire bits the tests build reports from.
-    const MOTION: u16 = 32;
-    const WHEEL: u16 = 64;
     const NO_BUTTON: u16 = 3;
 
     fn press(button: u16, col: u16, row: u16) -> MouseReport {

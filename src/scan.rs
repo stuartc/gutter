@@ -84,8 +84,9 @@ pub struct MouseReport {
     pub release: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum State {
+    #[default]
     Ground,
     Esc,
     Csi,
@@ -98,6 +99,7 @@ enum State {
 }
 
 /// The input state machine. See the module docs.
+#[derive(Default)]
 pub struct Scanner {
     state: State,
     /// Withheld bytes of an escape sequence that has not completed yet.
@@ -111,21 +113,9 @@ pub struct Scanner {
     in_paste: bool,
 }
 
-impl Default for Scanner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Scanner {
     pub fn new() -> Self {
-        Self {
-            state: State::Ground,
-            pending: Vec::new(),
-            run: Vec::new(),
-            paste_guards: false,
-            in_paste: false,
-        }
+        Self::default()
     }
 
     /// Tell the scanner whether the mode mirror currently has bracketed paste on
@@ -186,26 +176,20 @@ impl Scanner {
                     }
                     ESC => {
                         // The held ESC was a bare Escape keypress after all; the
-                        // new one starts a fresh sequence.
-                        self.pending.clear();
+                        // new one takes its place, byte-identically.
                         self.emit_loose(vec![ESC], out);
-                        self.pending.push(ESC);
                     }
                     _ => {
                         // ESC + byte: Alt+<key>, one atomic two-byte unit.
                         self.pending.push(b);
-                        let unit = std::mem::take(&mut self.pending);
-                        self.emit_seq(unit, out);
-                        self.state = State::Ground;
+                        self.emit_pending(out);
                     }
                 },
                 State::Csi => {
                     if (0x20..=0x3f).contains(&b) {
                         self.pending.push(b);
                         if self.pending.len() > CSI_CAP {
-                            let unit = std::mem::take(&mut self.pending);
-                            self.emit_seq(unit, out);
-                            self.state = State::Ground;
+                            self.emit_pending(out);
                         }
                     } else if (0x40..=0x7e).contains(&b) {
                         self.pending.push(b);
@@ -216,17 +200,13 @@ impl Scanner {
                         // A C0 control (or DEL) aborts the sequence exactly as it
                         // would in the child's own parser. Forward the fragment
                         // and re-read this byte from Ground.
-                        let unit = std::mem::take(&mut self.pending);
-                        self.emit_seq(unit, out);
-                        self.state = State::Ground;
+                        self.emit_pending(out);
                         i -= 1;
                     }
                 }
                 State::Ss3 => {
                     self.pending.push(b);
-                    let unit = std::mem::take(&mut self.pending);
-                    self.emit_seq(unit, out);
-                    self.state = State::Ground;
+                    self.emit_pending(out);
                 }
                 State::Str => {
                     self.run.push(b);
@@ -284,13 +264,15 @@ impl Scanner {
         });
     }
 
-    /// Emit one atomic escape-sequence unit.
-    fn emit_seq(&self, bytes: Vec<u8>, out: &mut Vec<Token>) {
+    /// Close the withheld sequence off as one atomic unit and return to `Ground`.
+    fn emit_pending(&mut self, out: &mut Vec<Token>) {
+        let unit = std::mem::take(&mut self.pending);
         out.push(if self.in_paste {
-            Token::Paste(bytes)
+            Token::Paste(unit)
         } else {
-            Token::Seq(bytes)
+            Token::Seq(unit)
         });
+        self.state = State::Ground;
     }
 
     /// Decide what a completed CSI is. The paste gate comes first and is

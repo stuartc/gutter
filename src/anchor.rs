@@ -102,20 +102,13 @@ fn find_cpr(buf: &[u8]) -> Option<(usize, usize, u16)> {
             continue;
         }
         let digits_start = start + 2;
-        let mut i = digits_start;
-        while i < buf.len() && buf[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i == digits_start || i >= buf.len() || buf[i] != b';' {
+        let row_end = digits_end(buf, digits_start);
+        if row_end == digits_start || buf.get(row_end) != Some(&b';') {
             continue;
         }
-        let row_end = i;
-        i += 1;
-        let col_start = i;
-        while i < buf.len() && buf[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i == col_start || i >= buf.len() || buf[i] != b'R' {
+        let col_start = row_end + 1;
+        let col_end = digits_end(buf, col_start);
+        if col_end == col_start || buf.get(col_end) != Some(&b'R') {
             continue;
         }
         let Ok(text) = std::str::from_utf8(&buf[digits_start..row_end]) else {
@@ -126,9 +119,18 @@ fn find_cpr(buf: &[u8]) -> Option<(usize, usize, u16)> {
         };
         // The reply is 1-based; the grid is 0-based.
         let row0 = row.saturating_sub(1).min(u16::MAX as u32) as u16;
-        return Some((start, i + 1, row0));
+        return Some((start, col_end + 1, row0));
     }
     None
+}
+
+/// The index just past the run of ASCII digits starting at `from`.
+fn digits_end(buf: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < buf.len() && buf[i].is_ascii_digit() {
+        i += 1;
+    }
+    i
 }
 
 #[cfg(test)]

@@ -59,27 +59,31 @@ impl ModeMirror {
     #[must_use]
     pub fn take_pending(&mut self, screen: &vt100::Screen) -> Vec<u8> {
         let mut out = Vec::new();
-        edge(
-            &mut self.application_cursor,
-            screen.application_cursor(),
-            APPLICATION_CURSOR_ON,
-            APPLICATION_CURSOR_OFF,
-            &mut out,
-        );
-        edge(
-            &mut self.application_keypad,
-            screen.application_keypad(),
-            APPLICATION_KEYPAD_ON,
-            APPLICATION_KEYPAD_OFF,
-            &mut out,
-        );
-        edge(
-            &mut self.bracketed_paste,
-            screen.bracketed_paste(),
-            BRACKETED_PASTE_ON,
-            BRACKETED_PASTE_OFF,
-            &mut out,
-        );
+        for (mirrored, live, on, off) in [
+            (
+                &mut self.application_cursor,
+                screen.application_cursor(),
+                APPLICATION_CURSOR_ON,
+                APPLICATION_CURSOR_OFF,
+            ),
+            (
+                &mut self.application_keypad,
+                screen.application_keypad(),
+                APPLICATION_KEYPAD_ON,
+                APPLICATION_KEYPAD_OFF,
+            ),
+            (
+                &mut self.bracketed_paste,
+                screen.bracketed_paste(),
+                BRACKETED_PASTE_ON,
+                BRACKETED_PASTE_OFF,
+            ),
+        ] {
+            if live != *mirrored {
+                out.extend_from_slice(if live { on } else { off });
+                *mirrored = live;
+            }
+        }
         out
     }
 
@@ -112,15 +116,6 @@ impl ModeMirror {
     pub fn clear(&mut self) {
         *self = Self::default();
     }
-}
-
-/// Emit one mode's transition, if there is one.
-fn edge(mirrored: &mut bool, live: bool, on: &[u8], off: &[u8], out: &mut Vec<u8>) {
-    if live == *mirrored {
-        return;
-    }
-    out.extend_from_slice(if live { on } else { off });
-    *mirrored = live;
 }
 
 #[cfg(test)]
