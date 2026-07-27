@@ -15,10 +15,10 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::{
-    answer_cpr, drain_window, first_painted_col, outer_grid, pty_guard, spawn_gutter,
+    answer_cpr, drain_window, first_painted_col, outer_grid, poll_bytes, pty_guard, spawn_gutter,
     spawn_gutter_probing,
 };
 
@@ -126,29 +126,6 @@ fn pty_pair(cols: u16, rows: u16) -> (File, File) {
     }
 }
 
-/// Read `master` until `marker` appears or `deadline` elapses. The master is
-/// non-blocking, so an empty read is nothing-yet rather than end-of-stream.
-fn read_until_marker(master: &mut File, marker: &str, deadline: Duration) -> Vec<u8> {
-    let start = Instant::now();
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    while start.elapsed() < deadline {
-        match master.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                out.extend_from_slice(&buf[..n]);
-                if String::from_utf8_lossy(&out).contains(marker) {
-                    break;
-                }
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    out
-}
-
 /// A terminal on descriptors 0/1/2 that was never made the controlling terminal:
 /// `setsid gutter bash`, `subprocess.Popen` with a PTY but no `start_new_session`, a
 /// Go `exec` without `Setsid`+`Setctty`. `/dev/tty` does not open there, but there is
@@ -189,7 +166,12 @@ fn a_terminal_with_no_controlling_terminal_still_paints() {
     }
     let mut child = cmd.spawn().expect("spawn gutter on a PTY it does not control");
 
-    let out = read_until_marker(&mut master, "hi-no-ctty", Duration::from_secs(5));
+    let (_, out) = poll_bytes(
+        |buf| master.read(buf),
+        Duration::from_secs(5),
+        Duration::from_millis(3),
+        |b| String::from_utf8_lossy(b).contains("hi-no-ctty"),
+    );
     let _ = child.kill();
     let _ = child.wait();
 

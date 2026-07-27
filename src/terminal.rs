@@ -12,7 +12,7 @@
 //! symmetric: each restore step undoes only what was actually set up. The alt
 //! screen is not forced at setup; it mirrors the child's mode (ADR-012).
 
-use std::ffi::OsStr;
+use std::ffi::{CStr, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -149,19 +149,15 @@ pub trait OuterTerminal {
 /// The open doubles as gutter's terminal guard: both routes failing means there is no
 /// screen to render a band on. The error reported is `/dev/tty`'s, the usual cause.
 pub fn open_tty_write() -> io::Result<(File, PathBuf)> {
-    let dev_tty = Path::new("/dev/tty");
-    match open_write(dev_tty) {
-        Ok(f) => Ok((f, dev_tty.to_path_buf())),
-        Err(e) => {
-            let Some(path) = stdin_tty_path() else {
-                return Err(e);
-            };
-            match open_write(&path) {
-                Ok(f) => Ok((f, path)),
-                Err(_) => Err(e),
-            }
-        }
-    }
+    let dev_tty = PathBuf::from("/dev/tty");
+    let no_ctty = match open_write(&dev_tty) {
+        Ok(f) => return Ok((f, dev_tty)),
+        Err(e) => e,
+    };
+    let Some(path) = stdin_tty_path() else {
+        return Err(no_ctty);
+    };
+    open_write(&path).map(|f| (f, path)).map_err(|_| no_ctty)
 }
 
 /// `O_NOCTTY`: naming a terminal must not make it gutter's controlling terminal.
@@ -184,8 +180,8 @@ fn stdin_tty_path() -> Option<PathBuf> {
     if rc != 0 {
         return None;
     }
-    let end = buf.iter().position(|&b| b == 0)?;
-    (end > 0).then(|| PathBuf::from(OsStr::from_bytes(&buf[..end])))
+    let name = CStr::from_bytes_until_nul(&buf).ok()?.to_bytes();
+    (!name.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(name)))
 }
 
 /// The real outer terminal, backed by crossterm against the controlling terminal.

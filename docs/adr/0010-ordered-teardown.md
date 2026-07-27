@@ -56,9 +56,10 @@ pathological one. Only the error handling is different.
 
 The park half of the suspend/resume cycle ([ADR-019](0019-suspend-resume-cycle-ordering.md))
 already worked this way — `disable_raw_mode` has to run before the self-stop or the shell
-gets a raw terminal — so the two paths share one shape (`BestEffort` in `src/render.rs`)
-and one step list: the attribute and cursor-shape resets park emitted are on the exit
-path too.
+gets a raw terminal — so the two paths share one shape and one step list: `ordered_restore`
+in `src/render.rs`, collecting into a `BestEffort`. The attribute and cursor-shape resets
+park emitted are on the exit path because it is the same list; park adds only the flush
+before the self-stop.
 
 The exit path leans on this for its bytes too: `show_cursor` flushes, so reaching it
 unconditionally is what lands the hand-back line and anything else the restore queued.

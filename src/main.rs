@@ -80,17 +80,15 @@ fn run() -> i32 {
     // `gutter cmd > log` paints on screen and leaves the log empty. The open is also
     // the guard — no terminal resolves, no run — and it runs here, ahead of the CPR
     // probe that would otherwise stall waiting for a reply no one is going to send.
-    let (tty_out, tty_path) = match open_tty_write() {
-        Ok(resolved) => resolved,
-        Err(e) => {
-            eprintln!("gutter: no controlling terminal: {e}");
-            return 1;
-        }
-    };
-    // The tty gutter reads input from. Opened ONCE here: the CPR probe below and
-    // Thread 3 must share one file description, or they would race for the reply.
-    let input_tty = match open_input_tty(&tty_path) {
-        Ok(f) => f,
+    //
+    // The input side is opened ONCE, here: the CPR probe below and Thread 3 must share
+    // one file description, or they would race for the reply.
+    let resolved = open_tty_write().and_then(|(out, path)| {
+        let input = open_input_tty(&path)?;
+        Ok((out, path, input))
+    });
+    let (tty_out, tty_path, input_tty) = match resolved {
+        Ok(handles) => handles,
         Err(e) => {
             eprintln!("gutter: no controlling terminal: {e}");
             return 1;

@@ -95,13 +95,25 @@ pub fn poll_until(
     session: &mut OsSession,
     deadline: Duration,
     interval: Duration,
+    done: impl FnMut(&[u8]) -> bool,
+) -> (Duration, Vec<u8>) {
+    poll_bytes(|buf| session.try_read(buf), deadline, interval, done)
+}
+
+/// The same poll against any non-blocking reader — a bare PTY master a test built
+/// itself, not just an [`OsSession`]. A would-block is nothing-yet; `Ok(0)` is the
+/// end of the stream.
+pub fn poll_bytes(
+    mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+    deadline: Duration,
+    interval: Duration,
     mut done: impl FnMut(&[u8]) -> bool,
 ) -> (Duration, Vec<u8>) {
     let mut out = Vec::new();
     let mut buf = [0u8; 8192];
     let start = Instant::now();
     while start.elapsed() < deadline {
-        match session.try_read(&mut buf) {
+        match read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 out.extend_from_slice(&buf[..n]);

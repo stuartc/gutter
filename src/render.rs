@@ -1631,36 +1631,59 @@ impl BestEffort {
     }
 }
 
-/// Park the outer terminal (ADR-0019 step 3): leave alt (or hand the shell a fresh
-/// line below the inline band), reset attributes and cursor shape, undo the mirrored
-/// input modes and the child's keyboard modes, disable mouse, show the cursor, and
-/// drop raw mode LAST — then flush so it all lands before the self-stop.
-/// Deliberately does NOT clear `outer_alt_active`: it stays as "the child's screen
-/// is alt" for the resume re-derivation (the double-meaning note in ADR-0019). The
-/// relay's log survives for the same reason — this is a park, not a teardown, and
-/// `unpark` replays it.
-fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
+/// The explicit, ordered terminal restore (ADR-010), mode-aware (ADR-012/013):
+/// conditional alt-leave / inline hand-back → drop any leftover attribute run → hand the
+/// shell a default cursor shape → undo the mirrored input modes (ADR-022) → undo the
+/// child's keyboard modes (ADR-021) → disable mouse → show the cursor → drop raw mode
+/// LAST. Each step undoes only what was actually set up — the cursor shape is reset only
+/// when the child asked for one, so a shape the user set for their own shell survives.
+///
+/// The discriminator is the live `outer_alt_active`: a child that exits in the alt screen
+/// takes the leave-alt path; one that exits inline hands back below the band. The
+/// hand-back is gated on `ever_painted_inline` alone, so a TUI that dropped back to the
+/// primary screen without ever painting inline (even on a non-zero exit) leaves no stray
+/// status line. The exit code is consulted only inside the hand-back.
+///
+/// Best-effort per step: the order is fixed, but a failing step never short-circuits the
+/// ones after it, so raw mode comes off whatever else went wrong. The collector is handed
+/// back rather than a result, so a caller can add its own steps to the same run.
+fn ordered_restore<T: OuterTerminal>(
+    renderer: &Renderer,
+    term: &mut T,
+    exit_code: i32,
+) -> BestEffort {
     let mut restore = BestEffort::default();
 
     if renderer.outer_alt_active {
         restore.step(term.leave_alt_screen());
     } else if renderer.ever_painted_inline {
-        // Same hand-back as run_teardown's exit-0 path: a fresh line below the band.
-        restore.step(hand_back_inline(renderer, term, 0));
+        restore.step(hand_back_inline(renderer, term, exit_code));
     }
     restore.step(term.write_row(SGR_RESET));
     if renderer.parser.callbacks().cursor_shape.is_set() {
         restore.step(term.set_cursor_shape(DEFAULT_CURSOR_SHAPE));
     }
-    restore.step(mode_reset(renderer, term)); // undo the mirrored input modes (ADR-022)
+    restore.step(mode_reset(renderer, term));
+    restore.step(relay_reset(renderer, term));
+    restore.step(term.disable_mouse()); // conditional on mouse_enabled
+    restore.step(term.show_cursor());
+    restore.step(term.disable_raw_mode()); // LAST (ADR-010)
+    restore
+}
+
+/// Park the outer terminal (ADR-0019 step 3): the ordered restore, hand-back in its
+/// exit-0 shape, then a flush so it all lands before the self-stop.
+/// Deliberately does NOT clear `outer_alt_active`: it stays as "the child's screen
+/// is alt" for the resume re-derivation (the double-meaning note in ADR-0019). The
+/// relay's log survives for the same reason — this is a park, not a teardown, and
+/// `unpark` replays it.
+fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
+    let mut restore = ordered_restore(renderer, term, 0);
+
     // Cleared, not kept: the child's modes are still on its screen, so the step-9
     // repaint's poll re-asserts them on resume with no replay list.
     renderer.mode_mirror.clear();
-    restore.step(relay_reset(renderer, term)); // undo the child's keyboard modes (ADR-021)
-    restore.step(term.disable_mouse()); // conditional on mouse_enabled
-    restore.step(term.show_cursor());
     renderer.cursor_visible = true;
-    restore.step(term.disable_raw_mode()); // LAST (ADR-010)
     restore.step(term.flush()); // the park bytes must land before the self-stop
     restore.result()
 }
@@ -1797,42 +1820,30 @@ fn drain_pty_path<C, T, P, R>(
     }
 }
 
-/// The explicit, ordered terminal restore (ADR-010), mode-aware (ADR-012/013):
-/// conditional alt-leave / inline hand-back → reset the mirrored input modes → reset
-/// the child's keyboard modes → disable mouse → show cursor → disable raw mode. Each
-/// step undoes only what was actually set up.
-///
-/// The discriminator is the live `outer_alt_active`: a child that exits in the alt
-/// screen takes the leave-alt path; one that exits inline hands back below the band. The
-/// hand-back is gated on `ever_painted_inline` alone, so a TUI that dropped back to the
-/// primary screen without ever painting inline (even on a non-zero exit) leaves no stray
-/// status line. The exit code is consulted only inside the hand-back.
-///
-/// Best-effort per step, like `park`: the order is fixed but a failing step never
-/// short-circuits the ones after it, so the raw-mode drop happens whatever else went
-/// wrong. `show_cursor` flushes, landing everything the restore queued ahead of it.
+/// The exit path's restore: [`ordered_restore`] carrying the child's exit code, so the
+/// inline hand-back can print the dim status line. No flush of its own — `show_cursor`
+/// flushes, landing everything the restore queued ahead of it. The first error is
+/// returned; every step ran regardless.
 fn run_teardown<T: OuterTerminal>(
     renderer: &Renderer,
     term: &mut T,
     exit_code: i32,
 ) -> std::io::Result<()> {
-    let mut restore = BestEffort::default();
+    ordered_restore(renderer, term, exit_code).result()
+}
 
-    if renderer.outer_alt_active {
-        restore.step(term.leave_alt_screen());
-    } else if renderer.ever_painted_inline {
-        restore.step(hand_back_inline(renderer, term, exit_code));
-    }
-    restore.step(term.write_row(SGR_RESET));
-    if renderer.parser.callbacks().cursor_shape.is_set() {
-        restore.step(term.set_cursor_shape(DEFAULT_CURSOR_SHAPE));
-    }
-    restore.step(mode_reset(renderer, term));
-    restore.step(relay_reset(renderer, term));
-    restore.step(term.disable_mouse());
-    restore.step(term.show_cursor());
-    restore.step(term.disable_raw_mode());
-    restore.result()
+/// The content rows a mock terminal was asked to write, with the restore's own
+/// [`SGR_RESET`] dropped: every restore emits one, and no assertion here is about it.
+#[cfg(test)]
+fn content_rows(calls: &[crate::terminal::mock::Call]) -> Vec<&[u8]> {
+    use crate::terminal::mock::Call;
+    calls
+        .iter()
+        .filter_map(|c| match c {
+            Call::WriteRow(b) if b != SGR_RESET => Some(b.as_slice()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The inline hand-back (ADR-013): drop the cursor to a fresh line below the band's last
@@ -1844,7 +1855,7 @@ fn run_teardown<T: OuterTerminal>(
 /// to the bottom). A `newline()` from there lands a fresh line below it, scrolling the
 /// terminal when the band already reaches the bottom; on a non-zero exit the dim status's
 /// own leading `\r\n` does that line break instead. No explicit flush: the queued bytes
-/// are drained by the `show_cursor` flush later in `run_teardown`.
+/// are drained by the `show_cursor` flush later in the restore.
 fn hand_back_inline<T: OuterTerminal>(
     renderer: &Renderer,
     term: &mut T,
@@ -2318,12 +2329,8 @@ mod tests {
 
         // A TUI exits in alt → the leave-alt path runs, the hand-back is skipped:
         // no hand-back write_row and no status line on the primary screen.
-        assert_eq!(
-            term.calls
-                .iter()
-                .filter(|c| matches!(c, Call::WriteRow(b) if b != SGR_RESET))
-                .count(),
-            0,
+        assert!(
+            content_rows(&term.calls).is_empty(),
             "an alt-screen TUI replays nothing onto the primary screen"
         );
     }
@@ -2496,32 +2503,20 @@ mod tests {
             "a never-alt renderer must not leave an alt screen it never entered"
         );
 
-        let status_rows: Vec<&[u8]> = term
-            .calls
-            .iter()
-            .filter_map(|c| match c {
-                Call::WriteRow(b) if b != SGR_RESET => Some(b.as_slice()),
-                _ => None,
-            })
-            .collect();
         assert_eq!(
-            status_rows,
+            content_rows(&term.calls),
             vec![b"\r\n\x1b[2mExited with: 1\x1b[0m".as_slice()],
             "exit_code = 1 hands back the dim status line via write_row"
         );
 
-        let status = term
-            .calls
-            .iter()
-            .position(|c| matches!(c, Call::WriteRow(b) if b != SGR_RESET))
-            .unwrap();
         let show_cursor = term
             .calls
             .iter()
             .position(|c| *c == Call::ShowCursor)
             .unwrap();
-        assert!(
-            status < show_cursor,
+        assert_eq!(
+            content_rows(&term.calls[..show_cursor]).len(),
+            1,
             "status emission slots before the remaining restore steps"
         );
 
@@ -2530,13 +2525,8 @@ mod tests {
         renderer0.ever_painted_inline = true;
         let mut term0 = MockTerminal::new();
         run_teardown(&renderer0, &mut term0, 0).unwrap();
-        assert_eq!(
-            term0
-                .calls
-                .iter()
-                .filter(|c| matches!(c, Call::WriteRow(b) if b != SGR_RESET))
-                .count(),
-            0,
+        assert!(
+            content_rows(&term0.calls).is_empty(),
             "exit_code = 0 hands back no status line"
         );
         assert!(
@@ -2677,9 +2667,7 @@ mod tests {
         // write_row is emitted (the hand-back is skipped while in alt).
         let leave_idx = term.calls.iter().position(|c| *c == Call::LeaveAltScreen).unwrap();
         assert!(
-            !term.calls[leave_idx..]
-                .iter()
-                .any(|c| matches!(c, Call::WriteRow(b) if b != SGR_RESET)),
+            content_rows(&term.calls[leave_idx..]).is_empty(),
             "alt stream: no hand-back write_row after the alt-leave"
         );
 
@@ -5461,7 +5449,7 @@ mod inline_anchor {
         );
         assert!(t0.calls.contains(&Call::Newline), "zero exit drops a fresh line below the band");
         assert!(
-            !t0.calls.iter().any(|c| matches!(c, Call::WriteRow(b) if b != SGR_RESET)),
+            content_rows(&t0.calls).is_empty(),
             "zero exit writes no status line"
         );
 
@@ -5469,16 +5457,8 @@ mod inline_anchor {
         let mut t1 = MockTerminal::new();
         run_teardown(&r, &mut t1, 7).unwrap();
         assert!(t1.calls.contains(&Call::MoveTo(0, 11)));
-        let writes: Vec<&[u8]> = t1
-            .calls
-            .iter()
-            .filter_map(|c| match c {
-                Call::WriteRow(b) if b != SGR_RESET => Some(b.as_slice()),
-                _ => None,
-            })
-            .collect();
         assert_eq!(
-            writes,
+            content_rows(&t1.calls),
             vec![b"\r\n\x1b[2mExited with: 7\x1b[0m".as_slice()],
             "a non-zero exit hands back the dim status line below the band"
         );
