@@ -1604,6 +1604,27 @@ where
     SuspendOutcome::Resumed
 }
 
+/// A restore run in ADR-010 order: every step is attempted even after an earlier one
+/// fails, so a failed alt-leave cannot short-circuit the raw-mode drop and strand the
+/// shell in raw mode or mouse reporting. The first error is kept and returned.
+#[derive(Default)]
+struct BestEffort(Option<std::io::Error>);
+
+impl BestEffort {
+    fn step(&mut self, r: std::io::Result<()>) {
+        if let Err(e) = r {
+            self.0.get_or_insert(e);
+        }
+    }
+
+    fn result(self) -> std::io::Result<()> {
+        match self.0 {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Park the outer terminal (ADR-0019 step 3): leave alt (or hand the shell a fresh
 /// line below the inline band), reset attributes and cursor shape, undo the mirrored
 /// input modes and the child's keyboard modes, disable mouse, show the cursor, and
@@ -1613,39 +1634,27 @@ where
 /// relay's log survives for the same reason — this is a park, not a teardown, and
 /// `unpark` replays it.
 fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
-    // Best-effort per step (ADR-010's "restore by hand, each step conditional"):
-    // attempt EVERY restore step even if an earlier one errors, so an early failure
-    // (e.g. a flush inside leave_alt_screen) can't short-circuit the rest and strand
-    // the shell in raw mode or mouse reporting. disable_raw_mode in particular MUST run
-    // before the self-stop. The first error is remembered and returned for logging.
-    let mut first_err: std::io::Result<()> = Ok(());
-    let mut record = |r: std::io::Result<()>| {
-        if let Err(e) = r {
-            if first_err.is_ok() {
-                first_err = Err(e);
-            }
-        }
-    };
+    let mut restore = BestEffort::default();
 
     if renderer.outer_alt_active {
-        record(term.leave_alt_screen());
+        restore.step(term.leave_alt_screen());
     } else if renderer.ever_painted_inline {
         // Same hand-back as run_teardown's exit-0 path: a fresh line below the band.
-        record(hand_back_inline(renderer, term, 0));
+        restore.step(hand_back_inline(renderer, term, 0));
     }
-    record(term.write_row(b"\x1b[0m")); // drop any leftover attribute run
-    record(term.set_cursor_shape(b"\x1b[0 q")); // hand the shell a default cursor shape
-    record(mode_reset(renderer, term)); // undo the mirrored input modes (ADR-022)
+    restore.step(term.write_row(b"\x1b[0m")); // drop any leftover attribute run
+    restore.step(term.set_cursor_shape(b"\x1b[0 q")); // hand the shell a default cursor shape
+    restore.step(mode_reset(renderer, term)); // undo the mirrored input modes (ADR-022)
     // Cleared, not kept: the child's modes are still on its screen, so the step-9
     // repaint's poll re-asserts them on resume with no replay list.
     renderer.mode_mirror.clear();
-    record(relay_reset(renderer, term)); // undo the child's keyboard modes (ADR-021)
-    record(term.disable_mouse()); // conditional on mouse_enabled
-    record(term.show_cursor());
+    restore.step(relay_reset(renderer, term)); // undo the child's keyboard modes (ADR-021)
+    restore.step(term.disable_mouse()); // conditional on mouse_enabled
+    restore.step(term.show_cursor());
     renderer.cursor_visible = true;
-    record(term.disable_raw_mode()); // LAST (ADR-010) — must run even after an error
-    record(term.flush()); // the park bytes must land before the self-stop
-    first_err
+    restore.step(term.disable_raw_mode()); // LAST (ADR-010)
+    restore.step(term.flush()); // the park bytes must land before the self-stop
+    restore.result()
 }
 
 /// Unpark the outer terminal (ADR-0019 step 5): re-take it after the self-stop
@@ -1790,22 +1799,28 @@ fn drain_pty_path<C, T, P, R>(
 /// hand-back is gated on `ever_painted_inline` alone, so a TUI that dropped back to the
 /// primary screen without ever painting inline (even on a non-zero exit) leaves no stray
 /// status line. The exit code is consulted only inside the hand-back.
+///
+/// Best-effort per step, like `park`: the order is fixed but a failing step never
+/// short-circuits the ones after it, so the raw-mode drop happens whatever else went
+/// wrong. `show_cursor` flushes, landing everything the restore queued ahead of it.
 fn run_teardown<T: OuterTerminal>(
     renderer: &Renderer,
     term: &mut T,
     exit_code: i32,
 ) -> std::io::Result<()> {
+    let mut restore = BestEffort::default();
+
     if renderer.outer_alt_active {
-        term.leave_alt_screen()?;
+        restore.step(term.leave_alt_screen());
     } else if renderer.ever_painted_inline {
-        hand_back_inline(renderer, term, exit_code)?;
+        restore.step(hand_back_inline(renderer, term, exit_code));
     }
-    mode_reset(renderer, term)?;
-    relay_reset(renderer, term)?;
-    term.disable_mouse()?;
-    term.show_cursor()?;
-    term.disable_raw_mode()?;
-    Ok(())
+    restore.step(mode_reset(renderer, term));
+    restore.step(relay_reset(renderer, term));
+    restore.step(term.disable_mouse());
+    restore.step(term.show_cursor());
+    restore.step(term.disable_raw_mode());
+    restore.result()
 }
 
 /// The inline hand-back (ADR-013): drop the cursor to a fresh line below the band's last
@@ -2515,6 +2530,34 @@ mod tests {
         assert!(
             term0.calls.contains(&Call::Newline),
             "exit_code = 0 still drops the cursor to a fresh line below the band"
+        );
+    }
+
+    /// Teardown is best-effort per step (ADR-010): a terminal that fails the alt-leave
+    /// and the cursor show still gets every later step, raw mode above all — propagating
+    /// the first error instead would hand the user's shell back in raw mode. The first
+    /// failure is what surfaces.
+    #[test]
+    fn run_teardown_runs_every_step_after_a_failing_one() {
+        let mut renderer = left_renderer(80, 24);
+        renderer.outer_alt_active = true;
+        let mut term = MockTerminal::new();
+        term.enable_mouse().unwrap();
+        term.fail_on(Call::LeaveAltScreen);
+        term.fail_on(Call::ShowCursor);
+
+        let err = run_teardown(&renderer, &mut term, 0).expect_err("the failure surfaces");
+
+        assert_eq!(err.to_string(), "LeaveAltScreen failed");
+        assert_eq!(
+            term.restore_calls(),
+            vec![
+                Call::LeaveAltScreen,
+                Call::DisableMouse,
+                Call::ShowCursor,
+                Call::DisableRawMode,
+            ],
+            "a failing step leaves the ADR-010 order intact and the rest still runs"
         );
     }
 

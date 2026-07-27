@@ -248,11 +248,6 @@ fn run() -> i32 {
         &suspender,
     );
 
-    // The render loop already ran the ordered restore before returning; nothing
-    // writes to the buffered sink after it, and `process::exit` runs no destructor
-    // that would land those last bytes (ADR-010).
-    let _ = terminal.flush();
-
     // A None (channel disconnected without ChildExited) counts as success.
     code.unwrap_or(0)
 }

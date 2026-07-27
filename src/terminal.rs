@@ -524,6 +524,9 @@ pub mod mock {
         /// shared cell so a test (or the mock suspender's on-suspend hook) can flip
         /// it mid-cycle to model a resize while gutter was suspended (ADR-0019).
         size: std::rc::Rc<std::cell::Cell<(u16, u16)>>,
+        /// Call variants that return an error, so a test can drive a restore step
+        /// that fails against a terminal that has gone away.
+        failing: Vec<std::mem::Discriminant<Call>>,
     }
 
     impl MockTerminal {
@@ -550,14 +553,27 @@ pub mod mock {
             self.size.clone()
         }
 
+        /// Make the given call fail, matched on its variant alone — any argument will
+        /// do, so `fail_on(Call::WriteRow(vec![]))` fails every row write. The call is
+        /// still recorded: it was invoked, it just did not succeed.
+        pub fn fail_on(&mut self, call: Call) {
+            self.failing.push(std::mem::discriminant(&call));
+        }
+
         /// Record one call: into `calls`, and into the shared order log if one is
         /// attached. The single choke point every `OuterTerminal` method funnels
-        /// through, so nothing bypasses the interleaved log.
-        fn record(&mut self, c: Call) {
+        /// through, so nothing bypasses the interleaved log — or the failure list.
+        fn record(&mut self, c: Call) -> io::Result<()> {
+            let fails = self.failing.contains(&std::mem::discriminant(&c));
+            let named = fails.then(|| format!("{c:?} failed"));
             if let Some(log) = &self.log {
                 log.borrow_mut().push(c.clone());
             }
             self.calls.push(c);
+            match named {
+                Some(msg) => Err(io::Error::other(msg)),
+                None => Ok(()),
+            }
         }
 
         /// The restore subsequence only, for the ADR-010 order assertion —
@@ -821,32 +837,27 @@ pub mod mock {
 
     impl OuterTerminal for MockTerminal {
         fn enable_raw_mode(&mut self) -> io::Result<()> {
-            self.record(Call::EnableRawMode);
-            Ok(())
+            self.record(Call::EnableRawMode)
         }
         fn enable_mouse(&mut self) -> io::Result<()> {
-            self.record(Call::EnableMouse);
+            let r = self.record(Call::EnableMouse);
             self.mouse_enabled = true;
-            Ok(())
+            r
         }
         fn enter_alt_screen(&mut self) -> io::Result<()> {
-            self.record(Call::EnterAltScreen);
-            Ok(())
+            self.record(Call::EnterAltScreen)
         }
         fn terminal_size(&mut self) -> io::Result<(u16, u16)> {
             Ok(self.size.get())
         }
         fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
-            self.record(Call::MoveTo(col, row));
-            Ok(())
+            self.record(Call::MoveTo(col, row))
         }
         fn write_row(&mut self, bytes: &[u8]) -> io::Result<()> {
-            self.record(Call::WriteRow(bytes.to_vec()));
-            Ok(())
+            self.record(Call::WriteRow(bytes.to_vec()))
         }
         fn newline(&mut self) -> io::Result<()> {
-            self.record(Call::Newline);
-            Ok(())
+            self.record(Call::Newline)
         }
         fn clear_gutter(
             &mut self,
@@ -856,56 +867,46 @@ pub mod mock {
             row_start: u16,
             row_end: u16,
         ) -> io::Result<()> {
-            self.record(Call::ClearGutter(margin, width, real_cols, row_start, row_end));
-            Ok(())
+            self.record(Call::ClearGutter(margin, width, real_cols, row_start, row_end))
         }
         fn clear_row_span(&mut self, row_start: u16, row_end: u16) -> io::Result<()> {
-            self.record(Call::ClearRowSpan(row_start, row_end));
-            Ok(())
+            self.record(Call::ClearRowSpan(row_start, row_end))
         }
         fn draw_rails(&mut self, rails: &super::Rails) -> io::Result<()> {
-            self.record(Call::DrawRails(rails.clone()));
-            Ok(())
+            self.record(Call::DrawRails(rails.clone()))
         }
         fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {
-            self.record(Call::PlaceCursor(col, row));
-            Ok(())
+            self.record(Call::PlaceCursor(col, row))
         }
         fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
-            self.record(Call::SetCursorVisible(visible));
-            Ok(())
+            self.record(Call::SetCursorVisible(visible))
         }
         fn set_cursor_shape(&mut self, bytes: &[u8]) -> io::Result<()> {
-            self.record(Call::SetCursorShape(bytes.to_vec()));
-            Ok(())
+            self.record(Call::SetCursorShape(bytes.to_vec()))
         }
         fn flush(&mut self) -> io::Result<()> {
-            self.record(Call::Flush);
-            Ok(())
+            self.record(Call::Flush)
         }
         fn relay(&mut self, bytes: &[u8]) -> io::Result<()> {
-            self.record(Call::Relay(bytes.to_vec()));
-            Ok(())
+            self.record(Call::Relay(bytes.to_vec()))
         }
         fn leave_alt_screen(&mut self) -> io::Result<()> {
-            self.record(Call::LeaveAltScreen);
-            Ok(())
+            self.record(Call::LeaveAltScreen)
         }
         fn disable_mouse(&mut self) -> io::Result<()> {
             // Mirror the real impl: only disable what was actually enabled.
-            if self.mouse_enabled {
-                self.record(Call::DisableMouse);
-                self.mouse_enabled = false;
+            if !self.mouse_enabled {
+                return Ok(());
             }
-            Ok(())
+            let r = self.record(Call::DisableMouse);
+            self.mouse_enabled = false;
+            r
         }
         fn show_cursor(&mut self) -> io::Result<()> {
-            self.record(Call::ShowCursor);
-            Ok(())
+            self.record(Call::ShowCursor)
         }
         fn disable_raw_mode(&mut self) -> io::Result<()> {
-            self.record(Call::DisableRawMode);
-            Ok(())
+            self.record(Call::DisableRawMode)
         }
     }
 }

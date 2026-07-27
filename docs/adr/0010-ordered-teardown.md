@@ -32,6 +32,29 @@ actually set up.
 - Disabling mouse, showing the cursor, and disabling raw mode are always safe to
   call unconditionally.
 
+## Amendment — the order is fixed, the steps are best-effort
+
+Teardown used to propagate with `?`, which made the order fixed *and* the sequence
+fragile: one failing step — a flush inside the alt-leave against a terminal that has
+gone away — skipped every step after it, `disable_raw_mode` included, and handed the
+user's shell back in raw mode. The failure worth protecting against is exactly the one
+that leaves the terminal unusable.
+
+So every restore step is attempted regardless of what an earlier one returned, and the
+first error is kept and returned for the caller to log. The order does not change and
+must not: it is what makes the restore correct when everything succeeds, which is every
+run but the pathological one. Only the error handling is different.
+
+The park half of the suspend/resume cycle ([ADR-019](0019-suspend-resume-cycle-ordering.md))
+already worked this way — `disable_raw_mode` has to run before the self-stop or the shell
+gets a raw terminal — so the two paths now share one shape (`BestEffort` in
+`src/render.rs`) rather than disagreeing.
+
+The exit path leans on this for its bytes too: `show_cursor` flushes, so reaching it
+unconditionally is what lands the hand-back line and anything else the restore queued.
+Nothing writes to the sink after teardown returns, and `process::exit` runs no destructor
+that would land a straggler.
+
 ## Code anchors
 
 - `src/render.rs` — the ordered teardown path

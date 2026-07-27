@@ -75,8 +75,8 @@ the render sink and the clipboard sink are two of them, deliberately (ADR-004).
 **The sink is buffered, so the flush is correctness, not tidiness.** `io::Stdout`
 flushed itself as the process ended; a `BufWriter<File>` does not, and `process::exit`
 runs no destructors (ADR-010). The ordered restore's last byte-producing step,
-`show_cursor`, flushes; `park` flushes before the self-stop (ADR-019); and `run()`
-flushes once more after the render loop returns.
+`show_cursor`, flushes, and teardown is best-effort per step so it is reached whatever
+else failed; `park` flushes before the self-stop (ADR-019).
 
 ### The precedent: tmux and screen
 
@@ -181,8 +181,7 @@ redirect cases that used to trigger the stdout half of this bug no longer reach 
 - `src/clipboard.rs` — `open_tty_read_write`, the read-write open both the input
   handle and the clipboard sink are made from
 - `src/main.rs` — both opens at the top of `run()`, the resolved path threaded to the
-  keyboard and clipboard opens, the refusal lines, and the flush after the render loop
-  returns
+  keyboard and clipboard opens, and the refusal lines
 - `tests/tty_model.rs` — the refusal, the fallback, the redirect, and the
   probe-survives-a-redirect tests
 
