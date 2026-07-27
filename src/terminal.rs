@@ -100,8 +100,8 @@ pub trait OuterTerminal {
 
     // --- Child-driven keyboard modes (ADR-021) ---
     /// Write child-originated keyboard-mode bytes to the real terminal verbatim, and
-    /// flush them: the child may be blocked waiting on the round trip, and crossterm's
-    /// stdout is buffered. The bytes are the relay's canonical forms, so this method
+    /// flush them: the child may be blocked waiting on the round trip, and the sink is
+    /// buffered. The bytes are the relay's canonical forms, so this method
     /// neither builds nor inspects them.
     ///
     /// Distinct from [`write_row`] so the recorded call log keeps relay bytes apart

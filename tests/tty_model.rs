@@ -13,7 +13,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::{
-    answer_cpr, drain_window, grid_text, outer_grid, pty_guard, spawn_gutter, spawn_gutter_probing,
+    answer_cpr, drain_window, first_painted_col, outer_grid, pty_guard, spawn_gutter,
+    spawn_gutter_probing,
 };
 
 /// A fresh path under the system temp dir, unique per process and tag. Not created —
@@ -25,16 +26,19 @@ fn temp_path(tag: &str) -> PathBuf {
 /// With no controlling terminal there is nothing to render a band on: gutter prints
 /// one line to stderr, exits 1, and never gets as far as spawning the child.
 ///
-/// `setsid` in the forked child is what arranges that — it leaves the session (and so
-/// the controlling terminal) the test binary inherited from whoever ran `cargo test`.
-/// A fresh `Command` child is never a process-group leader, so the call cannot fail.
+/// The child is a path that cannot exist, which is what makes the ordering readable:
+/// reaching the spawn produces `failed to spawn`, refusing first produces
+/// `no controlling terminal`, and stderr says which happened. A marker file the child
+/// would touch cannot tell them apart — the refusal closes the PTY master and SIGHUPs
+/// the child long before it execs, so the marker never appears either way.
+///
+/// `setsid` in the forked child is what removes the controlling terminal — it leaves
+/// the session the test binary inherited from whoever ran `cargo test`. A fresh
+/// `Command` child is never a process-group leader, so the call cannot fail.
 #[test]
 fn no_controlling_terminal_refuses_before_spawning_the_child() {
-    let marker = temp_path("marker");
-    let _ = fs::remove_file(&marker);
-
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gutter"));
-    cmd.args(["sh", "-c", &format!("touch {}", marker.display())]);
+    cmd.arg("/nonexistent/gutter-never-spawns-this");
     cmd.env("TERM", "xterm-256color");
     cmd.env_remove("GUTTER_FORCE_ANCHOR_ROW");
     cmd.stdin(Stdio::piped());
@@ -69,15 +73,18 @@ fn no_controlling_terminal_refuses_before_spawning_the_child() {
         String::from_utf8_lossy(&out.stdout)
     );
     assert!(
-        !marker.exists(),
-        "the guard must refuse before the child is spawned"
+        !stderr.contains("failed to spawn"),
+        "the guard must refuse before the child is spawned, got {stderr:?}"
     );
-
-    let _ = fs::remove_file(&marker);
 }
 
 /// `gutter cmd > log` paints on the screen and leaves the log empty: the band goes to
 /// the controlling terminal, and the child's output is not teed into the redirect.
+///
+/// 120×40 rather than 80×24, because 80×24 is `crossterm::terminal::size`'s own
+/// fallback — a geometry regression that read the size through the redirect target
+/// would land on it and still look right. Centred at `--width 40` the band starts at
+/// column 40 on this terminal, and at column 20 if the fallback is what answered.
 #[test]
 fn a_redirect_captures_nothing_and_the_band_still_paints() {
     let _guard = pty_guard();
@@ -85,20 +92,27 @@ fn a_redirect_captures_nothing_and_the_band_still_paints() {
     let _ = fs::remove_file(&log);
 
     let mut session = spawn_gutter(
-        80,
-        24,
+        120,
+        40,
         &format!(
-            "--width 40 sh -c 'printf hi-from-the-band; sleep 0.5' > {}",
+            "--width 40 --center sh -c 'printf hi-from-the-band; sleep 0.5' > {}",
             log.display()
         ),
     );
     let out = drain_window(&mut session, Duration::from_secs(2));
     drop(session);
 
-    let text = grid_text(&out, 80, 24);
+    let parser = outer_grid(&out, 120, 40);
+    let screen = parser.screen();
+    let rows: Vec<String> = screen.rows(0, 120).collect();
     assert!(
-        text.contains("hi-from-the-band"),
-        "the band must paint on the terminal even with stdout redirected: {text:?}"
+        rows.iter().any(|r| r.contains("hi-from-the-band")),
+        "the band must paint on the terminal even with stdout redirected: {rows:?}"
+    );
+    assert_eq!(
+        first_painted_col(screen, 120),
+        Some(40),
+        "the band must be centred in the terminal's own 120 columns; rows: {rows:?}"
     );
     let captured = fs::read(&log).expect("the redirect target must exist");
     assert!(

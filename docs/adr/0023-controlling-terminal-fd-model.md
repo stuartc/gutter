@@ -35,7 +35,9 @@ Three consequences, all measured rather than theorised:
 ## Decision
 
 **One terminal: the controlling terminal.** Every side gutter has on the outer
-terminal goes through `/dev/tty`, and stdout is not touched.
+terminal goes through `/dev/tty`, and stdout is not touched — bar one, the termios
+state, which crossterm still owns and which *The one thing still not on the controlling
+terminal* below records in full.
 
 | Side | Handle |
 |---|---|
@@ -43,8 +45,10 @@ terminal goes through `/dev/tty`, and stdout is not touched.
 | The keyboard, and the CPR probe's reply | `/dev/tty`, opened read-write, **once**, shared by the probe and Thread 3 |
 | The OSC-52 clipboard | `/dev/tty`, its own read-write open (ADR-004) |
 | The terminal's size | `/dev/tty`, opened by crossterm inside `terminal::size` |
+| Raw mode | **stdin** whenever stdin is a terminal — crossterm's `tty_fd()`, the exception |
 
-gutter never reads stdin and never writes stdout. stderr carries gutter's own
+gutter never writes stdout, and reads stdin in no code of its own; crossterm's
+raw-mode helpers are the only thing left that touches descriptor 0. stderr carries gutter's own
 diagnostics — the startup refusals, and a failed clipboard write — never the child's
 output, which goes to its PTY and reaches the screen only as band paint.
 
@@ -98,20 +102,37 @@ gutter keys off `/dev/tty` directly instead of naming the terminal via
   terminal, or nothing. gutter is a single process wrapping a single child, so the
   descriptor it opens is the descriptor it uses, and no name ever leaves the process.
 
-The visible difference: gutter accepts an invocation where stdin is redirected, as
-long as a controlling terminal exists. `gutter cmd < input.txt` runs, where tmux would
-refuse it. The child gets nothing from that file — its input comes from the keyboard,
-and gutter reads stdin nowhere.
+Two visible differences follow.
+
+- gutter accepts an invocation where stdin is redirected, as long as a controlling
+  terminal exists. `gutter cmd < input.txt` runs, where tmux would refuse it. The child
+  gets nothing from that file — its input comes from the keyboard, and gutter reads
+  stdin nowhere.
+- A terminal handed to gutter on descriptors 0/1/2 **without** being made the
+  controlling terminal gets nothing at all. That is
+  `subprocess.Popen([…], stdin=slave, stdout=slave, stderr=slave)` with no
+  `start_new_session=True`, or any exec that attaches a PTY but omits
+  `Setsid`+`Setctty`: `/dev/tty` still names the terminal gutter was launched from, so
+  gutter paints and sizes there, and the PTY the caller allocated — and is reading from
+  — sees not one byte. tmux and screen paint on the caller's PTY, because
+  `ttyname(STDIN_FILENO)` names it. gutter's own integration suite only escapes this
+  because expectrl does `setsid` + `TIOCSCTTY` in the child.
 
 ## Consequences
 
 - `gutter cmd > log` paints on screen and leaves the log empty, with no startup stall.
-- With no controlling terminal — a cron job, a detached session, a pipeline with no
-  terminal anywhere — gutter prints one line and exits 1 **before** the child is
-  spawned. There is no half-started run to clean up and no child left behind.
-- The `dup(0)` fallback in `open_input_tty` is deleted. It could only ever have had
-  gutter reading a redirected stdin as if it were the keyboard, which is the bug, not
-  a fallback.
+- With no controlling terminal — a cron job, a pipeline with no terminal anywhere, or
+  a session detached from the terminal it was handed — gutter prints one line and exits
+  1 **before** the child is spawned. There is no half-started run to clean up and no
+  child left behind.
+- The `dup(0)` fallback in `open_input_tty` is deleted, and a configuration that used
+  to work goes with it: a terminal on descriptors 0/1/2 with no controlling terminal,
+  which is `setsid gutter bash` and any launcher that hands over a PTY without
+  `TIOCSCTTY`. There `/dev/tty` never opened, `dup(0)` handed back the terminal anyway,
+  crossterm fell through to `STDOUT_FILENO` for the size, and everything but the
+  clipboard worked. That run now refuses, with a screen sitting right there. It is the
+  price of making the open the guard: buying it back means identifying the terminal a
+  second way, which is the two-mechanism bug this record exists to remove.
 - The degraded "keyboard input is disabled" branch is deleted with it. A run without a
   keyboard is no longer reachable: the same device must open for the paint sink first.
 - The clipboard's separateness (ADR-004) survives unchanged, but its rule is now
