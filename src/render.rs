@@ -48,6 +48,12 @@ pub const TEARDOWN_DRAIN_GRACE: Duration = Duration::from_millis(100);
 /// never the live parser's memory.
 const SCROLL_TRACKER_SCROLLBACK: usize = 4096;
 
+/// What the two restore paths hand the shell back: no leftover attribute run from the
+/// band's last painted cell, and the terminal's default cursor shape rather than
+/// whatever DECSCUSR the child last asked for (ADR-010).
+const SGR_RESET: &[u8] = b"\x1b[0m";
+const DEFAULT_CURSOR_SHAPE: &[u8] = b"\x1b[0 q";
+
 /// The render thread's state: the parsers, the diff baseline, and the band geometry.
 pub struct Renderer {
     parser: vt100::Parser<GutterCallbacks>,
@@ -1642,8 +1648,10 @@ fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Res
         // Same hand-back as run_teardown's exit-0 path: a fresh line below the band.
         restore.step(hand_back_inline(renderer, term, 0));
     }
-    restore.step(term.write_row(b"\x1b[0m")); // drop any leftover attribute run
-    restore.step(term.set_cursor_shape(b"\x1b[0 q")); // hand the shell a default cursor shape
+    restore.step(term.write_row(SGR_RESET));
+    if renderer.parser.callbacks().cursor_shape.is_set() {
+        restore.step(term.set_cursor_shape(DEFAULT_CURSOR_SHAPE));
+    }
     restore.step(mode_reset(renderer, term)); // undo the mirrored input modes (ADR-022)
     // Cleared, not kept: the child's modes are still on its screen, so the step-9
     // repaint's poll re-asserts them on resume with no replay list.
@@ -1814,6 +1822,10 @@ fn run_teardown<T: OuterTerminal>(
         restore.step(term.leave_alt_screen());
     } else if renderer.ever_painted_inline {
         restore.step(hand_back_inline(renderer, term, exit_code));
+    }
+    restore.step(term.write_row(SGR_RESET));
+    if renderer.parser.callbacks().cursor_shape.is_set() {
+        restore.step(term.set_cursor_shape(DEFAULT_CURSOR_SHAPE));
     }
     restore.step(mode_reset(renderer, term));
     restore.step(relay_reset(renderer, term));
@@ -2309,7 +2321,7 @@ mod tests {
         assert_eq!(
             term.calls
                 .iter()
-                .filter(|c| matches!(c, Call::WriteRow(_)))
+                .filter(|c| matches!(c, Call::WriteRow(b) if b != SGR_RESET))
                 .count(),
             0,
             "an alt-screen TUI replays nothing onto the primary screen"
@@ -2488,7 +2500,7 @@ mod tests {
             .calls
             .iter()
             .filter_map(|c| match c {
-                Call::WriteRow(b) => Some(b.as_slice()),
+                Call::WriteRow(b) if b != SGR_RESET => Some(b.as_slice()),
                 _ => None,
             })
             .collect();
@@ -2501,7 +2513,7 @@ mod tests {
         let status = term
             .calls
             .iter()
-            .position(|c| matches!(c, Call::WriteRow(_)))
+            .position(|c| matches!(c, Call::WriteRow(b) if b != SGR_RESET))
             .unwrap();
         let show_cursor = term
             .calls
@@ -2522,7 +2534,7 @@ mod tests {
             term0
                 .calls
                 .iter()
-                .filter(|c| matches!(c, Call::WriteRow(_)))
+                .filter(|c| matches!(c, Call::WriteRow(b) if b != SGR_RESET))
                 .count(),
             0,
             "exit_code = 0 hands back no status line"
@@ -2665,7 +2677,9 @@ mod tests {
         // write_row is emitted (the hand-back is skipped while in alt).
         let leave_idx = term.calls.iter().position(|c| *c == Call::LeaveAltScreen).unwrap();
         assert!(
-            !term.calls[leave_idx..].iter().any(|c| matches!(c, Call::WriteRow(_))),
+            !term.calls[leave_idx..]
+                .iter()
+                .any(|c| matches!(c, Call::WriteRow(b) if b != SGR_RESET)),
             "alt stream: no hand-back write_row after the alt-leave"
         );
 
@@ -3420,8 +3434,8 @@ line two\r\n\
             .collect();
         assert_eq!(
             shapes,
-            vec![b"\x1b[6 q".to_vec(), b"\x1b[4 q".to_vec()],
-            "each DECSCUSR change mirrored once, verbatim"
+            vec![b"\x1b[6 q".to_vec(), b"\x1b[4 q".to_vec(), DEFAULT_CURSOR_SHAPE.to_vec()],
+            "each DECSCUSR change mirrored once, verbatim, then teardown's default"
         );
     }
 
@@ -5447,7 +5461,7 @@ mod inline_anchor {
         );
         assert!(t0.calls.contains(&Call::Newline), "zero exit drops a fresh line below the band");
         assert!(
-            !t0.calls.iter().any(|c| matches!(c, Call::WriteRow(_))),
+            !t0.calls.iter().any(|c| matches!(c, Call::WriteRow(b) if b != SGR_RESET)),
             "zero exit writes no status line"
         );
 
@@ -5458,7 +5472,10 @@ mod inline_anchor {
         let writes: Vec<&[u8]> = t1
             .calls
             .iter()
-            .filter_map(|c| if let Call::WriteRow(b) = c { Some(b.as_slice()) } else { None })
+            .filter_map(|c| match c {
+                Call::WriteRow(b) if b != SGR_RESET => Some(b.as_slice()),
+                _ => None,
+            })
             .collect();
         assert_eq!(
             writes,

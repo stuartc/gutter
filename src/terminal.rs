@@ -840,9 +840,10 @@ pub mod mock {
             self.record(Call::EnableRawMode)
         }
         fn enable_mouse(&mut self) -> io::Result<()> {
-            let r = self.record(Call::EnableMouse);
+            // Mirror the real impl: a failed enable leaves nothing to disable.
+            self.record(Call::EnableMouse)?;
             self.mouse_enabled = true;
-            r
+            Ok(())
         }
         fn enter_alt_screen(&mut self) -> io::Result<()> {
             self.record(Call::EnterAltScreen)

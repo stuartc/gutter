@@ -48,6 +48,14 @@ impl CursorShape {
         self.requested = Some(ps);
     }
 
+    /// Whether the child ever asked for a shape. A restore path resets the outer
+    /// terminal's cursor only when it does — a shape the user set for their own
+    /// shell is not gutter's to clear.
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        self.requested.is_some()
+    }
+
     /// Forget what was last mirrored, so the next [`take_pending`] re-emits the
     /// child's last requested shape even though it did not change. Used on resume
     /// (ADR-0019): park reset the outer terminal's cursor to the default, so the
