@@ -27,6 +27,7 @@ The decisions behind gutter's design. Code comments reference these by number
 | [020](0020-raw-input-passthrough.md) | Raw input passthrough |
 | [021](0021-child-driven-mode-relay.md) | Child-driven outer keyboard modes |
 | [022](0022-absorbed-mode-mirroring.md) | Absorbed-mode mirroring by poll-diff |
+| [023](0023-controlling-terminal-fd-model.md) | One controlling terminal, never stdout |
 
 ## Format
 
