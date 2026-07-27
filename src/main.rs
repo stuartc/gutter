@@ -6,32 +6,39 @@
 //! render thread and repainted to the real terminal at a left-margin column
 //! offset.
 //!
-//! Three live threads plus a waiter feed one merged unbounded channel; no async
+//! Four live threads plus a waiter feed one merged unbounded channel; no async
 //! runtime. The design decisions behind all this live in `docs/adr/`.
 //!
 //! - Thread 1 (`pty::reader`)  — PTY byte pump, self-throttled via a bounded
 //!   staging `sync_channel` (the backpressure seam, ADR-007/009).
 //! - Thread 2 (`render::run`)  — owns the `vt100::Parser`, the outer terminal
-//!   handle and the sole PTY-master writer; runs the coalescing loop and the
-//!   offset repaint.
-//! - Thread 3 (`input::run`)   — owns crossterm's event source exclusively.
+//!   handle and the sole PTY-master writer; runs the coalescing loop, the input
+//!   scanner and the offset repaint.
+//! - Thread 3 (`input::run`)   — owns the outer tty read fd exclusively; a dumb
+//!   `read()` pump that interprets nothing (ADR-020).
 //! - Thread 4 (`waiter::run`)  — on unix, loops on raw `waitpid(WUNTRACED|
 //!   WCONTINUED)`, the authoritative child-state signal (exit AND stop/continue,
 //!   ADR-0018).
+//! - Thread 5 (`sigwinch::run`) — `SIGWINCH` → `Msg::Resize`.
 
+mod anchor;
 mod callbacks;
+mod chord;
 mod cli;
 mod clipboard;
 mod clock;
 mod cursor;
 mod geometry;
 mod input;
-mod keyboard;
+mod modes;
 mod mouse;
 mod msg;
 mod pty;
+mod relay;
 mod render;
 mod rowclip;
+mod scan;
+mod sigwinch;
 mod suspend;
 mod terminal;
 mod waiter;
@@ -47,6 +54,7 @@ use std::process;
 use std::sync::mpsc::{channel, sync_channel};
 use std::thread;
 
+use anchor::{open_input_tty, probe_cursor_row, CPR_TIMEOUT};
 use clock::RealClock;
 use render::Renderer;
 use terminal::{CrosstermTerminal, OuterTerminal};
@@ -128,61 +136,59 @@ fn run() -> i32 {
         thread::spawn(move || waiter::run(child_pid, child, merged_tx));
     }
 
-    // Outer terminal setup: raw mode, kitty probe, eager mouse capture. No forced
-    // alt screen (ADR-012): the render thread mirrors the child's mode.
+    // Outer terminal setup: raw mode, then eager mouse capture. No forced alt
+    // screen (ADR-012): the render thread mirrors the child's mode. gutter asks
+    // the outer terminal for no keyboard mode of its own — that is the child's to
+    // negotiate (ADR-020).
     let mut terminal = CrosstermTerminal::new();
     if let Err(e) = terminal.enable_raw_mode() {
         eprintln!("gutter: failed to enable raw mode: {e}");
         return 1;
     }
 
-    // Probe kitty keyboard capability AFTER raw mode — the probe does a `CSI ? u`
-    // round-trip on the real terminal (ADR-003). If the outer terminal supports
-    // kitty, push the disambiguation flags (paired with a pop in teardown) so
-    // crossterm distinguishes Shift+Enter from Enter; the result clamps the
-    // child's kitty state.
-    //
-    // A test harness can't make a dumb PTY answer the round-trip, so
-    // `GUTTER_FORCE_KITTY` overrides the probe: `1` forces true, `0` forces false.
-    // Absent the env var, the real probe decides.
-    let outer_supports_kitty = match std::env::var("GUTTER_FORCE_KITTY").ok().as_deref() {
-        Some("1") => true,
-        Some("0") => false,
-        _ => terminal.supports_keyboard_enhancement().unwrap_or(false),
-    };
-    if outer_supports_kitty {
-        if let Err(e) = terminal.push_keyboard_flags() {
-            eprintln!("gutter: failed to push keyboard enhancement flags: {e}");
-        }
-    }
+    // The tty gutter reads input from. Opened ONCE here: the CPR probe below and
+    // Thread 3 must share one file description, or they would race for the reply.
+    // A separate open from the clipboard's (ADR-004); nothing ever reads that one.
+    let input_tty = open_input_tty();
 
-    // Capture the launch cursor row, the inline anchor (ADR-013), in the same
-    // exclusive window the kitty probe used: once the input thread spawns it owns
-    // crossterm's event source and would consume the `ESC[6n` CPR reply, so the
-    // query must run while nothing else drains the terminal.
+    // Capture the launch cursor row, the inline anchor (ADR-013), before Thread 3
+    // starts draining the same fd.
     //
     // `GUTTER_FORCE_ANCHOR_ROW` injects the row for tests, whose kernel PTY never
-    // answers CPR. On a failed query, fall back to the bottom line (`rows - 1`),
-    // the common launch point — NOT row 0, which would reproduce the overpaint the
-    // anchor exists to prevent. `position()` has no timeout, but a real tty answers.
-    let anchor_row = match std::env::var("GUTTER_FORCE_ANCHOR_ROW").ok() {
-        Some(v) => v.parse::<u16>().unwrap_or(rows.saturating_sub(1)),
-        None => crossterm::cursor::position()
-            .map(|(_col, row)| row)
-            .unwrap_or(rows.saturating_sub(1)),
+    // answers CPR; when it is set the probe is skipped entirely. On a failed query,
+    // fall back to the bottom line (`rows - 1`), the common launch point — NOT row
+    // 0, which would reproduce the overpaint the anchor exists to prevent.
+    let (anchor_row, leftover) = match std::env::var("GUTTER_FORCE_ANCHOR_ROW").ok() {
+        Some(v) => (v.parse::<u16>().unwrap_or(rows.saturating_sub(1)), Vec::new()),
+        None => match input_tty.as_ref() {
+            Some(tty) => {
+                let (row, leftover) = probe_cursor_row(tty, CPR_TIMEOUT);
+                (row.unwrap_or(rows.saturating_sub(1)), leftover)
+            }
+            None => (rows.saturating_sub(1), Vec::new()),
+        },
     };
+
+    // Anything the probe read that was not the reply is a keystroke typed during
+    // startup. Seed it into the merged channel BEFORE Thread 3 exists, so mpsc's
+    // per-sender ordering guarantees the render thread scans it ahead of the first
+    // byte Thread 3 reads.
+    if !leftover.is_empty() {
+        let _ = merged_tx.send(msg::Msg::Input(leftover));
+    }
 
     // Thread 3: input reader, DETACHED. Spawned but never joined; the
     // un-interruptible `read()` is reaped by process::exit on teardown (ADR-010).
-    //
-    // ORDERING (load-bearing): this spawn MUST stay after the kitty probe. Thread 3
-    // drains crossterm's event source, and the probe's `CSI ? u` reply returns
-    // through that same source — a Thread 3 started first would consume the reply,
-    // forcing the probe to its full ~2 s timeout and a permanent `false` (kitty
-    // silently clamped off even on capable terminals). The span from
-    // `enable_raw_mode()` to this spawn is the only window an outer round-trip
-    // query can read its own reply uncontended.
-    thread::spawn(move || input::run(merged_tx));
+    if let Some(tty) = input_tty {
+        let merged_tx = merged_tx.clone();
+        thread::spawn(move || input::run(tty, merged_tx));
+    } else {
+        eprintln!("gutter: /dev/tty unavailable, keyboard input is disabled");
+    }
+
+    // Thread 5: SIGWINCH → Msg::Resize. Detached like Thread 3, and the only
+    // resize source there is (ADR-020).
+    thread::spawn(move || sigwinch::run(merged_tx));
 
     // Eager outer mouse capture (ADR-005): enable ONCE here, before the alt
     // screen, so the outer terminal is already reporting SGR motion at the first
@@ -210,7 +216,6 @@ fn run() -> i32 {
         real_cols,
         config.layout,
         width_config,
-        outer_supports_kitty,
         clipboard_out,
         anchor_row,
     );

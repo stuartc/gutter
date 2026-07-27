@@ -26,85 +26,13 @@
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
 use std::io::Write;
-use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use expectrl::session::OsSession;
-
-/// Serialize every PTY test in this binary. Each one drives a real `gutter`
-/// process in its own PTY; run in parallel they flake under PTY/process
-/// contention — a *different* test fails each run, deterministically green when
-/// serialized. Holding this lock for the whole test (take it on the first line)
-/// keeps just this binary single-file while the lib tests and other suites stay
-/// parallel — no `--test-threads=1` on the whole suite, no CI-only config. The
-/// poison recovery keeps one panicking test from cascading into the rest.
-fn pty_guard() -> MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Path to the freshly-built `gutter` binary (cargo sets this for the test).
-fn gutter_bin() -> String {
-    env!("CARGO_BIN_EXE_gutter").to_string()
-}
-
-/// Build a `std::process::Command` that runs gutter inside an outer terminal of
-/// the given size: `sh -c 'stty cols C rows R; exec gutter <args>'`. The whole
-/// script is one argv element, so the inner shell parses any nested quoting in
-/// `gutter_args` — avoiding expectrl's own word-splitting.
-fn gutter_in_terminal(
-    outer_cols: u16,
-    outer_rows: u16,
-    gutter_args: &str,
-) -> std::process::Command {
-    // `GUTTER_FORCE_KITTY=0`: a dumb test PTY can't answer the kitty probe, so
-    // the real `supports_keyboard_enhancement()` would stall ~2s before
-    // returning false. This suite is not about the keyboard; inject the known
-    // result to skip the stall (slice 04's injectable-capability seam).
-    let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    cmd
-}
-
-/// Spawn the prepared gutter command under a PTY.
-fn spawn(cmd: std::process::Command) -> OsSession {
-    OsSession::spawn(cmd).expect("spawn gutter under PTY")
-}
-
-/// Drain a bounded window of output using NON-BLOCKING reads, so the window is a
-/// real wall-clock cap even while the child keeps the PTY open: a still-running
-/// child's live alt-screen frame is captured (not the post-exit primary screen,
-/// which leaving the alt screen would discard). `try_read` returns `WouldBlock`
-/// when no data is pending — the loop just keeps ticking until `window` elapses.
-fn drain_window(session: &mut OsSession, window: Duration) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    let start = Instant::now();
-    while start.elapsed() < window {
-        match session.try_read(&mut buf) {
-            Ok(0) => break, // EOF (child gone)
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    out
-}
-
-/// Parse outer-terminal bytes through a vt100 at the given physical size, so
-/// tests can inspect which physical column each glyph landed in.
-fn outer_grid(bytes: &[u8], cols: u16, rows: u16) -> vt100::Parser {
-    let mut p = vt100::Parser::new(rows, cols, 0);
-    p.process(bytes);
-    p
-}
+mod common;
+use common::{
+    assert_cols_blank, drain_window, first_painted_col, outer_grid, pty_guard, spawn_gutter,
+    wait_exit,
+};
 
 /// The first non-empty row's trimmed text, or "" if the screen is blank.
 fn first_content_row(screen: &vt100::Screen, cols: u16) -> String {
@@ -120,35 +48,6 @@ fn assert_gutters_empty(screen: &vt100::Screen, band: u16, outer_cols: u16, rows
     assert_cols_blank(screen, band, outer_cols, rows);
 }
 
-/// The physical column of the first painted (non-blank) cell on row 0, or `None`
-/// if the row is blank.
-fn first_painted_col(screen: &vt100::Screen, cols: u16) -> Option<u16> {
-    for c in 0..cols {
-        if let Some(cell) = screen.cell(0, c) {
-            let s = cell.contents();
-            if !s.is_empty() && s != " " {
-                return Some(c);
-            }
-        }
-    }
-    None
-}
-
-/// Assert columns `[from, to)` on every row are blank.
-fn assert_cols_blank(screen: &vt100::Screen, from: u16, to: u16, rows: u16) {
-    for r in 0..rows {
-        for c in from..to {
-            if let Some(cell) = screen.cell(r, c) {
-                let s = cell.contents();
-                assert!(
-                    s.is_empty() || s == " ",
-                    "col {c} row {r} must be blank, found {s:?}"
-                );
-            }
-        }
-    }
-}
-
 /// **Child sees `COLUMNS == W`** — asserted from inside the child (`stty size`
 /// prints `rows W`), not from gutter internals. gutter sizes the child PTY to
 /// `W × real_rows` regardless of the outer width, so this holds independently of
@@ -156,8 +55,7 @@ fn assert_cols_blank(screen: &vt100::Screen, from: u16, to: u16, rows: u16) {
 #[test]
 fn child_sees_band_width() {
     let _guard = pty_guard();
-    let cmd = gutter_in_terminal(120, 40, "--width 100 /bin/sh -c 'stty size; sleep 3'");
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, "--width 100 /bin/sh -c 'stty size; sleep 3'");
     let bytes = drain_window(&mut session, Duration::from_millis(700));
 
     let parser = outer_grid(&bytes, 120, 40);
@@ -174,8 +72,7 @@ fn child_sees_band_width() {
 #[test]
 fn default_width_narrows_on_wide_terminal() {
     let _guard = pty_guard();
-    let cmd = gutter_in_terminal(120, 40, "/bin/sh -c 'stty size; sleep 3'");
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, "/bin/sh -c 'stty size; sleep 3'");
     let bytes = drain_window(&mut session, Duration::from_millis(700));
 
     let parser = outer_grid(&bytes, 120, 40);
@@ -193,8 +90,7 @@ fn default_width_narrows_on_wide_terminal() {
 fn default_width_centres_on_wide_terminal() {
     let _guard = pty_guard();
     let child = "/bin/sh -c 'printf \"%0.s#\" $(seq 1 200); sleep 3'";
-    let cmd = gutter_in_terminal(120, 40, child);
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, child);
     let bytes = drain_window(&mut session, Duration::from_millis(800));
 
     let parser = outer_grid(&bytes, 120, 40);
@@ -212,8 +108,7 @@ fn default_width_centres_on_wide_terminal() {
 #[test]
 fn default_width_clamps_on_narrow_terminal() {
     let _guard = pty_guard();
-    let cmd = gutter_in_terminal(80, 24, "/bin/sh -c 'stty size; sleep 3'");
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(80, 24, "/bin/sh -c 'stty size; sleep 3'");
     let bytes = drain_window(&mut session, Duration::from_millis(700));
 
     let parser = outer_grid(&bytes, 80, 24);
@@ -231,8 +126,7 @@ fn default_width_clamps_on_narrow_terminal() {
 #[test]
 fn full_literal_is_passthrough() {
     let _guard = pty_guard();
-    let cmd = gutter_in_terminal(120, 40, "--width full /bin/sh -c 'stty size; sleep 3'");
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, "--width full /bin/sh -c 'stty size; sleep 3'");
     let bytes = drain_window(&mut session, Duration::from_millis(700));
 
     let parser = outer_grid(&bytes, 120, 40);
@@ -245,8 +139,7 @@ fn full_literal_is_passthrough() {
     let first = first_painted_col(screen, 120).expect("row 0 has painted content");
     assert_eq!(first, 0, "--width full must sit flush at margin 0");
 
-    let cmd = gutter_in_terminal(120, 40, "--width 100% /bin/sh -c 'stty size; sleep 3'");
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, "--width 100% /bin/sh -c 'stty size; sleep 3'");
     let bytes = drain_window(&mut session, Duration::from_millis(700));
     let parser = outer_grid(&bytes, 120, 40);
     let row = first_content_row(parser.screen(), 120);
@@ -263,8 +156,7 @@ fn full_literal_is_passthrough() {
 fn content_in_band_gutters_empty() {
     let _guard = pty_guard();
     let child = "/bin/sh -c 'printf HELLO_FROM_THE_BAND; sleep 3'";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, &format!("--width 100 --left {child}"));
     let bytes = drain_window(&mut session, Duration::from_millis(700));
 
     let parser = outer_grid(&bytes, 120, 40);
@@ -286,8 +178,7 @@ fn cursor_tracks_child_inside_band() {
     let _guard = pty_guard();
     // Move to row 3, col 10 (1-based CSI), then idle alive.
     let child = "/bin/sh -c 'printf \"\\033[3;10H\"; sleep 3'";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, &format!("--width 100 --left {child}"));
     let bytes = drain_window(&mut session, Duration::from_millis(700));
 
     let parser = outer_grid(&bytes, 120, 40);
@@ -306,8 +197,7 @@ fn cursor_tracks_child_inside_band() {
 fn cursor_visibility_mirrored_on_outer() {
     let _guard = pty_guard();
     let child = "/bin/sh -c 'printf \"\\033[?25lX\"; sleep 3'";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, &format!("--width 100 --left {child}"));
     let bytes = drain_window(&mut session, Duration::from_millis(700));
 
     let parser = outer_grid(&bytes, 120, 40);
@@ -325,8 +215,7 @@ fn cursor_visibility_mirrored_on_outer() {
 fn vim_renders_inside_band() {
     let _guard = pty_guard();
     let child = "/usr/bin/vim -u NONE -N -n -i NONE";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, &format!("--width 100 --left {child}"));
 
     // Let vim enter the alt screen and lay out.
     std::thread::sleep(Duration::from_millis(700));
@@ -367,8 +256,7 @@ fn vim_renders_inside_band() {
 fn child_exit_restores_terminal_and_propagates_code() {
     let _guard = pty_guard();
     let child = "/bin/sh -c 'printf \"\\033[?1049h\"; exit 7'";
-    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(80, 24, &format!("--width 60 {child}"));
 
     // Read to EOF this time — we WANT the teardown sequence.
     let bytes = drain_window(&mut session, Duration::from_secs(3));
@@ -383,7 +271,7 @@ fn child_exit_restores_terminal_and_propagates_code() {
     );
 
     assert_eq!(
-        wait_status(session),
+        wait_exit(&session, Duration::from_secs(5)),
         Some(7),
         "gutter must propagate the child's exit code"
     );
@@ -401,8 +289,7 @@ fn plain_command_output_survives_to_primary_screen() {
     // No trailing newline, no alt-screen negotiation — a pure primary-screen
     // command. It exits immediately; we read the post-exit stream.
     let child = "/bin/sh -c \"printf 'line1\\nline2\\nline3'; exit 0\"";
-    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 --left {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(80, 24, &format!("--width 60 --left {child}"));
 
     // Drain through teardown: the output is on the primary screen, so it survives.
     let bytes = drain_window(&mut session, Duration::from_secs(3));
@@ -422,7 +309,11 @@ fn plain_command_output_survives_to_primary_screen() {
         assert!(present, "plain output {marker:?} must survive on the primary screen");
     }
 
-    assert_eq!(wait_status(session), Some(0), "gutter propagates the zero exit");
+    assert_eq!(
+        wait_exit(&session, Duration::from_secs(5)),
+        Some(0),
+        "gutter propagates the zero exit"
+    );
 }
 
 /// **Mode-switch mid-run (ADR-012).** A child that prints to the PRIMARY screen
@@ -435,8 +326,7 @@ fn mode_switch_mid_run_enters_alt_after_primary_lines() {
     // Print a primary marker, then enter the alt screen and paint, then exit in
     // alt. The `?1049h` must appear in the stream AFTER the primary marker.
     let child = "/bin/sh -c \"printf 'primline'; sleep 0.3; printf '\\033[?1049h\\033[1;1Halt-frame'; sleep 0.3; exit 0\"";
-    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 --left {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(80, 24, &format!("--width 60 --left {child}"));
 
     let bytes = drain_window(&mut session, Duration::from_secs(3));
     let s = String::from_utf8_lossy(&bytes);
@@ -460,26 +350,7 @@ fn mode_switch_mid_run_enters_alt_after_primary_lines() {
         "the primary lines must be painted before the ?1049h edge (not forced at startup)"
     );
 
-    let _ = wait_status(session);
-}
-
-/// Block on the wrapped process and return its exit code, if any.
-fn wait_status(session: OsSession) -> Option<i32> {
-    use expectrl::process::unix::WaitStatus;
-    use expectrl::process::Healthcheck;
-    let proc = session.get_process();
-    let start = Instant::now();
-    loop {
-        match proc.get_status() {
-            Ok(WaitStatus::Exited(_, code)) => return Some(code),
-            Ok(WaitStatus::Signaled(_, _, _)) => return None,
-            _ => {}
-        }
-        if start.elapsed() > Duration::from_secs(5) {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let _ = wait_exit(&session, Duration::from_secs(5));
 }
 
 /// **Real-PTY smoke (cap).** Feed a few MB of scrolling output through a real
@@ -494,8 +365,7 @@ fn multi_mb_scroll_stays_bounded() {
     // PAST our capture window — we want the live alt-screen frame, not the
     // post-exit primary screen (leaving the alt screen discards its content).
     let child = "/bin/sh -c 'i=0; while [ $i -lt 20000 ]; do printf \"line %d of the flood test\\n\" $i; i=$((i+1)); done; sleep 6'";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, &format!("--width 100 --left {child}"));
 
     let start = Instant::now();
     let bytes = drain_window(&mut session, Duration::from_secs(3));
@@ -542,8 +412,7 @@ fn scroll_off_lines_reach_real_terminal_scrollback() {
     // screen — a pure primary-screen command. Exits 0; we read the full stream
     // (the scrolled-off lines were emitted into scrollback as they departed).
     let child = "/bin/sh -c 'i=0; while [ $i -lt 40 ]; do printf \"SCROLLTAG-%02d\\n\" $i; i=$((i+1)); sleep 0.025; done; exit 0'";
-    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 --left {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(80, 24, &format!("--width 60 --left {child}"));
 
     // Drain through the whole run + teardown.
     let bytes = drain_window(&mut session, Duration::from_secs(5));
@@ -599,7 +468,11 @@ fn scroll_off_lines_reach_real_terminal_scrollback() {
         );
     }
 
-    assert_eq!(wait_status(session), Some(0), "gutter propagates the zero exit");
+    assert_eq!(
+        wait_exit(&session, Duration::from_secs(5)),
+        Some(0),
+        "gutter propagates the zero exit"
+    );
 }
 
 /// **Scroll-off survival under a COALESCED BURST (the slice-04 gate's hard case,
@@ -621,8 +494,7 @@ fn scroll_off_burst_reaches_scrollback_without_pacing() {
     // 120 lines, printed as fast as possible (no sleep): a single 16 ms frame
     // swallows dozens at once on a 24-row terminal. Each line is uniquely tagged.
     let child = "/bin/sh -c 'i=0; while [ $i -lt 120 ]; do printf \"BURSTTAG-%03d\\n\" $i; i=$((i+1)); done; exit 0'";
-    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 --left {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(80, 24, &format!("--width 60 --left {child}"));
 
     let bytes = drain_window(&mut session, Duration::from_secs(5));
     let s = String::from_utf8_lossy(&bytes);
@@ -679,7 +551,11 @@ fn scroll_off_burst_reaches_scrollback_without_pacing() {
         );
     }
 
-    assert_eq!(wait_status(session), Some(0), "gutter propagates the zero exit");
+    assert_eq!(
+        wait_exit(&session, Duration::from_secs(5)),
+        Some(0),
+        "gutter propagates the zero exit"
+    );
 }
 
 /// **Non-zero exit shows the dim `Exited with: N` status line (slice 02/03,
@@ -695,8 +571,7 @@ fn scroll_off_burst_reaches_scrollback_without_pacing() {
 fn non_zero_exit_shows_dim_status_line() {
     let _guard = pty_guard();
     let child = "/bin/sh -c 'printf boom; exit 3'";
-    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(80, 24, &format!("--width 60 {child}"));
 
     // Read to the teardown — we WANT the post-exit restore + status sequence.
     let bytes = drain_window(&mut session, Duration::from_secs(3));
@@ -713,7 +588,7 @@ fn non_zero_exit_shows_dim_status_line() {
     );
 
     assert_eq!(
-        wait_status(session),
+        wait_exit(&session, Duration::from_secs(5)),
         Some(3),
         "gutter must propagate the non-zero exit code"
     );
@@ -729,8 +604,7 @@ fn non_zero_exit_shows_dim_status_line() {
 fn no_output_nonzero_exit_is_silent() {
     let _guard = pty_guard();
     let child = "/bin/sh -c 'exit 3'";
-    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(80, 24, &format!("--width 60 {child}"));
 
     let bytes = drain_window(&mut session, Duration::from_secs(3));
     let s = String::from_utf8_lossy(&bytes);
@@ -740,7 +614,7 @@ fn no_output_nonzero_exit_is_silent() {
         "a no-output non-zero exit must not stamp a status line, got {s:?}"
     );
     assert_eq!(
-        wait_status(session),
+        wait_exit(&session, Duration::from_secs(5)),
         Some(3),
         "gutter must still propagate the non-zero exit code"
     );
@@ -754,8 +628,7 @@ fn no_output_nonzero_exit_is_silent() {
 fn zero_exit_shows_no_status_line() {
     let _guard = pty_guard();
     let child = "/bin/sh -c 'exit 0'";
-    let cmd = gutter_in_terminal(80, 24, &format!("--width 60 {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(80, 24, &format!("--width 60 {child}"));
 
     let bytes = drain_window(&mut session, Duration::from_secs(3));
     let s = String::from_utf8_lossy(&bytes);
@@ -772,7 +645,7 @@ fn zero_exit_shows_no_status_line() {
     );
 
     assert_eq!(
-        wait_status(session),
+        wait_exit(&session, Duration::from_secs(5)),
         Some(0),
         "gutter must propagate the zero exit code"
     );

@@ -1,6 +1,6 @@
 # ADR-003: Two independent kitty states
 
-Status: Accepted
+Status: Superseded by [ADR-021](0021-child-driven-mode-relay.md)
 
 ## Context
 
@@ -32,3 +32,12 @@ touches only `kitty_state`, never the clipboard.
 - `src/callbacks.rs` — the shared struct and the `unhandled_csi` watcher
 - `src/keyboard/kitty_state.rs` — the push/pop stack and clamp
 - `src/main.rs` — the startup capability probe
+
+---
+
+Superseded by [ADR-021](0021-child-driven-mode-relay.md). gutter no longer holds
+a kitty state of its own on either side: the outer terminal's capability is never
+probed, and the child's requests are relayed out rather than clamped. In place of
+the two clamped states there is one byte log of what the child asked for, so
+teardown can undo exactly that and nothing more. Everything above is kept for the
+record; none of it describes current behaviour.

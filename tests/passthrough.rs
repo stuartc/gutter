@@ -17,53 +17,17 @@
 //! Headless: a real PTY with no display. Tests pin `TERM=xterm-256color`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
 
 use expectrl::process::unix::WaitStatus;
-use expectrl::session::OsSession;
-use expectrl::{Eof, Expect, Session};
+use expectrl::{Eof, Expect};
+
+mod common;
+use common::{spawn_gutter_argv as spawn_gutter, spawn_gutter_argv_with as spawn_gutter_with};
 
 /// The window size expectrl gives the outer PTY. Tests that need the child to
 /// see this exact column count pass `--width full`, since the no-flag default
 /// is a 100-column band that would only match here via the clamp (80 < 100).
 const OUTER_COLS: u16 = 80;
-const OUTER_ROWS: u16 = 24;
-
-/// Build a `Command` that runs the gutter binary wrapping `child_argv`, with a
-/// terminfo-friendly `TERM` so `tput`/alt-screen sequences resolve headlessly.
-fn gutter_cmd(child_argv: &[&str]) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gutter"));
-    cmd.args(child_argv);
-    cmd.env("TERM", "xterm-256color");
-    // A dumb test PTY can't answer the kitty probe, so the real
-    // `supports_keyboard_enhancement()` would stall ~2s before returning false.
-    // This suite is not about the keyboard; inject the known result to skip the
-    // stall (slice 04's injectable-capability seam).
-    cmd.env("GUTTER_FORCE_KITTY", "0");
-    cmd.env("GUTTER_FORCE_ANCHOR_ROW", "0");
-    cmd
-}
-
-/// Spawn gutter under a real PTY sized `OUTER_COLS × OUTER_ROWS`.
-fn spawn_gutter(child_argv: &[&str]) -> OsSession {
-    spawn_gutter_with(child_argv, |_| {})
-}
-
-/// Spawn gutter under a real PTY, letting the caller tweak the `Command` first
-/// (e.g. set the launcher's `current_dir` or export an env var) — the seam the
-/// E1 cwd / env-inheritance tests drive.
-fn spawn_gutter_with(child_argv: &[&str], configure: impl FnOnce(&mut Command)) -> OsSession {
-    let mut cmd = gutter_cmd(child_argv);
-    configure(&mut cmd);
-    let mut session = Session::spawn(cmd).expect("spawn gutter under PTY");
-    session
-        .get_process_mut()
-        .set_window_size(OUTER_COLS, OUTER_ROWS)
-        .expect("set outer PTY window size");
-    session.set_expect_timeout(Some(Duration::from_secs(10)));
-    session
-}
 
 /// Create a fresh, uniquely-named directory under the system temp dir and return
 /// its canonical (symlink-resolved) path. On macOS the temp dir is reached via

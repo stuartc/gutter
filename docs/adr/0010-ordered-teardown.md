@@ -11,15 +11,24 @@ after disabling raw mode and the terminal is left corrupted.
 ## Decision
 
 Restore explicitly, in order, before exiting: leave the alt screen (or hand back
-inline) → pop kitty flags → disable mouse → show cursor → disable raw mode. Each
-step is conditional on what was actually set up.
+inline) → undo whatever input modes gutter set on the child's behalf → disable
+mouse → show cursor → disable raw mode. Each step is conditional on what was
+actually set up.
 
 ## Consequences
 
 - All cleanup is in one teardown path; nothing relies on `Drop`.
 - The alt-leave only fires if the child exited in the alt screen. A plain command's
   output is left on the primary screen.
-- The kitty pop only fires if we pushed a level.
+- gutter never resets a mode it did not set. It sets no keyboard mode of its own
+  (ADR-020), so what that slot undoes is what the child asked the terminal for
+  (ADR-021): the kitty stack pops back to the depth the child opened and
+  `CSI > 4 ; 0 m` turns modifyOtherKeys off, both only if gutter relayed them.
+- The slot has two steps, mirrored modes first: the input modes gutter mirrored on the
+  child's behalf (ADR-022 — DECCKM, application keypad, bracketed paste) go off
+  immediately before the keyboard-mode reset, keeping every input-encoding restore
+  together with the coarsest last. Same conditional rule — a mode never mirrored on is
+  never turned off, so a shell with its own paste protection keeps it.
 - Disabling mouse, showing the cursor, and disabling raw mode are always safe to
   call unconditionally.
 

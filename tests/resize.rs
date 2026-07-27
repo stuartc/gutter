@@ -10,7 +10,8 @@
 //! - **Outer size** is set by `sh -c 'stty cols C rows R; exec gutter ...'` so
 //!   gutter reads the intended size at startup with no race. For the resize
 //!   tests the outer PTY is then resized live via `set_window_size`, which sends
-//!   SIGWINCH to gutter's process group (crossterm surfaces it as `Event::Resize`).
+//!   SIGWINCH to gutter's process group; gutter's own signal thread turns that
+//!   into a `Msg::Resize` (ADR-020).
 //! - **Capture the LIVE alt-screen frame**, not the post-exit primary screen
 //!   (leaving the alt screen on exit discards its content) — so the wrapped
 //!   children stay alive (a long `sleep`) and the harness drains a bounded window
@@ -18,88 +19,10 @@
 //!
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use expectrl::session::OsSession;
-
-fn gutter_bin() -> String {
-    env!("CARGO_BIN_EXE_gutter").to_string()
-}
-
-/// Run gutter inside an outer terminal of the given size:
-/// `sh -c 'stty cols C rows R; exec env GUTTER_FORCE_KITTY=0 gutter <args>'`.
-/// `GUTTER_FORCE_KITTY=0` skips the ~2s kitty probe stall a dumb test PTY can't
-/// answer (this suite is not about the keyboard).
-fn gutter_in_terminal(outer_cols: u16, outer_rows: u16, gutter_args: &str) -> std::process::Command {
-    let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_KITTY=0 GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_args}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    cmd
-}
-
-fn spawn(cmd: std::process::Command) -> OsSession {
-    OsSession::spawn(cmd).expect("spawn gutter under PTY")
-}
-
-/// Drain a bounded window of output with NON-BLOCKING reads — a wall-clock cap
-/// even while the child keeps the PTY open, so the live alt-screen frame is
-/// captured (not the post-exit primary screen).
-fn drain_window(session: &mut OsSession, window: Duration) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    let start = Instant::now();
-    while start.elapsed() < window {
-        match session.try_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    out
-}
-
-/// Parse outer-terminal bytes through a vt100 at the given physical size.
-fn outer_grid(bytes: &[u8], cols: u16, rows: u16) -> vt100::Parser {
-    let mut p = vt100::Parser::new(rows, cols, 0);
-    p.process(bytes);
-    p
-}
-
-/// The physical column of the first painted (non-blank) cell on row 0, or `None`
-/// if the row is blank.
-fn first_painted_col(screen: &vt100::Screen, cols: u16) -> Option<u16> {
-    for c in 0..cols {
-        if let Some(cell) = screen.cell(0, c) {
-            let s = cell.contents();
-            if !s.is_empty() && s != " " {
-                return Some(c);
-            }
-        }
-    }
-    None
-}
-
-/// Assert columns `[from, to)` on every row are blank.
-fn assert_cols_blank(screen: &vt100::Screen, from: u16, to: u16, rows: u16) {
-    for r in 0..rows {
-        for c in from..to {
-            if let Some(cell) = screen.cell(r, c) {
-                let s = cell.contents();
-                assert!(
-                    s.is_empty() || s == " ",
-                    "col {c} row {r} must be blank, found {s:?}"
-                );
-            }
-        }
-    }
-}
+mod common;
+use common::{assert_cols_blank, drain_window, first_painted_col, outer_grid, spawn_gutter};
 
 /// **`--center` centres the band with gutters on BOTH sides.** Outer 120,
 /// `--width 100` → margin (120-100)/2 = 10. Content fills row 0; it must start at
@@ -110,8 +33,7 @@ fn center_band_has_gutters_both_sides() {
     // Fill the band's first row with a run of '#'s (100 of them) so the painted
     // span is the whole band width.
     let child = "/bin/sh -c 'printf \"%0.s#\" $(seq 1 100); sleep 3'";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --center {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, &format!("--width 100 --center {child}"));
     let bytes = drain_window(&mut session, Duration::from_millis(800));
 
     let parser = outer_grid(&bytes, 120, 40);
@@ -129,8 +51,7 @@ fn center_band_has_gutters_both_sides() {
 #[test]
 fn left_band_has_right_gutter_only() {
     let child = "/bin/sh -c 'printf \"%0.s#\" $(seq 1 100); sleep 3'";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --left {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, &format!("--width 100 --left {child}"));
     let bytes = drain_window(&mut session, Duration::from_millis(800));
 
     let parser = outer_grid(&bytes, 120, 40);
@@ -146,8 +67,7 @@ fn left_band_has_right_gutter_only() {
 /// `stty size`).
 #[test]
 fn proportional_width_pct_at_launch() {
-    let cmd = gutter_in_terminal(200, 40, "--width 50pct /bin/sh -c 'stty size; sleep 3'");
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(200, 40, "--width 50pct /bin/sh -c 'stty size; sleep 3'");
     let bytes = drain_window(&mut session, Duration::from_millis(800));
 
     let parser = outer_grid(&bytes, 200, 40);
@@ -167,8 +87,7 @@ fn proportional_width_pct_at_launch() {
 /// **`--width 50%` alias** behaves identically to `50pct`.
 #[test]
 fn proportional_width_percent_alias_at_launch() {
-    let cmd = gutter_in_terminal(160, 40, "--width 50% /bin/sh -c 'stty size; sleep 3'");
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(160, 40, "--width 50% /bin/sh -c 'stty size; sleep 3'");
     let bytes = drain_window(&mut session, Duration::from_millis(800));
 
     let parser = outer_grid(&bytes, 160, 40);
@@ -201,8 +120,7 @@ fn proportional_width_percent_alias_at_launch() {
 #[test]
 fn resize_once_absolute_width_stays_fixed() {
     let child = "/bin/sh -c 'stty size; while true; do sleep 0.2; done'";
-    let cmd = gutter_in_terminal(120, 40, &format!("--width 100 --center {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(120, 40, &format!("--width 100 --center {child}"));
 
     // Accumulate the whole stream from launch — gutter paints the child's `stty
     // size` output onto the PRIMARY screen (no forced alt screen, ADR-012). For an
@@ -239,8 +157,7 @@ fn resize_once_absolute_width_stays_fixed() {
 #[test]
 fn proportional_band_tracks_on_resize() {
     let child = "/bin/sh -c 'trap \"stty size\" WINCH; stty size; while true; do sleep 0.2; done'";
-    let cmd = gutter_in_terminal(200, 40, &format!("--width 50pct {child}"));
-    let mut session = spawn(cmd);
+    let mut session = spawn_gutter(200, 40, &format!("--width 50pct {child}"));
 
     let bytes0 = drain_window(&mut session, Duration::from_millis(500));
     let parser0 = outer_grid(&bytes0, 200, 40);

@@ -12,62 +12,10 @@
 //!
 //! Headless: a real PTY, no display, `TERM=xterm-256color`.
 
-use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use expectrl::session::OsSession;
-use expectrl::Session;
-
-const OUTER_COLS: u16 = 80;
-const OUTER_ROWS: u16 = 24;
-
-fn gutter_cmd(child_argv: &[&str]) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gutter"));
-    cmd.args(child_argv);
-    cmd.env("TERM", "xterm-256color");
-    // A dumb test PTY can't answer the kitty probe; inject the known result so
-    // the run is not itself stalled by the startup probe (slice 04's seam).
-    cmd.env("GUTTER_FORCE_KITTY", "0");
-    cmd.env("GUTTER_FORCE_ANCHOR_ROW", "0");
-    cmd
-}
-
-fn spawn_gutter(child_argv: &[&str]) -> OsSession {
-    let mut session = Session::spawn(gutter_cmd(child_argv)).expect("spawn gutter under PTY");
-    session
-        .get_process_mut()
-        .set_window_size(OUTER_COLS, OUTER_ROWS)
-        .expect("set outer PTY window size");
-    session.set_expect_timeout(Some(Duration::from_secs(10)));
-    session
-}
-
-/// Read the outer PTY until `marker` is seen or `deadline` elapses, returning the
-/// elapsed time and everything read. The elapsed time is the no-stall signal: a
-/// child blocked on an unanswered query only emits its marker once its own read
-/// times out.
-fn read_until(session: &mut OsSession, marker: &str, deadline: Duration) -> (Duration, String) {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    let start = Instant::now();
-    while start.elapsed() < deadline {
-        match session.try_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                out.extend_from_slice(&buf[..n]);
-                if String::from_utf8_lossy(&out).contains(marker) {
-                    break;
-                }
-            }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    (start.elapsed(), String::from_utf8_lossy(&out).into_owned())
-}
+mod common;
+use common::{read_until, spawn_gutter_argv as spawn_gutter};
 
 /// **Cursor-position round-trip in W-grid coordinates (the gate).** gutter runs a
 /// centred 40-column band in an 80-column terminal, so the band's left margin is

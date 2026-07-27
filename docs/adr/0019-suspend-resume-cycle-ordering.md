@@ -35,25 +35,39 @@ thread's process, not the group a shell's job control watches.
 
 **Restore before self-stop.** The shell that gets the terminal back after `[1]+
 Stopped` must inherit a sane state: cooked mode, cursor shown and default-shaped,
-mouse off, kitty popped, alt screen left (or an inline hand-back newline emitted).
-`park()` runs this in ADR-010's order — leave-alt-or-hand-back, reset attributes,
-default cursor shape, pop kitty, disable mouse, show cursor, disable raw mode
-**last** — then flushes, so every byte lands before `suspend_self()` freezes the
+mouse off, the child's keyboard modes undone, alt screen left (or an inline
+hand-back newline emitted). `park()` runs this in ADR-010's order —
+leave-alt-or-hand-back, reset attributes, default cursor shape, reset the mirrored
+input modes, reset the relayed keyboard modes, disable mouse, show cursor, disable
+raw mode **last** — then
+flushes, so every byte lands before `suspend_self()` freezes the
 process. This is the entire point of the fix: today's bug is exactly *not* doing
 this.
 
 **Raw mode dropped last, re-taken first.** `unpark()` mirrors `park()` in reverse,
-with raw mode re-enabled *first* — before kitty, mouse, or alt screen — to shrink
-the cooked-mode window during which the already-running input thread (Thread 3,
-which owns crossterm's event source across the whole suspend) could see canonical
-rather than raw input.
+with raw mode re-enabled *first* — before mouse or alt screen — to shrink the
+cooked-mode window during which the already-running input thread (Thread 3, which
+owns the tty read fd across the whole suspend) could see canonical rather than raw
+input.
 
-**No kitty re-probe, no CPR, at resume.** Both would need a round-trip read of
-crossterm's event source, which Thread 3 already owns and never releases during
-suspend (it freezes with the process but never joins or restarts). Re-probing would
-be eaten silently. So `unpark()` re-pushes kitty flags from `outer_supports_kitty`
-— the value captured once at startup, before Thread 3 spawned — and the inline
-anchor is not re-queried at all: **`base_row` is reseeded to the bottom
+**No CPR at resume.** It would need a round-trip read of the tty, which Thread 3
+already owns and never releases during suspend (it freezes with the process but
+never joins or restarts), so the reply would be eaten silently. There is no
+keyboard capability to re-probe either — gutter asks the outer terminal for no
+keyboard mode of its own (ADR-020). What `unpark()` does re-assert is what the
+*child* asked for, replayed from the relay's log (ADR-021), oldest first and
+before mouse: a set mutates whichever level was on top when it was issued, so the
+order is load-bearing. `park` deliberately leaves that log alone — it is a park,
+not a teardown, and the same double-meaning trap as `outer_alt_active` applies.
+The three modes ADR-022 mirrors are the opposite case and need no replay at all:
+`park` clears the mirror after emitting their off forms, and the step-9 repaint's
+per-frame poll finds the child's live modes disagreeing with it and re-asserts them.
+The poll-diff is the replay mechanism, which is why there is no `rearm` counterpart
+here for it. That lands after `continue_child`, so the child could in principle paint
+in the gap — it cannot matter, since the mode affects only what the terminal sends and
+the user is not typing during those microseconds.
+Beyond raw mode, the replay, mouse and the alt screen, nothing else is re-taken.
+The inline anchor is not re-queried at all: **`base_row` is reseeded to the bottom
 (`rows.saturating_sub(1)`)** for primary-screen (non-alt) children, on the
 assumption that the shell scrolled the screen while gutter slept, making the old
 `base_row` meaningless. `render_once`'s make-room scroll then re-lays the band at
@@ -62,8 +76,8 @@ pre-suspend band copy — the same duplication a plain terminal shows after `fg`
 Accepted, not fixed.
 
 **TIOCSWINSZ before child SIGCONT.** The outer terminal may have been resized while
-gutter was stopped; crossterm's own pending-SIGWINCH can coalesce a resize-and-back
-into a stale or missing event, so `unpark` queries `term.terminal_size()` explicitly
+gutter was stopped; a pending SIGWINCH can coalesce a resize-and-back into a stale
+or missing event, so `unpark` queries `term.terminal_size()` explicitly
 and, if it differs from the parser's current size, runs the full ADR-008 resize
 handler. Because this runs *before* `continue_child()`, the `TIOCSWINSZ` queues one
 SIGWINCH on the still-stopped child; the child wakes to a single pending resize and
@@ -72,9 +86,9 @@ again a moment later.
 
 **`continue_child` last.** `suspender.continue_child()` — `kill(-child_pgid,
 SIGCONT)`, `ESRCH` ignored (the child may have died while gutter was stopped) —
-only runs after the outer terminal is fully raw, kitty-pushed, mouse-enabled and
-alt-screen-correct. The child's post-continue repaint bytes must never race an
-un-raw or wrong-mode terminal.
+only runs after the outer terminal is fully raw, keyboard-modes-replayed,
+mouse-enabled and alt-screen-correct. The child's post-continue repaint bytes must
+never race an un-raw or wrong-mode terminal.
 
 **`outer_alt_active`'s double meaning.** During park, the flag is *not* cleared
 after `leave_alt_screen()` — it deliberately keeps meaning "the child's screen is
@@ -113,9 +127,9 @@ confirm against both `zsh` and `bash`.
    any) fires here, keeping `outer_alt_active` truthful for park.
 3. **Park** (`park()`).
 4. **`suspender.suspend_self()`** — the process stops here until `fg`.
-5. **Unpark** (`unpark()`) — raw mode first, then kitty/mouse/alt, cursor shape
-   `rearm()`ed for the next repaint (park reset the outer cursor to default,
-   staling the cursor-shape watcher's dedup state).
+5. **Unpark** (`unpark()`) — raw mode first, then the mode replay, mouse and alt,
+   cursor shape `rearm()`ed for the next repaint (park reset the outer cursor to
+   default, staling the cursor-shape watcher's dedup state).
 6. **Inline anchor reseed** — `base_row` reset to the bottom for primary-screen
    children, seeded from the post-resize row count read via `term.terminal_size()`.
 7. **Missed-resize catch-up** — `term.terminal_size()` vs. the parser's current
@@ -147,7 +161,8 @@ no guard against a double call was needed.
 - A `Suspender` trait (`src/suspend.rs`) makes the two syscalls injectable —
   `RealSuspender` in production, a recording `MockSuspender` in tests that shares an
   ordered call log with `MockTerminal` so park/self-stop/unpark/continue-child
-  interleaving is asserted as one sequence.
+  interleaving is asserted as one sequence. The filter that log is read through has
+  to admit `Call::Relay`, or the two mode steps are invisible to the assertion.
 - `Flow::Suspend` is ignored inside `drain_pty_path` (the shutdown drain never
   recurses into a fresh suspend).
 - On resume, `continue 'frames` in `run`'s loop ensures the next coalescing frame
@@ -155,14 +170,16 @@ no guard against a double call was needed.
   long suspension.
 - Direct `SIGTSTP` sent straight to gutter (not via a child's Ctrl-Z) is
   unaffected by this ADR — gutter has no handler, so it stops in raw mode,
-  corrupting the outer terminal exactly as before. Deferred hardening (a fifth
-  signal-handling thread) is out of scope for this fix; `signal-hook` stays in
-  `Cargo.toml` unused, reserved for it.
+  corrupting the outer terminal exactly as before. Deferred hardening (handling
+  `SIGTSTP` on gutter's own signal thread) is out of scope for this fix.
+  `signal-hook` is no longer unused — ADR-020 gives it `SIGWINCH` — so the
+  hardening would extend that thread rather than add one.
 
 ## Code anchors
 
 - `src/render.rs` — `suspend_cycle`, `park`, `unpark`, `retry_enable_raw`,
   `SuspendOutcome`, `Flow::Suspend`
+- `src/relay.rs` — the mode log park resets and unpark replays
 - `src/suspend.rs` — the `Suspender` trait, `RealSuspender`, `MockSuspender`
 - `src/cursor.rs` — the cursor-shape watcher's `rearm()`
 - `src/terminal.rs` — `OuterTerminal::terminal_size()`

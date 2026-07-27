@@ -20,60 +20,15 @@
 //!
 //! Headless: a real PTY, no display, `TERM=xterm-256color`.
 
-use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use expectrl::session::OsSession;
-use expectrl::Session;
-
-const OUTER_COLS: u16 = 80;
-const OUTER_ROWS: u16 = 24;
+mod common;
+use common::{drain_window, spawn_gutter_argv as spawn_gutter};
 
 /// A known base64 payload the child copies. Carries `+`, `/` and `=` padding so
 /// the "verbatim, no decode/re-encode" guarantee is exercised on the full base64
 /// alphabet end-to-end.
 const KNOWN_B64: &str = "aGVs+bG8/8w==";
-
-fn gutter_cmd(child_argv: &[&str]) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gutter"));
-    cmd.args(child_argv);
-    cmd.env("TERM", "xterm-256color");
-    // A dumb test PTY can't answer the kitty probe; inject the known result to
-    // skip the ~2s stall (slice 04's injectable-capability seam).
-    cmd.env("GUTTER_FORCE_KITTY", "0");
-    cmd.env("GUTTER_FORCE_ANCHOR_ROW", "0");
-    cmd
-}
-
-fn spawn_gutter(child_argv: &[&str]) -> OsSession {
-    let mut session = Session::spawn(gutter_cmd(child_argv)).expect("spawn gutter under PTY");
-    session
-        .get_process_mut()
-        .set_window_size(OUTER_COLS, OUTER_ROWS)
-        .expect("set outer PTY window size");
-    session.set_expect_timeout(Some(Duration::from_secs(10)));
-    session
-}
-
-/// Non-blocking drain of the outer PTY for `window`, collecting everything
-/// gutter painted (frames AND the clipboard OSC it forwarded to `/dev/tty`).
-fn drain_window(session: &mut OsSession, window: Duration) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    let start = Instant::now();
-    while start.elapsed() < window {
-        match session.try_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    out
-}
 
 /// **Copy in the child reaches the real terminal (OSC 52 write).** The child
 /// emits `ESC ] 52 ; c ; <known-base64> BEL` on its output. gutter must

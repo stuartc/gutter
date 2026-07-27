@@ -5,24 +5,25 @@
 //! 60fps coalescing loop (ADR-007), generic over an injectable [`Clock`] so the
 //! timing tests run on virtual time.
 //!
-//! Each message is dispatched by [`dispatch`]: PTY bytes feed the parser, keys
-//! re-encode at the child's kitty level (ADR-002/003), mouse events route through
-//! the forwarding gate (ADR-005), and resize runs the ordered handler
-//! (ADR-008/011).
+//! Each message is dispatched by [`dispatch`]: PTY bytes feed the parser, raw
+//! input bytes go through the scanner and on to the child untouched (ADR-020),
+//! extracted mouse reports route through the forwarding gate (ADR-005), and
+//! resize runs the ordered handler (ADR-008/011).
 
 use std::io::Write;
 use std::time::Duration;
 
-use crossterm::event::{Event, KeyEvent};
-
 use crate::callbacks::GutterCallbacks;
+use crate::chord::Chord;
 use crate::clock::{Clock, Recv};
 use crate::geometry::{self, Layout, Width};
-use crate::keyboard::{self, KeyChord};
+use crate::modes::ModeMirror;
 use crate::mouse::{MouseDecision, MouseGate};
 use crate::msg::Msg;
 use crate::pty::PtyResizer;
+use crate::relay::KeyModeRelay;
 use crate::rowclip::clip_row_to_width_into;
+use crate::scan::{Scanner, Token, ESC_HOLD};
 use crate::suspend::Suspender;
 use crate::terminal::OuterTerminal;
 
@@ -83,6 +84,10 @@ pub struct Renderer {
     /// an enter/leave only on a real change. Never forced — gutter enters the alt
     /// screen only when the child does.
     outer_alt_active: bool,
+    /// The input modes last mirrored to the outer terminal (ADR-022) — DECCKM,
+    /// application keypad and bracketed paste. Edge-triggered like `cursor_visible`
+    /// and `outer_alt_active`, and polled from the same place in the frame.
+    mode_mirror: ModeMirror,
     /// Physical terminal row where grid row 0 sits on the PRIMARY screen (ADR-013).
     /// Initialised to the launch cursor row and driven monotonically toward 0 by the
     /// per-frame make-room scroll as the band grows; once it reaches 0 the band fills
@@ -99,12 +104,12 @@ pub struct Renderer {
     pty_eof_seen: bool,
     /// The mouse forwarding gate (ADR-005), holding the button-held flag the motion
     /// down-filter needs. The child's `(mode, encoding)` is read live from the screen
-    /// each `Event::Mouse` dispatch, not cached here.
+    /// each mouse report, not cached here.
     mouse_gate: MouseGate,
     /// The reserved resize-mode enter chord (`--resize-key`, default Ctrl-\). The one
     /// key gutter ever withholds from the child, and only as the enter chord or while
     /// in the mode (PRD 0001, Feature 2).
-    resize_key: KeyChord,
+    resize_key: Chord,
     /// Whether resize mode is currently active. Mirrors the loop-owned `ResizeCtl`
     /// (which `render_once` can't see) so the per-frame cursor tail knows to suppress
     /// the mirrored child cursor while the resize overlay owns the band.
@@ -116,19 +121,16 @@ impl Renderer {
     /// outer terminal.
     ///
     /// `width` is the resolved initial `W`; `width_config` is kept so resize can
-    /// recompute it for the proportional path (ADR-011). `outer_supports_kitty`
-    /// clamps the child's kitty negotiation (ADR-003); `clipboard_out` is the OSC-52
-    /// sink (ADR-004). Both ride only the live `parser` — `prev` is a diff-only
-    /// baseline that runs neither the kitty nor the clipboard path. `base_row` is the
-    /// launch cursor row (ADR-013).
-    #[allow(clippy::too_many_arguments)]
+    /// recompute it for the proportional path (ADR-011). `clipboard_out` is the
+    /// OSC-52 sink (ADR-004), riding only the live `parser` — `prev` is a diff-only
+    /// baseline that never runs the clipboard path. `base_row` is the launch cursor
+    /// row (ADR-013).
     pub fn new(
         width: u16,
         rows: u16,
         real_cols: u16,
         layout: Layout,
         width_config: Width,
-        outer_supports_kitty: bool,
         clipboard_out: Box<dyn Write + Send>,
         base_row: u16,
     ) -> Self {
@@ -137,21 +139,16 @@ impl Renderer {
                 rows,
                 width,
                 0,
-                GutterCallbacks::with_clipboard(outer_supports_kitty, clipboard_out),
+                GutterCallbacks::live(clipboard_out),
             ),
-            prev: vt100::Parser::new_with_callbacks(
-                rows,
-                width,
-                0,
-                GutterCallbacks::new(false),
-            ),
+            prev: vt100::Parser::new_with_callbacks(rows, width, 0, GutterCallbacks::baseline()),
             // Mirrors the band's geometry with a bounded scrollback so vt100 records
             // the lines that scroll off the top (ADR-013). Diff-only like `prev`.
             scroll_tracker: vt100::Parser::new_with_callbacks(
                 rows,
                 width,
                 SCROLL_TRACKER_SCROLLBACK,
-                GutterCallbacks::new(false),
+                GutterCallbacks::baseline(),
             ),
             width,
             width_config,
@@ -162,19 +159,21 @@ impl Renderer {
             cursor_visible: true,
             // gutter never forces the alt screen (ADR-012); start false.
             outer_alt_active: false,
+            // Nothing mirrored yet, so nothing owed back at teardown (ADR-022).
+            mode_mirror: ModeMirror::new(),
             // The inline anchor (ADR-013), clamped into the grid.
             base_row: base_row.min(rows.saturating_sub(1)),
             ever_painted_inline: false,
             pty_eof_seen: false,
             mouse_gate: MouseGate::default(),
-            resize_key: KeyChord::default(),
+            resize_key: Chord::default(),
             resize_active: false,
         }
     }
 
     /// Override the resize-mode enter chord (from `--resize-key`). Called once at
     /// startup from `main`; tests keep the default.
-    pub fn set_resize_key(&mut self, chord: KeyChord) {
+    pub fn set_resize_key(&mut self, chord: Chord) {
         self.resize_key = chord;
     }
 
@@ -206,7 +205,6 @@ impl Renderer {
             width,
             Layout::Left,
             Width::Cols(width),
-            false,
             Box::new(std::io::sink()),
             0,
         );
@@ -251,9 +249,18 @@ where
     match msg {
         Msg::Pty(bytes) => {
             renderer.parser.process(&bytes);
+            // Carry the child's keyboard-mode requests out to the real terminal
+            // (ADR-021), before the inward replies: a relayed `CSI ? u` has a round
+            // trip ahead of it and the head start is free. Safe outside a frame —
+            // `render_once` queues and flushes within one call, so no half-built
+            // frame is ever outstanding when a message is dispatched.
+            let relayed = renderer.parser.callbacks_mut().drain_relay();
+            if !relayed.is_empty() {
+                let _ = term.relay(&relayed);
+            }
             // Answer the child's device queries: parser.process surfaced any
-            // CSI c / CSI 5 n / CSI 6 n / CSI ? u through unhandled_csi, which
-            // buffered a spec-correct reply; drain it to the PTY master.
+            // CSI c / CSI 5 n / CSI 6 n through unhandled_csi, which buffered a
+            // spec-correct reply; drain it to the PTY master.
             let replies = renderer.parser.callbacks_mut().drain_replies();
             if !replies.is_empty() {
                 let _ = pty_writer.write_all(&replies);
@@ -266,53 +273,21 @@ where
             renderer.scroll_tracker.process(&bytes);
             Flow::Continue
         }
-        Msg::Input(crossterm::event::Event::Key(key)) => {
-            // Re-encode at the child's current kitty level (ADR-002/003). The level
-            // lives on the parser's callbacks — read lock-free, same thread.
-            let level: keyboard::KittyLevel = renderer.parser.callbacks().kitty_state.current();
-            let bytes = keyboard::encode_key(&key, level);
-            if !bytes.is_empty() {
-                let _ = pty_writer.write_all(&bytes);
-                let _ = pty_writer.flush();
-            }
-            Flow::Continue
-        }
-        Msg::Input(crossterm::event::Event::Resize(cols, rows)) => {
+        Msg::Resize => {
             // The resize handler (ADR-008/011) runs on THIS thread, the only parser
-            // owner. Param-order trap: (cols, rows) here, set_size(rows, cols) inside.
-            handle_resize(renderer, resizer, term, cols, rows);
-            Flow::Continue
-        }
-        Msg::Input(crossterm::event::Event::Mouse(ev)) => {
-            // The mouse forwarding gate (ADR-005). Read the child's (mode, encoding)
-            // from the live screen FIRST: this runs after the frame's Msg::Pty bytes
-            // applied, so a DECSET the child just sent is already visible. The gate
-            // translates the coordinate, down-filters motion, and re-encodes SGR.
-            let screen = renderer.parser.screen();
-            let mode = screen.mouse_protocol_mode();
-            let encoding = screen.mouse_protocol_encoding();
-            match renderer
-                .mouse_gate
-                .forward(&ev, mode, encoding, renderer.left_margin, renderer.width)
-            {
-                MouseDecision::Forward(bytes) => {
-                    let _ = pty_writer.write_all(&bytes);
-                    let _ = pty_writer.flush();
-                }
-                MouseDecision::Swallow => {}
-                MouseDecision::BailNonSgr => {
-                    // A reporting mode with a non-SGR encoding is out of v1 scope.
-                    // Fail loud rather than feed the child a malformed SGR event that
-                    // would desync its mouse parser (ADR-005).
-                    panic!(
-                        "gutter: child negotiated an unsupported non-SGR mouse \
-                         encoding; SGR 1006 is the only supported encoding (v1)"
-                    );
-                }
+            // owner. The size is read here rather than carried on the message, so
+            // two coalesced SIGWINCHes can't leave us acting on a stale geometry.
+            // Param-order trap: (cols, rows) here, set_size(rows, cols) inside.
+            if let Ok((cols, rows)) = term.terminal_size() {
+                handle_resize(renderer, resizer, term, cols, rows);
             }
             Flow::Continue
         }
-        // Other input events (focus/paste) are swallowed here.
+        // Input reaches the child through `apply_message`'s scanner, which is the
+        // only caller that owns the scanner state. This arm is reached from the two
+        // bounded drains — the shutdown drain (ADR-013) and the suspend cycle's
+        // pre-stop drain (ADR-0019) — where a keystroke is dropped rather than
+        // forwarded unscanned.
         Msg::Input(_) => Flow::Continue,
         Msg::ChildExited(status) => Flow::Exit(status.exit_code() as i32),
         // The child stopped (ADR-0018): drive the suspend/resume cycle. `sig` is
@@ -333,8 +308,8 @@ where
     }
 }
 
-/// What the render loop should do with a decoded key while resize mode is / isn't
-/// active. `PassThrough` is the only variant that reaches `encode_key`.
+/// What the render loop should do with one scanned unit while resize mode is /
+/// isn't active. `PassThrough` is the only variant that reaches the child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyAction {
     Enter,        // the chord, not in mode → enter resize mode
@@ -344,53 +319,34 @@ enum KeyAction {
     PassThrough,  // forward to the child (the normal path)
 }
 
-/// Classify a key against the reserved chord and the current mode.
+/// Classify one scanned unit against the reserved chord and the current mode.
 ///
-/// Releases are filtered FIRST: with kitty REPORT_EVENT_TYPES active on the outer
-/// terminal, every press is followed by a release event — without this guard the
-/// chord's own release would match again and instantly toggle the mode back
-/// (enter → exit on key-up). A release is inert: swallowed in mode (without
-/// refreshing idle), passed through otherwise (`encode_key` already returns empty
-/// bytes for releases, so passthrough preserves today's behaviour byte-for-byte).
+/// The chord is checked in BOTH states: not-in-mode it enters, in-mode it exits —
+/// so a chord that happens to be a letter can never collide with an in-mode
+/// command. `Chord::matches` fires on presses only, so a held chord's repeats and
+/// its own key-up cannot toggle the mode back off (ADR-016).
 ///
-/// The chord itself fires on `Press` only — an auto-repeating held chord must not
-/// toggle enter/exit every repeat. Step keys DO act on repeats (hold `h` to keep
-/// shrinking). The chord is checked in BOTH states: not-in-mode it enters, in-mode
-/// it exits — so a chord that happens to be a letter can never collide with an
-/// in-mode command.
-fn classify_key(ev: &KeyEvent, chord: KeyChord, in_mode: bool) -> KeyAction {
-    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-    if ev.kind == KeyEventKind::Release {
-        return if in_mode { KeyAction::Swallow } else { KeyAction::PassThrough };
-    }
-    if chord.matches(ev) && ev.kind == KeyEventKind::Press {
+/// The in-mode set is exact byte strings, no parsing. Repeats act on step keys
+/// (holding `h` keeps shrinking) automatically: an auto-repeating key simply
+/// sends its byte again, which is a fresh unit.
+fn classify_unit(unit: &[u8], chord: &Chord, in_mode: bool) -> KeyAction {
+    if chord.matches(unit) {
         return if in_mode { KeyAction::Exit } else { KeyAction::Enter };
     }
     if !in_mode {
         return KeyAction::PassThrough;
     }
-    // In mode: interpret the adjustment keys, swallow everything else. A step key
-    // carrying CONTROL or ALT is NOT a step (Ctrl-h in mode must not resize) —
-    // swallow it like any other stray key.
-    if ev
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-    {
-        return if matches!(ev.code, KeyCode::Esc) { KeyAction::Exit } else { KeyAction::Swallow };
-    }
-    let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
-    match ev.code {
-        KeyCode::Esc => KeyAction::Exit,
-        KeyCode::Left | KeyCode::Char('h') if !shift => KeyAction::Step(-1),
-        KeyCode::Right | KeyCode::Char('l') if !shift => KeyAction::Step(1),
-        KeyCode::Char('-') => KeyAction::Step(-1),
-        KeyCode::Char('+') | KeyCode::Char('=') => KeyAction::Step(1),
-        KeyCode::Char('H') => KeyAction::Step(-10),
-        KeyCode::Char('L') => KeyAction::Step(10),
-        // Shifted forms (kitty reports `Char('H')`+SHIFT; some legacy paths report
-        // SHIFT + lowercase; Shift+arrows mirror H/L for symmetry):
-        KeyCode::Char('h') | KeyCode::Left if shift => KeyAction::Step(-10),
-        KeyCode::Char('l') | KeyCode::Right if shift => KeyAction::Step(10),
+    match unit {
+        // A bare Escape, whether resolved by the hold or arriving as one of the
+        // disambiguated forms a relayed keyboard mode produces.
+        b"\x1b" | b"\x1b[27u" | b"\x1b[27;1u" | b"\x1b[27;1;27~" => KeyAction::Exit,
+        b"h" | b"-" => KeyAction::Step(-1),
+        b"l" | b"+" | b"=" => KeyAction::Step(1),
+        b"H" => KeyAction::Step(-10),
+        b"L" => KeyAction::Step(10),
+        // Left/Right in both cursor-key modes: normal (CSI) and DECCKM (SS3).
+        b"\x1b[D" | b"\x1bOD" => KeyAction::Step(-1),
+        b"\x1b[C" | b"\x1bOC" => KeyAction::Step(1),
         _ => KeyAction::Swallow,
     }
 }
@@ -601,6 +557,15 @@ fn apply_resize_step<R: PtyResizer, T: OuterTerminal>(
     }
 }
 
+/// The nearer of two optional deadlines, so Phase A's bounded wait can be capped
+/// by whichever of the ESC-hold and the resize-mode idle window comes first.
+fn earliest<I: Ord>(a: Option<I>, b: Option<I>) -> Option<I> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (only, None) | (None, only) => only,
+    }
+}
+
 /// Loop-owned resize-mode control. `Some(deadline)` == in mode, holding the instant
 /// idle auto-exit fires; `None` == not in mode. Generic over the clock's `Instant`
 /// so the idle window is virtual-clock testable (ADR-007).
@@ -622,14 +587,210 @@ impl<I: Copy + Ord> ResizeCtl<I> {
     }
 }
 
-/// Handle one live-loop message: intercept resize-mode keys BEFORE `encode_key`
-/// (PRD 0001, Feature 2), else delegate to `dispatch`. Returns the child exit code
-/// exactly as `dispatch` does.
+/// Loop-owned input control: the scanner and the ESC-hold deadline. Generic over
+/// the clock's `Instant` so the hold is virtual-clock testable (ADR-007/020).
+struct InputCtl<I> {
+    scanner: Scanner,
+    hold_deadline: Option<I>,
+}
+impl<I: Copy + Ord> InputCtl<I> {
+    fn new() -> Self {
+        Self {
+            scanner: Scanner::new(),
+            hold_deadline: None,
+        }
+    }
+}
+
+/// Apply one `KeyAction` that gutter consumes. `PassThrough` never reaches here —
+/// the caller forwards those bytes itself.
+fn apply_key_action<C, T, R>(
+    action: KeyAction,
+    clock: &mut C,
+    renderer: &mut Renderer,
+    resize: &mut ResizeCtl<C::Instant>,
+    term: &mut T,
+    resizer: &R,
+) where
+    C: Clock<Msg = Msg>,
+    T: OuterTerminal,
+    R: PtyResizer,
+{
+    match action {
+        KeyAction::Enter => {
+            // Two statements, NOT `clock.deadline(clock.now(), ..)`: `deadline`
+            // takes `&self` and `now` takes `&mut self`, so nesting them in one
+            // expression is an E0502 overlapping borrow.
+            let now = clock.now();
+            resize.arm(clock.deadline(now, RESIZE_IDLE));
+            let _ = renderer.begin_resize(term);
+            let _ = enter_resize_overlay(renderer, term);
+        }
+        KeyAction::Step(delta) => {
+            let now = clock.now();
+            resize.arm(clock.deadline(now, RESIZE_IDLE)); // a resize key = activity
+            apply_resize_step(renderer, resizer, term, delta);
+        }
+        KeyAction::Exit => {
+            resize.disarm();
+            renderer.end_resize();
+            let _ = clear_resize_overlay(renderer, term);
+            renderer.reset_prev_baseline();
+        }
+        // Consumed but NOT counted as activity: a swallowed stray key must not
+        // keep the mode alive forever (PRD 0001: idle = "no resize key").
+        KeyAction::Swallow => {}
+        KeyAction::PassThrough => {}
+    }
+}
+
+/// Write bytes to the child, the default action for everything the scanner did
+/// not consume.
+fn forward_to_child<P: Write>(pty_writer: &mut P, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let _ = pty_writer.write_all(bytes);
+    let _ = pty_writer.flush();
+}
+
+/// Walk one chunk's tokens, forwarding or consuming each.
+///
+/// All splitting of an ordinary byte run happens here rather than in the scanner,
+/// because this is the layer that knows whether resize mode is active — and it
+/// re-reads that at every step, so a chunk carrying the chord and two step keys
+/// (`0x1C l l`) enters the mode mid-run and applies both steps.
+fn walk_tokens<C, T, P, R>(
+    tokens: &[Token],
+    clock: &mut C,
+    renderer: &mut Renderer,
+    resize: &mut ResizeCtl<C::Instant>,
+    term: &mut T,
+    pty_writer: &mut P,
+    resizer: &R,
+) where
+    C: Clock<Msg = Msg>,
+    T: OuterTerminal,
+    P: Write,
+    R: PtyResizer,
+{
+    for token in tokens {
+        match token {
+            // A paste — guards included — and a string-sequence payload are data,
+            // not input protocol: nothing is extracted, nothing is matched,
+            // nothing is dropped, in resize mode or out of it.
+            Token::Paste(bytes) | Token::Str(bytes) => forward_to_child(pty_writer, bytes),
+            Token::Mouse(report) => {
+                // The mouse forwarding gate (ADR-005). Read the child's
+                // (mode, encoding) from the live screen FIRST: this runs after the
+                // frame's Msg::Pty bytes applied, so a DECSET the child just sent is
+                // already visible. The gate translates the coordinate, down-filters
+                // motion, and re-encodes SGR.
+                let screen = renderer.parser.screen();
+                let mode = screen.mouse_protocol_mode();
+                let encoding = screen.mouse_protocol_encoding();
+                match renderer.mouse_gate.forward(
+                    report,
+                    mode,
+                    encoding,
+                    renderer.left_margin,
+                    renderer.width,
+                ) {
+                    MouseDecision::Forward(bytes) => forward_to_child(pty_writer, &bytes),
+                    MouseDecision::Swallow => {}
+                    MouseDecision::BailNonSgr => {
+                        // A reporting mode with a non-SGR encoding is out of v1
+                        // scope. Fail loud rather than feed the child a malformed
+                        // SGR report that would desync its mouse parser (ADR-005).
+                        panic!(
+                            "gutter: child negotiated an unsupported non-SGR mouse \
+                             encoding; SGR 1006 is the only supported encoding (v1)"
+                        );
+                    }
+                }
+            }
+            // A complete escape sequence is atomic: matched whole or forwarded
+            // whole, never split into an Escape plus literal characters.
+            Token::Seq(bytes) => {
+                match classify_unit(bytes, &renderer.resize_key, resize.active()) {
+                    KeyAction::PassThrough => forward_to_child(pty_writer, bytes),
+                    action => apply_key_action(action, clock, renderer, resize, term, resizer),
+                }
+            }
+            Token::Text(run) => {
+                let mut i = 0;
+                while i < run.len() {
+                    if resize.active() {
+                        let action = classify_unit(&run[i..i + 1], &renderer.resize_key, true);
+                        apply_key_action(action, clock, renderer, resize, term, resizer);
+                        i += 1;
+                        continue;
+                    }
+                    // Out of mode the only byte gutter withholds is the chord's
+                    // single-byte form; everything up to it is one write, so a
+                    // burst of typing costs one write per chunk.
+                    let rest = &run[i..];
+                    match renderer
+                        .resize_key
+                        .single_byte()
+                        .and_then(|b| rest.iter().position(|&x| x == b))
+                    {
+                        Some(at) => {
+                            forward_to_child(pty_writer, &rest[..at]);
+                            apply_key_action(
+                                KeyAction::Enter,
+                                clock,
+                                renderer,
+                                resize,
+                                term,
+                                resizer,
+                            );
+                            i += at + 1;
+                        }
+                        None => {
+                            forward_to_child(pty_writer, rest);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The ESC-hold expired: emit whatever the scanner withheld and clear the
+/// deadline. The flush is verbatim and in order — a held `ESC [` reaches the
+/// child as two bytes, never as an Escape followed by a `[` keystroke.
+fn flush_hold<C, T, P, R>(
+    input: &mut InputCtl<C::Instant>,
+    clock: &mut C,
+    renderer: &mut Renderer,
+    resize: &mut ResizeCtl<C::Instant>,
+    term: &mut T,
+    pty_writer: &mut P,
+    resizer: &R,
+) where
+    C: Clock<Msg = Msg>,
+    T: OuterTerminal,
+    P: Write,
+    R: PtyResizer,
+{
+    let mut tokens = Vec::new();
+    input.scanner.flush(&mut tokens);
+    input.hold_deadline = None;
+    walk_tokens(&tokens, clock, renderer, resize, term, pty_writer, resizer);
+}
+
+/// Handle one live-loop message: raw input goes through the scanner and the token
+/// walk (ADR-020), everything else delegates to `dispatch`. Returns the child exit
+/// code exactly as `dispatch` does.
+#[allow(clippy::too_many_arguments)]
 fn apply_message<C, T, P, R>(
     m: Msg,
     clock: &mut C,
     renderer: &mut Renderer,
     resize: &mut ResizeCtl<C::Instant>,
+    input: &mut InputCtl<C::Instant>,
     term: &mut T,
     pty_writer: &mut P,
     resizer: &R,
@@ -640,44 +801,32 @@ where
     P: Write,
     R: PtyResizer,
 {
-    if let Msg::Input(Event::Key(key)) = &m {
-        match classify_key(key, renderer.resize_key, resize.active()) {
-            KeyAction::PassThrough => {} // fall through to dispatch (encode + write)
-            KeyAction::Enter => {
-                // Two statements, NOT `clock.deadline(clock.now(), ..)`: `deadline`
-                // takes `&self` and `now` takes `&mut self`, so nesting them in one
-                // expression is an E0502 overlapping borrow.
-                let now = clock.now();
-                resize.arm(clock.deadline(now, RESIZE_IDLE));
-                let _ = renderer.begin_resize(term);
-                let _ = enter_resize_overlay(renderer, term);
-                return Flow::Continue; // consumed, no PTY
-            }
-            KeyAction::Step(delta) => {
-                let now = clock.now();
-                resize.arm(clock.deadline(now, RESIZE_IDLE)); // a resize key = activity
-                apply_resize_step(renderer, resizer, term, delta);
-                return Flow::Continue;
-            }
-            KeyAction::Exit => {
-                resize.disarm();
-                renderer.end_resize();
-                let _ = clear_resize_overlay(renderer, term);
-                renderer.reset_prev_baseline();
-                return Flow::Continue;
-            }
-            KeyAction::Swallow => {
-                // Consumed but NOT counted as activity: a swallowed stray key must
-                // not keep the mode alive forever (PRD: idle = "no resize key").
-                return Flow::Continue;
-            }
-        }
+    if let Msg::Input(bytes) = &m {
+        // The paste gate reads what gutter told the OUTER terminal (ADR-022), because
+        // only a terminal that was sent `?2004h` can have produced the guards. Same
+        // thread as the mirror, so this is a plain field read.
+        input
+            .scanner
+            .set_paste_guards(renderer.mode_mirror.bracketed_paste());
+        let mut tokens = Vec::new();
+        input.scanner.feed(bytes, &mut tokens);
+        walk_tokens(&tokens, clock, renderer, resize, term, pty_writer, resizer);
+        // Re-arm on every feed, not just the not-holding→holding edge: a chunk
+        // that EXTENDS an incomplete sequence is evidence more is coming, so
+        // restarting the clock is the right behaviour.
+        input.hold_deadline = if input.scanner.holding() {
+            let now = clock.now();
+            Some(clock.deadline(now, ESC_HOLD))
+        } else {
+            None
+        };
+        return Flow::Continue;
     }
     // A terminal resize (SIGWINCH) while in mode moved the band — repaint the
     // overlay after handle_resize has updated the geometry. Capture the geometry
     // BEFORE dispatch mutates it, so a grow can blank the vacated rail columns
     // handle_resize's own (rails-blind) clear left behind.
-    let was_resize = matches!(m, Msg::Input(Event::Resize(..)));
+    let was_resize = matches!(m, Msg::Resize);
     let prev = (was_resize && resize.active()).then(|| BandGeom::of(renderer));
     let code = dispatch(m, renderer, pty_writer, resizer, term);
     if was_resize && resize.active() {
@@ -710,6 +859,18 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
             renderer.reset_prev_baseline();
         }
         renderer.outer_alt_active = child_alt;
+    }
+
+    // Mirror the input modes vt100 swallowed into its screen state (ADR-022): DECCKM,
+    // application keypad and bracketed paste, each edge-triggered against what was last
+    // mirrored. Sitting next to the alt-screen mirror is legibility, not ordering — all
+    // three are terminal-global and survive a `?1049` either way — but being ahead of
+    // the paint loop is load-bearing: a painted row is a self-contained run inside its
+    // margin-offset rectangle (ADR-014), and mode bytes between a `move_to` and its row
+    // would break that for nothing.
+    let mode_bytes = renderer.mode_mirror.take_pending(renderer.parser.screen());
+    if !mode_bytes.is_empty() {
+        term.relay(&mode_bytes)?;
     }
 
     // Scroll emit (ADR-013): on the primary screen, advance each line that left the
@@ -994,7 +1155,7 @@ impl Renderer {
         // Reset prev to a blank grid of the same size before replaying, so stale cells
         // from a shrunk region don't linger.
         let (rows, cols) = self.parser.screen().size();
-        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::new(false));
+        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::baseline());
         self.prev.process(&formatted);
     }
 
@@ -1004,7 +1165,7 @@ impl Renderer {
     /// scroll detection stays sound across the change.
     fn reset_prev_baseline(&mut self) {
         let (rows, cols) = self.parser.screen().size();
-        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::new(false));
+        self.prev = vt100::Parser::new_with_callbacks(rows, cols, 0, GutterCallbacks::baseline());
         self.reset_scroll_tracker();
     }
 
@@ -1048,7 +1209,7 @@ impl Renderer {
             rows,
             cols,
             SCROLL_TRACKER_SCROLLBACK,
-            GutterCallbacks::new(false),
+            GutterCallbacks::baseline(),
         );
         self.scroll_tracker.process(&formatted);
     }
@@ -1119,8 +1280,26 @@ where
 {
     let mut exit_code: Option<i32> = None;
     let mut resize = ResizeCtl::inactive();
+    let mut input = InputCtl::new();
 
     'frames: loop {
+        // Top-of-frame hold check: a hold that expired while the loop was busy
+        // draining a PTY burst flushes this frame rather than at the burst's end.
+        // Runs before the idle check because it is the cheaper one and its flushed
+        // bytes may feed the mode.
+        if let Some(dl) = input.hold_deadline {
+            if clock.now() >= dl {
+                flush_hold(
+                    &mut input, clock, renderer, &mut resize, term, pty_writer, resizer,
+                );
+                // The flushed Escape may have left resize mode, whose overlay clear
+                // is only queued — render so it reaches the terminal even if the
+                // child never writes again.
+                let _ = render_once(renderer, term);
+                continue 'frames;
+            }
+        }
+
         // Top-of-frame idle check (handles a flooding child that never lets Phase A
         // block): if the idle deadline has already passed, exit the mode and repaint
         // before doing anything else this frame.
@@ -1135,17 +1314,30 @@ where
             }
         }
 
-        // --- Phase A: block for the first message (zero idle CPU when not in mode;
-        // a bounded wait while in mode, so a quiet child still wakes for auto-exit) ---
-        let first = if let Some(dl) = resize.idle_deadline {
+        // --- Phase A: block for the first message (zero idle CPU with no deadline
+        // pending; a bounded wait while resize mode or the ESC-hold is armed, so a
+        // quiet child still wakes for the auto-exit or the flush) ---
+        let first = if let Some(dl) = earliest(input.hold_deadline, resize.idle_deadline) {
             match clock.recv_until(dl) {
                 Recv::Msg(m) => m,
                 Recv::Timeout => {
-                    // ~3 s idle elapsed.
-                    resize.disarm();
-                    renderer.end_resize();
-                    let _ = clear_resize_overlay(renderer, term);
-                    renderer.reset_prev_baseline();
+                    // Both deadlines can fire in one wake; the hold goes first,
+                    // since it is the cheaper one and might feed the mode.
+                    let now = clock.now();
+                    if input.hold_deadline.is_some_and(|d| now >= d) {
+                        flush_hold(
+                            &mut input, clock, renderer, &mut resize, term, pty_writer, resizer,
+                        );
+                    }
+                    if resize.idle_deadline.is_some_and(|d| now >= d) {
+                        // ~3 s idle elapsed.
+                        resize.disarm();
+                        renderer.end_resize();
+                        let _ = clear_resize_overlay(renderer, term);
+                        renderer.reset_prev_baseline();
+                    }
+                    // Both paths may have queued an overlay clear; flush it here
+                    // rather than waiting for a child that may never write again.
                     let _ = render_once(renderer, term);
                     continue 'frames;
                 }
@@ -1159,7 +1351,9 @@ where
             }
         };
         let mut shutdown = false;
-        match apply_message(first, clock, renderer, &mut resize, term, pty_writer, resizer) {
+        match apply_message(
+            first, clock, renderer, &mut resize, &mut input, term, pty_writer, resizer,
+        ) {
             Flow::Continue => {}
             Flow::Exit(code) => {
                 exit_code = Some(code);
@@ -1206,7 +1400,8 @@ where
                 match clock.recv_until(deadline) {
                     Recv::Msg(m) => {
                         match apply_message(
-                            m, clock, renderer, &mut resize, term, pty_writer, resizer,
+                            m, clock, renderer, &mut resize, &mut input, term, pty_writer,
+                            resizer,
                         ) {
                             Flow::Continue => {}
                             Flow::Exit(code) => {
@@ -1355,7 +1550,7 @@ where
 
     // Step 6 — inline anchor reseed (primary-screen children). The shell scrolled the
     // screen while gutter slept, so base_row is meaningless and CPR is unavailable (the
-    // input thread owns the event source). Reseed at the bottom like a fresh launch;
+    // input thread owns the tty read fd). Reseed at the bottom like a fresh launch;
     // render_once's make-room scroll re-lays the band there.
     //
     // This runs BEFORE the step-7 catch-up (which normally settles base_row first) so
@@ -1416,16 +1611,18 @@ where
 }
 
 /// Park the outer terminal (ADR-0019 step 3): leave alt (or hand the shell a fresh
-/// line below the inline band), reset attributes and cursor shape, pop kitty,
-/// disable mouse, show the cursor, and drop raw mode LAST — then flush so it all
-/// lands before the self-stop. Deliberately does NOT clear `outer_alt_active`: it
-/// stays as "the child's screen is alt" for the resume re-derivation (the
-/// double-meaning note in ADR-0019).
+/// line below the inline band), reset attributes and cursor shape, undo the mirrored
+/// input modes and the child's keyboard modes, disable mouse, show the cursor, and
+/// drop raw mode LAST — then flush so it all lands before the self-stop.
+/// Deliberately does NOT clear `outer_alt_active`: it stays as "the child's screen
+/// is alt" for the resume re-derivation (the double-meaning note in ADR-0019). The
+/// relay's log survives for the same reason — this is a park, not a teardown, and
+/// `unpark` replays it.
 fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
     // Best-effort per step (ADR-010's "restore by hand, each step conditional"):
     // attempt EVERY restore step even if an earlier one errors, so an early failure
     // (e.g. a flush inside leave_alt_screen) can't short-circuit the rest and strand
-    // the shell in raw mode / mouse / kitty. disable_raw_mode in particular MUST run
+    // the shell in raw mode or mouse reporting. disable_raw_mode in particular MUST run
     // before the self-stop. The first error is remembered and returned for logging.
     let mut first_err: std::io::Result<()> = Ok(());
     let mut record = |r: std::io::Result<()>| {
@@ -1444,7 +1641,11 @@ fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Res
     }
     record(term.write_row(b"\x1b[0m")); // drop any leftover attribute run
     record(term.set_cursor_shape(b"\x1b[0 q")); // hand the shell a default cursor shape
-    record(term.pop_keyboard_flags()); // conditional on kitty_pushed
+    record(mode_reset(renderer, term)); // undo the mirrored input modes (ADR-022)
+    // Cleared, not kept: the child's modes are still on its screen, so the step-9
+    // repaint's poll re-asserts them on resume with no replay list.
+    renderer.mode_mirror.clear();
+    record(relay_reset(renderer, term)); // undo the child's keyboard modes (ADR-021)
     record(term.disable_mouse()); // conditional on mouse_enabled
     record(term.show_cursor());
     renderer.cursor_visible = true;
@@ -1455,14 +1656,12 @@ fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Res
 
 /// Unpark the outer terminal (ADR-0019 step 5): re-take it after the self-stop
 /// returns, in inverse order — raw mode FIRST, shrinking the cooked-mode window the
-/// already-running input thread could read canonical input in. No kitty re-probe: a
-/// `CSI ? u` round-trip would be eaten by Thread 3, which now owns crossterm's event
-/// source, so re-push from the stored startup capability instead.
+/// already-running input thread could read canonical input in. gutter asks the outer
+/// terminal for no keyboard mode of its own (ADR-020); what it re-asserts is what the
+/// child asked for, replayed from the relay's log (ADR-021).
 fn unpark<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
     retry_enable_raw(term)?;
-    if renderer.parser.callbacks().kitty_state.outer_supports() {
-        let _ = term.push_keyboard_flags();
-    }
+    relay_replay(renderer, term)?;
     term.enable_mouse()?;
     let child_alt = renderer.parser.screen().alternate_screen();
     if child_alt {
@@ -1477,6 +1676,55 @@ fn unpark<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::R
     // cursor to the default, so the watcher's mirrored state is stale.
     renderer.parser.callbacks_mut().cursor_shape.rearm();
     Ok(())
+}
+
+/// Turn off the input modes gutter mirrored onto the outer terminal (ADR-022),
+/// immediately before the relay's own reset so every input-encoding restore sits
+/// together with the coarsest last.
+///
+/// Restores to the terminal's defaults rather than to whatever it had before gutter
+/// launched. A shell whose paste protection is clobbered by this re-asserts its input
+/// modes at its next prompt, so the blast radius is one prompt.
+fn mode_reset<T: OuterTerminal>(renderer: &Renderer, term: &mut T) -> std::io::Result<()> {
+    let bytes = renderer.mode_mirror.reset_bytes();
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    term.relay(&bytes)
+}
+
+/// Undo the keyboard modes the child asked the outer terminal for (ADR-021), in the
+/// slot ADR-010 gives the input-encoding restores: after the screen is back to the
+/// primary buffer, so the bytes land on the screen the shell inherits, and before raw
+/// mode is dropped.
+///
+/// Writes nothing when the child negotiated nothing — the relay's log is the record of
+/// what was actually set up, and gutter resets no mode it did not set.
+fn relay_reset<T: OuterTerminal>(renderer: &Renderer, term: &mut T) -> std::io::Result<()> {
+    relay_write(renderer, term, KeyModeRelay::reset_bytes)
+}
+
+/// Re-apply the child's keyboard modes on resume, oldest first, so the terminal comes
+/// back at the depth and flags the child last asked for and a later pop still lines up.
+fn relay_replay<T: OuterTerminal>(renderer: &Renderer, term: &mut T) -> std::io::Result<()> {
+    relay_write(renderer, term, KeyModeRelay::replay_bytes)
+}
+
+fn relay_write<T: OuterTerminal>(
+    renderer: &Renderer,
+    term: &mut T,
+    bytes: fn(&KeyModeRelay) -> Vec<u8>,
+) -> std::io::Result<()> {
+    let out = renderer
+        .parser
+        .callbacks()
+        .key_modes()
+        .map(bytes)
+        .unwrap_or_default();
+    if out.is_empty() {
+        return Ok(());
+    }
+    term.relay(&out)
 }
 
 /// Re-enter raw mode on resume, retrying a bounded number of times on `EINTR`: the
@@ -1537,8 +1785,9 @@ fn drain_pty_path<C, T, P, R>(
 }
 
 /// The explicit, ordered terminal restore (ADR-010), mode-aware (ADR-012/013):
-/// conditional alt-leave / inline hand-back → pop kitty flags → disable mouse → show
-/// cursor → disable raw mode. Each step undoes only what was actually set up.
+/// conditional alt-leave / inline hand-back → reset the mirrored input modes → reset
+/// the child's keyboard modes → disable mouse → show cursor → disable raw mode. Each
+/// step undoes only what was actually set up.
 ///
 /// The discriminator is the live `outer_alt_active`: a child that exits in the alt
 /// screen takes the leave-alt path; one that exits inline hands back below the band. The
@@ -1555,7 +1804,8 @@ fn run_teardown<T: OuterTerminal>(
     } else if renderer.ever_painted_inline {
         hand_back_inline(renderer, term, exit_code)?;
     }
-    term.pop_keyboard_flags()?;
+    mode_reset(renderer, term)?;
+    relay_reset(renderer, term)?;
     term.disable_mouse()?;
     term.show_cursor()?;
     term.disable_raw_mode()?;
@@ -1690,17 +1940,114 @@ mod tests {
 
     /// Build a left-aligned, fixed-`width` renderer (margin 0) — the absolute-width,
     /// left-aligned baseline.
-    fn left_renderer(width: u16, rows: u16, outer_kitty: bool) -> Renderer {
+    fn left_renderer(width: u16, rows: u16) -> Renderer {
         Renderer::new(
             width,
             rows,
             width, // real_cols == width → margin 0 for both Left and Center
             Layout::Left,
             Width::Cols(width),
-            outer_kitty,
             Box::new(std::io::sink()),
             0, // base_row 0 → absolute paint, the baseline
         )
+    }
+
+    /// A recording [`PtyResizer`] capturing each `master.resize(cols, rows)` in
+    /// order.
+    #[derive(Default)]
+    struct RecResizer {
+        calls: std::cell::RefCell<Vec<(u16, u16)>>,
+    }
+    impl PtyResizer for RecResizer {
+        fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+            self.calls.borrow_mut().push((cols, rows));
+            Ok(())
+        }
+    }
+
+    /// Build a centred renderer with an explicit width config, for the tests that
+    /// drive the width machinery.
+    fn mode_renderer(width: u16, rows: u16, real_cols: u16, cfg: Width) -> Renderer {
+        Renderer::new(
+            width,
+            rows,
+            real_cols,
+            Layout::Center,
+            cfg,
+            Box::new(std::io::sink()),
+            0,
+        )
+    }
+
+    /// The default chord's byte, the one gutter withholds from the child.
+    const CHORD: &[u8] = &[0x1c];
+
+    /// Everything one turn of the loop touches, bundled so tests read as a script of
+    /// `send`/`enter` calls rather than repeating eight `&mut` arguments. Drives
+    /// `apply_message` and `flush_hold` directly, which is the whole loop minus the
+    /// frame timing.
+    struct Ctx {
+        clock: VirtualClock,
+        renderer: Renderer,
+        resize: ResizeCtl<u64>,
+        input: InputCtl<u64>,
+        term: MockTerminal,
+        pty: Vec<u8>,
+        resizer: RecResizer,
+    }
+
+    impl Ctx {
+        fn new(width: u16, rows: u16, real_cols: u16, cfg: Width) -> Self {
+            Self {
+                clock: VirtualClock::new(vec![]),
+                renderer: mode_renderer(width, rows, real_cols, cfg),
+                resize: ResizeCtl::inactive(),
+                input: InputCtl::new(),
+                term: MockTerminal::new(),
+                pty: Vec::new(),
+                resizer: RecResizer::default(),
+            }
+        }
+
+        fn send(&mut self, bytes: &[u8]) -> Flow {
+            apply_message(
+                Msg::Input(bytes.to_vec()),
+                &mut self.clock,
+                &mut self.renderer,
+                &mut self.resize,
+                &mut self.input,
+                &mut self.term,
+                &mut self.pty,
+                &self.resizer,
+            )
+        }
+
+        /// Release whatever the ESC-hold is withholding, as the loop's top-of-frame
+        /// check does once the deadline passes.
+        fn expire_hold(&mut self) {
+            flush_hold(
+                &mut self.input,
+                &mut self.clock,
+                &mut self.renderer,
+                &mut self.resize,
+                &mut self.term,
+                &mut self.pty,
+                &self.resizer,
+            );
+        }
+
+        /// Advance virtual time, firing the hold only once its deadline has passed —
+        /// the loop's own top-of-frame condition.
+        fn advance(&mut self, ms: u64) {
+            self.clock.now_ms += ms;
+            if self.input.hold_deadline.is_some_and(|d| self.clock.now_ms >= d) {
+                self.expire_hold();
+            }
+        }
+
+        fn enter(&mut self) {
+            self.send(CHORD);
+        }
     }
 
     fn run_with(
@@ -1709,7 +2056,7 @@ mod tests {
         rows: u16,
     ) -> (usize, MockTerminal, Vec<u8>, Renderer, Option<i32>) {
         let mut clock = VirtualClock::new(script);
-        let mut renderer = left_renderer(width, rows, false);
+        let mut renderer = left_renderer(width, rows);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         let resizer = NoopResizer;
@@ -1750,7 +2097,7 @@ mod tests {
 
         // Completeness: replay every PTY byte into a fresh parser; same grid.
         let mut reference: vt100::Parser<GutterCallbacks> =
-            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::new(false));
+            vt100::Parser::new_with_callbacks(24, 80, 0, GutterCallbacks::baseline());
         for p in &payloads {
             reference.process(p);
         }
@@ -1794,7 +2141,7 @@ mod tests {
     #[test]
     fn idle_park_zero_renders_zero_wakeups() {
         let mut clock = VirtualClock::new(vec![]);
-        let mut renderer = left_renderer(80, 24, false);
+        let mut renderer = left_renderer(80, 24);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
 
@@ -1812,18 +2159,13 @@ mod tests {
     /// and completeness still hold.
     #[test]
     fn input_liveness_under_load() {
-        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-
         // ~64KB chunk every 1ms for 200ms = a multi-MB burst; inject one key at
         // the 100ms mark (the 100th chunk).
         let chunk = vec![b'x'; 64 * 1024];
         let mut script: Vec<(u64, Msg)> = Vec::new();
         for i in 0..200 {
             if i == 100 {
-                script.push((
-                    0,
-                    Msg::Input(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))),
-                ));
+                script.push((0, Msg::Input(b"\r".to_vec())));
             }
             script.push((1, Msg::Pty(chunk.clone())));
         }
@@ -1837,7 +2179,7 @@ mod tests {
         // 16ms window — we assert the writer is non-empty immediately after the
         // run and that it landed before the burst's end is processed.
         let mut clock = VirtualClock::new(script);
-        let mut renderer = left_renderer(80, 24, false);
+        let mut renderer = left_renderer(80, 24);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
@@ -1856,19 +2198,16 @@ mod tests {
     /// fire in order, the loop exits, and the exit code matches `status.exit_code()`.
     /// `LeaveAltScreen` must not fire; the hand-back drops the cursor below the band and
     /// emits the dim `Exited with: 42` status line before the remaining restore steps.
-    /// On a non-kitty outer terminal `PopKeyboardFlags` must not fire — we only pop what
-    /// we pushed (ADR-003).
     #[test]
-    fn child_exit_restores_in_order_no_kitty_pop_when_not_pushed() {
-        use crate::terminal::OuterTerminal;
+    fn child_exit_restores_in_order() {
         let mut clock = VirtualClock::new(vec![
             (0u64, Msg::Pty(b"report".to_vec())),
             (1, Msg::ChildExited(ExitStatus::with_exit_code(42))),
         ]);
-        let mut renderer = left_renderer(80, 24, false);
+        let mut renderer = left_renderer(80, 24);
         let mut term = MockTerminal::new();
-        // Model the eager startup mouse capture main.rs performs (no kitty push
-        // on this non-kitty path). `DisableMouse` must then fire in teardown.
+        // Model the eager startup mouse capture main.rs performs; `DisableMouse`
+        // must then fire in teardown.
         term.enable_mouse().unwrap();
         let mut pty: Vec<u8> = Vec::new();
 
@@ -1889,7 +2228,7 @@ mod tests {
                 Call::ShowCursor,
                 Call::DisableRawMode,
             ],
-            "restore order: NO LeaveAltScreen (never entered), NO kitty pop"
+            "restore order: NO LeaveAltScreen (the child never entered it)"
         );
 
         // The dim status line is recorded as a `write_row` carrying the
@@ -1925,26 +2264,20 @@ mod tests {
         );
     }
 
-    /// Child-exit restore with a kitty-capable outer terminal, for a TUI in the alt
-    /// screen at exit (`?1049h` then exit): the startup kitty push must be paired with a
-    /// `PopKeyboardFlags` in the right slot — after the leave-alt-screen, before
-    /// disable-raw-mode (ADR-010/003/012). Because the child exits in the alt screen,
-    /// `LeaveAltScreen` fires and the inline hand-back is skipped, so teardown emits no
-    /// hand-back rows and no status line, even on a zero exit.
+    /// Child-exit restore for a TUI in the alt screen at exit (`?1049h` then exit).
+    /// `LeaveAltScreen` fires in the ADR-010 slot and the inline hand-back is
+    /// skipped, so teardown emits no hand-back rows and no status line, even on a
+    /// zero exit (ADR-010/012).
     #[test]
-    fn child_exit_pops_kitty_flags_when_pushed_at_startup() {
-        use crate::terminal::OuterTerminal;
+    fn child_exit_leaves_alt_screen_then_restores_in_order() {
         let mut clock = VirtualClock::new(vec![
             // The child enters the alt screen (a TUI), then exits while still in it.
             (0u64, Msg::Pty(b"\x1b[?1049h".to_vec())),
             (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ]);
-        let mut renderer = left_renderer(80, 24, true);
-        let mut term = MockTerminal::kitty_capable();
-        // Simulate the startup probe + push + eager mouse capture main.rs
-        // performs, in that order (kitty push, then EnableMouse).
-        assert!(term.supports_keyboard_enhancement().unwrap());
-        term.push_keyboard_flags().unwrap();
+        let mut renderer = left_renderer(80, 24);
+        let mut term = MockTerminal::new();
+        // Model the eager startup mouse capture main.rs performs.
         term.enable_mouse().unwrap();
         let mut pty: Vec<u8> = Vec::new();
 
@@ -1966,12 +2299,11 @@ mod tests {
             term.restore_calls(),
             vec![
                 Call::LeaveAltScreen,
-                Call::PopKeyboardFlags,
                 Call::DisableMouse,
                 Call::ShowCursor,
                 Call::DisableRawMode,
             ],
-            "an alt-screen TUI leaves the alt screen, then pops kitty in the ADR-010 slot"
+            "an alt-screen TUI leaves the alt screen, then restores in the ADR-010 order"
         );
 
         // A TUI exits in alt → the leave-alt path runs, the hand-back is skipped:
@@ -1986,6 +2318,64 @@ mod tests {
         );
     }
 
+    /// Teardown undoes the keyboard modes the child asked the outer terminal for
+    /// (ADR-021), in the ADR-010 slot: after the screen is back to the primary
+    /// buffer, so the bytes land on the screen the shell inherits, and before the
+    /// mouse and raw mode come off. Without this the user's shell is left with kitty
+    /// reporting active and Escape starts producing `CSI 27 u`.
+    #[test]
+    fn child_exit_resets_the_relayed_keyboard_modes() {
+        let mut clock = VirtualClock::new(vec![
+            // A TUI that enters the alt screen, pushes a kitty level and turns
+            // modifyOtherKeys on, then exits with both still live.
+            (0u64, Msg::Pty(b"\x1b[?1049h\x1b[>1u\x1b[>4;2m".to_vec())),
+            (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ]);
+        let mut renderer = left_renderer(80, 24);
+        let mut term = MockTerminal::new();
+        term.enable_mouse().unwrap();
+        let mut pty: Vec<u8> = Vec::new();
+
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
+
+        assert_eq!(
+            term.restore_calls(),
+            vec![
+                // The child's own request, carried out to the terminal while it ran.
+                Call::Relay(b"\x1b[>1u\x1b[>4;2m".to_vec()),
+                Call::LeaveAltScreen,
+                Call::Relay(b"\x1b[<1u\x1b[>4;0m".to_vec()),
+                Call::DisableMouse,
+                Call::ShowCursor,
+                Call::DisableRawMode,
+            ],
+            "the mode reset slots between the alt-leave and the mouse disable"
+        );
+    }
+
+    /// The other half of ADR-010's rule: a child that never negotiated a keyboard
+    /// mode leaves the outer terminal's own keyboard settings alone. A terminal
+    /// whose user configured modifyOtherKeys themselves must survive gutter.
+    #[test]
+    fn child_exit_relays_nothing_when_no_mode_was_requested() {
+        let mut clock = VirtualClock::new(vec![
+            (0u64, Msg::Pty(b"plain output".to_vec())),
+            (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ]);
+        let mut renderer = left_renderer(80, 24);
+        let mut term = MockTerminal::new();
+        term.enable_mouse().unwrap();
+        let mut pty: Vec<u8> = Vec::new();
+
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
+
+        assert!(
+            !term.calls.iter().any(|c| matches!(c, Call::Relay(_))),
+            "no mode requested, no mode reset: {:?}",
+            term.calls
+        );
+    }
+
     /// The teardown-race regression guard (ADR-013). The waiter's `ChildExited` lands
     /// first, with the child's final `?1049h` queued behind it and the forwarder's
     /// `PtyEof` behind that. The shutdown drain must process the queued alt-screen bytes
@@ -1994,7 +2384,6 @@ mod tests {
     /// and emitted no `LeaveAltScreen`.
     #[test]
     fn child_exit_before_final_alt_frame_still_leaves_alt() {
-        use crate::terminal::OuterTerminal;
         let mut clock = VirtualClock::new(vec![
             // The waiter's ChildExited lands first; the alt-screen bytes the child
             // wrote just before exiting are still queued behind it, then PtyEof.
@@ -2002,10 +2391,8 @@ mod tests {
             (0, Msg::Pty(b"\x1b[?1049h".to_vec())),
             (0, Msg::PtyEof),
         ]);
-        let mut renderer = left_renderer(80, 24, true);
-        let mut term = MockTerminal::kitty_capable();
-        assert!(term.supports_keyboard_enhancement().unwrap());
-        term.push_keyboard_flags().unwrap();
+        let mut renderer = left_renderer(80, 24);
+        let mut term = MockTerminal::new();
         term.enable_mouse().unwrap();
         let mut pty: Vec<u8> = Vec::new();
 
@@ -2031,16 +2418,14 @@ mod tests {
     /// still completes and returns the exit code.
     #[test]
     fn shutdown_drain_caps_at_grace_when_no_eof() {
-        use crate::terminal::OuterTerminal;
         let grace_ms = TEARDOWN_DRAIN_GRACE.as_millis() as u64;
         let mut clock = VirtualClock::new(vec![
             (0u64, Msg::ChildExited(ExitStatus::with_exit_code(0))),
             // A straggler arriving well past the grace window: never reached.
             (grace_ms + 500, Msg::Pty(b"\x1b[?1049h".to_vec())),
         ]);
-        let mut renderer = left_renderer(80, 24, true);
-        let mut term = MockTerminal::kitty_capable();
-        term.push_keyboard_flags().unwrap();
+        let mut renderer = left_renderer(80, 24);
+        let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
 
         let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
@@ -2062,15 +2447,13 @@ mod tests {
     /// screen the (already processed) `?1049h` put us in.
     #[test]
     fn pty_eof_before_child_exit_short_circuits_drain() {
-        use crate::terminal::OuterTerminal;
         let mut clock = VirtualClock::new(vec![
             (0u64, Msg::Pty(b"\x1b[?1049h".to_vec())),
             (1, Msg::PtyEof),
             (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ]);
-        let mut renderer = left_renderer(80, 24, true);
-        let mut term = MockTerminal::kitty_capable();
-        term.push_keyboard_flags().unwrap();
+        let mut renderer = left_renderer(80, 24);
+        let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
 
         let code = run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
@@ -2093,7 +2476,7 @@ mod tests {
     fn run_teardown_replays_dim_status_on_primary_only_on_nonzero() {
         // Non-zero on a primary (never-alt) renderer that painted inline: the dim
         // line is handed back, with no alt-leave, before the remaining restore steps.
-        let mut renderer = left_renderer(80, 24, false); // outer_alt_active == false
+        let mut renderer = left_renderer(80, 24); // outer_alt_active == false
         renderer.ever_painted_inline = true; // it printed inline content this run
         let mut term = MockTerminal::new();
         run_teardown(&renderer, &mut term, 1).unwrap();
@@ -2133,7 +2516,7 @@ mod tests {
         );
 
         // Zero exit: no status-line write_row at all — just a Newline below the band.
-        let mut renderer0 = left_renderer(80, 24, false);
+        let mut renderer0 = left_renderer(80, 24);
         renderer0.ever_painted_inline = true;
         let mut term0 = MockTerminal::new();
         run_teardown(&renderer0, &mut term0, 0).unwrap();
@@ -2347,7 +2730,7 @@ mod tests {
             (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ];
         let mut clock = VirtualClock::new(script);
-        let mut renderer = left_renderer(20, 5, false);
+        let mut renderer = left_renderer(20, 5);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
@@ -2377,21 +2760,21 @@ mod tests {
     /// clear starts at 0. Pins the `offset` computation inside `repaint_margins`.
     #[test]
     fn resize_clears_band_row_span_preserving_history() {
-        use crossterm::event::Event;
-
         // --- Primary (plain) stream resized: clear starts at base_row (5), not 0. ---
         let script = vec![
             (0u64, Msg::Pty(b"primary content".to_vec())),
             // A resize arrives mid-run, BEFORE the child exits.
-            (20, Msg::Input(Event::Resize(100, 30))),
+            (20, Msg::Resize),
             (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ];
         let mut clock = VirtualClock::new(script);
-        let mut renderer = left_renderer(20, 24, false);
+        let mut renderer = left_renderer(20, 24);
         // The scripted content sits on grid row 0, so make-room never scrolls and
         // base_row stays 5 through the resize (5 < 29, the height clamp is a no-op).
         renderer.base_row = 5;
         let mut term = MockTerminal::new();
+        // The render thread reads the new size itself when SIGWINCH lands.
+        term.set_terminal_size(100, 30);
         let mut pty: Vec<u8> = Vec::new();
         run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
@@ -2409,12 +2792,13 @@ mod tests {
         // --- Alt stream resized: the clear still fires, spanning from row 0. ---
         let script = vec![
             (0u64, Msg::Pty(b"\x1b[?1049h\x1b[1;1Htui".to_vec())),
-            (20, Msg::Input(Event::Resize(100, 30))),
+            (20, Msg::Resize),
             (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ];
         let mut clock = VirtualClock::new(script);
-        let mut renderer = left_renderer(20, 24, false);
+        let mut renderer = left_renderer(20, 24);
         let mut term = MockTerminal::new();
+        term.set_terminal_size(100, 30);
         let mut pty: Vec<u8> = Vec::new();
         run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
 
@@ -2430,71 +2814,38 @@ mod tests {
         );
     }
 
-    /// Through the render loop's dispatch arm: once the child has enabled kitty on its
-    /// output (`CSI > 1 u` arrives as a `Msg::Pty`), a subsequent Enter and Shift+Enter
-    /// re-encode at the negotiated level and reach the PTY writer as the distinct kitty
-    /// `CSI 13 u` / `CSI 13 ; 2 u` sequences, with a kitty-capable outer.
+    /// Passthrough fidelity through the render loop's dispatch arm: whatever byte
+    /// forms the outer terminal sends reach the child unchanged. The two Enters are
+    /// the reported case — under a keyboard mode that distinguishes them the child
+    /// gets distinct bytes, because gutter forwards rather than re-encodes.
     #[test]
-    fn dispatch_reencodes_at_child_kitty_level() {
-        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-
+    fn dispatch_forwards_input_bytes_verbatim() {
         let script = vec![
-            // Child enables kitty on its output.
-            (0u64, Msg::Pty(b"\x1b[>1u".to_vec())),
-            // Then the user presses Enter, then Shift+Enter.
-            (
-                1,
-                Msg::Input(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))),
-            ),
-            (
-                1,
-                Msg::Input(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))),
-            ),
+            // The two modifyOtherKeys Enter forms, then a battery of navigation
+            // and function keys.
+            (0u64, Msg::Input(b"\r".to_vec())),
+            (1, Msg::Input(b"\x1b[13;2u".to_vec())),
+            (1, Msg::Input(b"\x1b[3~\x1b[H\x1b[5~\x1bOP\x1b[24~".to_vec())),
+            (1, Msg::Input(b"\x1b[1;5C".to_vec())),
             (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ];
-        let mut clock = VirtualClock::new(script);
-        // Kitty-capable outer: the child's enable is honoured (not clamped).
-        let mut renderer = left_renderer(80, 24, true);
-        let mut term = MockTerminal::kitty_capable();
-        let mut pty: Vec<u8> = Vec::new();
-        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
-
+        let (_flushes, _term, pty, ..) = run_with(script, 80, 24);
         assert_eq!(
-            pty, b"\x1b[13u\x1b[13;2u",
-            "Enter → CSI 13 u, Shift+Enter → CSI 13 ; 2 u, distinct"
+            pty,
+            b"\r\x1b[13;2u\x1b[3~\x1b[H\x1b[5~\x1bOP\x1b[24~\x1b[1;5C",
+            "every byte reaches the child, in order, unchanged"
         );
     }
 
-    /// With the outer terminal unable to source kitty (`outer_supports_kitty = false`),
-    /// the child's `CSI > 1 u` enable is clamped to a no-op, so Enter and Shift+Enter both
-    /// degrade to the same legacy byte (`\r`).
+    /// Alt+<char> reaches the child with its ESC prefix intact.
     #[test]
-    fn dispatch_clamps_to_legacy_when_outer_unsupported() {
-        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-
+    fn dispatch_forwards_alt_char_with_its_esc_prefix() {
         let script = vec![
-            (0u64, Msg::Pty(b"\x1b[>1u".to_vec())),
-            (
-                1,
-                Msg::Input(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))),
-            ),
-            (
-                1,
-                Msg::Input(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))),
-            ),
+            (0u64, Msg::Input(b"\x1br".to_vec())),
             (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ];
-        let mut clock = VirtualClock::new(script);
-        // Non-kitty outer: the child's enable is neutralised.
-        let mut renderer = left_renderer(80, 24, false);
-        let mut term = MockTerminal::new();
-        let mut pty: Vec<u8> = Vec::new();
-        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
-
-        assert_eq!(
-            pty, b"\r\r",
-            "both Enters degrade to the same legacy byte under the clamp"
-        );
+        let (_flushes, _term, pty, ..) = run_with(script, 80, 24);
+        assert_eq!(pty, b"\x1br");
     }
 
     /// Device queries through the render-loop dispatch arm: a `Msg::Pty` carrying the
@@ -2521,24 +2872,62 @@ mod tests {
         assert_eq!(pty, b"\x1b[?1;2c", "CSI c → DA1 reply");
     }
 
+    /// The relay through the same dispatch arm (ADR-021): the child's mode request
+    /// goes **outward** to the terminal, and nothing goes back to the child. The two
+    /// directions share the arm, so a wiring mistake would cross them — a mode
+    /// request echoed onto the PTY would arrive at the child as keystrokes.
+    #[test]
+    fn dispatch_relays_mode_requests_outward_and_answers_nothing() {
+        let script = vec![
+            (0u64, Msg::Pty(b"\x1b[>1u".to_vec())),
+            (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ];
+        let (_flushes, term, pty, ..) = run_with(script, 40, 24);
+
+        assert!(
+            term.calls.contains(&Call::Relay(b"\x1b[>1u".to_vec())),
+            "the child's kitty push reaches the outer terminal; calls were {:?}",
+            term.calls
+        );
+        assert!(
+            pty.is_empty(),
+            "a mode request is a question for the terminal, not the child: {pty:?}"
+        );
+    }
+
     // --- Mouse forwarding through the render-loop dispatch arm (ADR-005) ---
     //
     // These exercise the full Thread-2 wiring: a `Msg::Pty` carrying the child's DECSET
     // negotiation, the per-cycle poll that refreshes the gate from the live screen, then
-    // a `Msg::Input(Event::Mouse)` the gate translates and re-encodes onto the PTY writer.
-    // They assert on the child-received bytes, never the grid — proven without a PTY.
+    // the raw SGR bytes gutter's own scanner extracts, translates and re-encodes onto
+    // the PTY writer. They assert on the child-received bytes, never the grid.
 
-    use crossterm::event::{
-        Event as CtEvent, MouseButton, MouseEvent, MouseEventKind,
-    };
+    /// The SGR wire bits, so the scripts read as the reports a terminal sends.
+    const MOTION: u16 = 32;
+    const NO_BUTTON: u16 = 3;
 
-    fn mouse_ev(kind: MouseEventKind, column: u16, row: u16) -> Msg {
-        Msg::Input(CtEvent::Mouse(MouseEvent {
-            kind,
-            column,
-            row,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        }))
+    /// One SGR-1006 report on the wire, in 1-based physical coordinates.
+    fn mouse_ev(button: u16, column: u16, row: u16, release: bool) -> Msg {
+        let final_byte = if release { 'm' } else { 'M' };
+        Msg::Input(
+            format!("\x1b[<{button};{};{}{final_byte}", column + 1, row + 1).into_bytes(),
+        )
+    }
+
+    fn mouse_down(column: u16, row: u16) -> Msg {
+        mouse_ev(0, column, row, false)
+    }
+
+    fn mouse_up(column: u16, row: u16) -> Msg {
+        mouse_ev(0, column, row, true)
+    }
+
+    fn mouse_drag(column: u16, row: u16) -> Msg {
+        mouse_ev(MOTION, column, row, false)
+    }
+
+    fn mouse_moved(column: u16, row: u16) -> Msg {
+        mouse_ev(NO_BUTTON | MOTION, column, row, false)
     }
 
     /// Run a mouse script against a renderer pinned at `left_margin`, returning the
@@ -2571,7 +2960,7 @@ mod tests {
                 // The very first click after negotiation.
                 (
                     1,
-                    mouse_ev(MouseEventKind::Down(MouseButton::Left), margin + 5, 3),
+                    mouse_down(margin + 5, 3),
                 ),
             ],
         );
@@ -2593,11 +2982,11 @@ mod tests {
             vec![
                 (0u64, Msg::Pty(b"\x1b[?1000h\x1b[?1006h".to_vec())),
                 // Left gutter (col 5 < margin 30).
-                (1, mouse_ev(MouseEventKind::Down(MouseButton::Left), 5, 0)),
+                (1, mouse_down(5, 0)),
                 // Right gutter (col margin+w = 70, >= band end).
                 (
                     1,
-                    mouse_ev(MouseEventKind::Down(MouseButton::Left), margin + w, 0),
+                    mouse_down(margin + w, 0),
                 ),
             ],
         );
@@ -2616,16 +3005,16 @@ mod tests {
                 (0u64, Msg::Pty(b"\x1b[?1000h\x1b[?1006h".to_vec())),
                 (
                     1,
-                    mouse_ev(MouseEventKind::Down(MouseButton::Left), margin + 1, 0),
+                    mouse_down(margin + 1, 0),
                 ),
                 // Motion mid-drag — must be dropped in PressRelease.
                 (
                     1,
-                    mouse_ev(MouseEventKind::Drag(MouseButton::Left), margin + 2, 0),
+                    mouse_drag(margin + 2, 0),
                 ),
                 (
                     1,
-                    mouse_ev(MouseEventKind::Up(MouseButton::Left), margin + 2, 0),
+                    mouse_up(margin + 2, 0),
                 ),
             ],
         );
@@ -2649,24 +3038,24 @@ mod tests {
             vec![
                 (0u64, Msg::Pty(b"\x1b[?1002h\x1b[?1006h".to_vec())),
                 // Motion before any press → no button held → dropped.
-                (1, mouse_ev(MouseEventKind::Moved, margin + 1, 0)),
+                (1, mouse_moved(margin + 1, 0)),
                 // Press → held.
                 (
                     1,
-                    mouse_ev(MouseEventKind::Down(MouseButton::Left), margin + 1, 0),
+                    mouse_down(margin + 1, 0),
                 ),
                 // Drag (motion with button) → delivered.
                 (
                     1,
-                    mouse_ev(MouseEventKind::Drag(MouseButton::Left), margin + 2, 0),
+                    mouse_drag(margin + 2, 0),
                 ),
                 // Release → not held.
                 (
                     1,
-                    mouse_ev(MouseEventKind::Up(MouseButton::Left), margin + 2, 0),
+                    mouse_up(margin + 2, 0),
                 ),
                 // Motion after release → dropped.
-                (1, mouse_ev(MouseEventKind::Moved, margin + 3, 0)),
+                (1, mouse_moved(margin + 3, 0)),
             ],
         );
         // Delivered: press (col1→2, button 0, M), drag (col2→3, button 0|32=32, M),
@@ -2689,7 +3078,7 @@ mod tests {
             40,
             vec![
                 (0u64, Msg::Pty(b"\x1b[?1000h".to_vec())),
-                (1, mouse_ev(MouseEventKind::Down(MouseButton::Left), 15, 0)),
+                (1, mouse_down(15, 0)),
             ],
         );
     }
@@ -2703,7 +3092,7 @@ mod tests {
         let pty = run_mouse(
             10,
             40,
-            vec![(1, mouse_ev(MouseEventKind::Down(MouseButton::Left), 15, 0))],
+            vec![(1, mouse_down(15, 0))],
         );
         assert!(
             pty.is_empty(),
@@ -2937,7 +3326,7 @@ line two\r\n\
             (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
         ];
         let mut clock = VirtualClock::new(script);
-        let mut renderer = left_renderer(width, 5, false);
+        let mut renderer = left_renderer(width, 5);
         let mut term = MockTerminal::new();
         let mut pty: Vec<u8> = Vec::new();
         run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
@@ -3010,91 +3399,360 @@ line two\r\n\
         );
     }
 
-    /// Modal resize-mode state machine. `VirtualClock`, `MockTerminal`,
-    /// `mode_renderer` and `run_with_resizer` are nested here (rather than a
-    /// top-level sibling module) so the suite can reuse `VirtualClock`/`MockTerminal`,
-    /// which are private to this `mod tests` — a sibling module cannot see them.
-    /// `RecResizer` is a local copy of the one in the (sibling) `mod resize`, which
-    /// is likewise private to that module.
+    /// Absorbed-mode mirroring (ADR-022) through the real frame. `render_once` takes
+    /// an injected terminal, so every one of these is a parser feed, a frame, and a
+    /// read of what the outer terminal saw — no PTY, no threads, no clock.
+    mod mode_mirror {
+        use super::*;
+        use crate::terminal::mock::RecordingGrid;
+
+        /// Feed the child's bytes, run one frame, and return the bytes the frame
+        /// relayed to the outer terminal.
+        fn frame(renderer: &mut Renderer, term: &mut MockTerminal, child: &[u8]) -> Vec<u8> {
+            renderer.parser.process(child);
+            let before = term.calls.len();
+            render_once(renderer, term).unwrap();
+            term.calls[before..]
+                .iter()
+                .filter_map(|c| match c {
+                    Call::Relay(b) => Some(b.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        }
+
+        /// Each mode reaches the outer terminal once on the edge that set it, once on
+        /// the edge that cleared it, and never on a repeat of either.
+        #[test]
+        fn each_edge_emits_once_and_a_repeat_emits_nothing() {
+            for (set, on, clear, off) in [
+                (&b"\x1b[?1h"[..], &b"\x1b[?1h"[..], &b"\x1b[?1l"[..], &b"\x1b[?1l"[..]),
+                (b"\x1b=", b"\x1b=", b"\x1b>", b"\x1b>"),
+                (b"\x1b[?2004h", b"\x1b[?2004h", b"\x1b[?2004l", b"\x1b[?2004l"),
+            ] {
+                let mut renderer = left_renderer(20, 5);
+                let mut term = MockTerminal::new();
+
+                assert_eq!(frame(&mut renderer, &mut term, set), on);
+                assert!(frame(&mut renderer, &mut term, set).is_empty());
+                assert_eq!(frame(&mut renderer, &mut term, clear), off);
+                assert!(frame(&mut renderer, &mut term, clear).is_empty());
+            }
+        }
+
+        /// All three in one frame, in one relay call, in the pinned order.
+        #[test]
+        fn all_three_land_in_one_frame() {
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            assert_eq!(
+                frame(&mut renderer, &mut term, b"\x1b[?2004h\x1b=\x1b[?1h"),
+                b"\x1b[?1h\x1b=\x1b[?2004h"
+            );
+        }
+
+        /// `ESC c` resets vt100's screen wholesale, so the next frame's poll finds all
+        /// three off with no RIS handling anywhere in gutter.
+        #[test]
+        fn ris_turns_all_three_off_on_the_next_frame() {
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            frame(&mut renderer, &mut term, b"\x1b[?1h\x1b=\x1b[?2004h");
+            assert_eq!(
+                frame(&mut renderer, &mut term, b"\x1bc"),
+                b"\x1b[?1l\x1b>\x1b[?2004l"
+            );
+        }
+
+        /// **The one that stops someone reaching for `input_mode_diff`.** A mouse mode
+        /// on the outer terminal would be a second authority over state ADR-005 owns,
+        /// and a child that disabled reporting would turn gutter's own capture off
+        /// underneath it.
+        #[test]
+        fn no_mouse_mode_ever_reaches_the_outer_terminal() {
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            assert!(frame(
+                &mut renderer,
+                &mut term,
+                b"\x1b[?9h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1005h"
+            )
+            .is_empty());
+        }
+
+        /// There is no relay path for private modes at all, so the assertion takes the
+        /// strongest available form: no DECSET is ever forwarded, whether vt100
+        /// implements it or drops it through `unhandled_csi`.
+        #[test]
+        fn no_decset_is_relayed() {
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            assert!(frame(
+                &mut renderer,
+                &mut term,
+                b"\x1b[?1047h\x1b[?1048h\x1b[?2048h\x1b[?1004h\x1b[?66h\x1b[?7727h\x1b[?2026h"
+            )
+            .is_empty());
+        }
+
+        /// The alt screen keeps its own mirror (ADR-012) and gains nothing from this one.
+        #[test]
+        fn alt_screen_stays_on_its_own_mirror() {
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            assert!(frame(&mut renderer, &mut term, b"\x1b[?1049h").is_empty());
+            assert!(
+                term.calls.contains(&Call::EnterAltScreen),
+                "the alt screen still mirrors: {:?}",
+                term.calls
+            );
+        }
+
+        /// The mirror must not be diffed against the `prev` parser. `sync_prev` replays
+        /// `contents_formatted`, which excludes the input modes, so `prev`'s flags sit
+        /// at their defaults for ever — a diff against it would re-emit every frame,
+        /// which is exactly what an idle frame here proves it does not.
+        #[test]
+        fn the_diff_baseline_is_not_prev() {
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            frame(&mut renderer, &mut term, b"\x1b[?1h\x1b=\x1b[?2004h");
+            // `render_once` ends in `sync_prev`, so `prev` is already the trap's state.
+            assert!(!renderer.prev.screen().application_cursor());
+            for _ in 0..3 {
+                assert!(frame(&mut renderer, &mut term, b"").is_empty());
+            }
+        }
+
+        /// What the outer terminal ends up in, rather than what gutter spelled: the
+        /// recording grid parses the relayed bytes the way a real terminal would.
+        #[test]
+        fn the_outer_terminal_ends_up_in_the_childs_modes() {
+            let mut renderer = Renderer::at_margin(20, 5, 0);
+            let mut grid = RecordingGrid::new(20, 5);
+            renderer.parser.process(b"\x1b[?1h\x1b=\x1b[?2004h");
+            render_once(&mut renderer, &mut grid).unwrap();
+            assert_eq!(grid.outer_input_modes(), (true, true, true));
+
+            renderer.parser.process(b"\x1b[?1l\x1b>\x1b[?2004l");
+            render_once(&mut renderer, &mut grid).unwrap();
+            assert_eq!(grid.outer_input_modes(), (false, false, false));
+        }
+
+        /// Teardown hands the terminal back at its defaults, in ADR-010's slot: after
+        /// the alt-leave and immediately before the keyboard-mode reset, so every
+        /// input-encoding restore sits together with the coarsest last.
+        #[test]
+        fn child_exit_resets_the_mirrored_modes_before_the_relay_reset() {
+            let mut clock = VirtualClock::new(vec![
+                (0u64, Msg::Pty(b"\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[>1u".to_vec())),
+                (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+            ]);
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            term.enable_mouse().unwrap();
+            let mut pty: Vec<u8> = Vec::new();
+
+            run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
+
+            assert_eq!(
+                term.restore_calls(),
+                vec![
+                    Call::Relay(b"\x1b[>1u".to_vec()),
+                    Call::Relay(b"\x1b[?1h\x1b[?2004h".to_vec()),
+                    Call::LeaveAltScreen,
+                    Call::Relay(b"\x1b[?1l\x1b[?2004l".to_vec()),
+                    Call::Relay(b"\x1b[<1u".to_vec()),
+                    Call::DisableMouse,
+                    Call::ShowCursor,
+                    Call::DisableRawMode,
+                ],
+                "the mode reset sits between the alt-leave and the keyboard-mode reset"
+            );
+        }
+
+        /// The other half of ADR-010's rule: a mode gutter never mirrored on is a mode
+        /// gutter never turns off. A shell that had its own paste protection running
+        /// keeps it.
+        #[test]
+        fn child_exit_resets_nothing_that_was_never_mirrored() {
+            let mut clock = VirtualClock::new(vec![
+                (0u64, Msg::Pty(b"plain output".to_vec())),
+                (1, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+            ]);
+            let mut renderer = left_renderer(20, 5);
+            let mut term = MockTerminal::new();
+            term.enable_mouse().unwrap();
+            let mut pty: Vec<u8> = Vec::new();
+
+            run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
+
+            assert!(
+                !term.calls.iter().any(|c| matches!(c, Call::Relay(_))),
+                "nothing mirrored, nothing reset: {:?}",
+                term.calls
+            );
+        }
+    }
+
+    /// The ESC-hold (ADR-020), on virtual time. The hold is loop-owned, so these
+    /// drive `apply_message` and `flush_hold` directly with a `VirtualClock`: no
+    /// wall-clock sleeps, no threads, no PTY.
+    mod esc_hold {
+        use super::*;
+
+        const HOLD_MS: u64 = 25;
+
+        /// The band geometry these tests use: margin 0, so nothing here depends on
+        /// where the band sits.
+        fn ctx() -> Ctx {
+            Ctx::new(80, 24, 80, Width::Cols(80))
+        }
+
+        #[test]
+        fn lone_esc_waits_then_flushes() {
+            let mut ctx = ctx();
+            ctx.send(b"\x1b");
+            assert!(ctx.pty.is_empty(), "the Escape is withheld");
+            assert_eq!(ctx.input.hold_deadline, Some(HOLD_MS), "armed at now + 25ms");
+
+            ctx.advance(HOLD_MS - 1);
+            assert!(ctx.pty.is_empty(), "still withheld one millisecond short");
+
+            ctx.advance(1);
+            assert_eq!(ctx.pty, b"\x1b", "exactly the Escape, once the deadline passes");
+            assert_eq!(ctx.input.hold_deadline, None);
+        }
+
+        #[test]
+        fn esc_completed_within_hold_cancels_it() {
+            let mut ctx = ctx();
+            ctx.send(b"\x1b");
+            ctx.clock.now_ms += 5;
+            ctx.send(b"[A");
+            assert_eq!(ctx.pty, b"\x1b[A", "the arrow goes out whole");
+            assert_eq!(ctx.input.hold_deadline, None, "the deadline is disarmed");
+
+            ctx.advance(HOLD_MS * 2);
+            assert_eq!(ctx.pty, b"\x1b[A", "the expired deadline emits nothing more");
+        }
+
+        #[test]
+        fn plain_bytes_are_never_delayed() {
+            let mut ctx = ctx();
+            ctx.send(b"abc");
+            assert_eq!(ctx.pty, b"abc");
+            assert_eq!(
+                ctx.input.hold_deadline, None,
+                "no deadline means Phase A keeps its single blocking park"
+            );
+        }
+
+        #[test]
+        fn complete_sequence_in_one_chunk_never_arms_the_hold() {
+            let mut ctx = ctx();
+            ctx.send(b"\x1b[15~");
+            assert_eq!(ctx.pty, b"\x1b[15~");
+            assert_eq!(ctx.input.hold_deadline, None);
+        }
+
+        #[test]
+        fn partial_sequence_flushed_whole_on_timeout() {
+            let mut ctx = ctx();
+            ctx.send(b"\x1b[");
+            ctx.advance(HOLD_MS);
+            assert_eq!(
+                ctx.pty, b"\x1b[",
+                "both bytes go out together, in order, not split into Escape then '['"
+            );
+        }
+
+        #[test]
+        fn late_tail_is_forwarded_in_order() {
+            let mut ctx = ctx();
+            ctx.send(b"\x1b[");
+            ctx.advance(HOLD_MS);
+            ctx.send(b"3~");
+            assert_eq!(
+                ctx.pty, b"\x1b[3~",
+                "the child's own parser reassembles across the two writes"
+            );
+        }
+
+        #[test]
+        fn nothing_overtakes_the_hold_buffer() {
+            let mut ctx = ctx();
+            ctx.send(b"\x1b");
+            ctx.advance(HOLD_MS);
+            ctx.send(b"a");
+            assert_eq!(
+                ctx.pty, b"\x1ba",
+                "reordering would turn a flushed Escape and an 'a' into Alt+a"
+            );
+        }
+
+        #[test]
+        fn double_esc_holds_only_the_second() {
+            let mut ctx = ctx();
+            ctx.send(b"\x1b\x1b");
+            assert_eq!(ctx.pty, b"\x1b", "the first Escape is resolved by the second");
+            assert!(ctx.input.hold_deadline.is_some());
+            ctx.advance(HOLD_MS);
+            assert_eq!(ctx.pty, b"\x1b\x1b");
+        }
+
+        #[test]
+        fn a_chunk_extending_a_sequence_restarts_the_clock() {
+            let mut ctx = ctx();
+            ctx.send(b"\x1b");
+            assert_eq!(ctx.input.hold_deadline, Some(HOLD_MS));
+            ctx.clock.now_ms += 20;
+            ctx.send(b"[");
+            assert_eq!(
+                ctx.input.hold_deadline,
+                Some(20 + HOLD_MS),
+                "more bytes are evidence more are coming"
+            );
+        }
+
+        #[test]
+        fn mouse_report_is_extracted_not_forwarded() {
+            let mut ctx = ctx();
+            // The child negotiates SGR mouse so the gate forwards rather than swallows.
+            ctx.renderer.parser.process(b"\x1b[?1000h\x1b[?1006h");
+            for byte in b"\x1b[<0;10;5M" {
+                ctx.send(&[*byte]);
+            }
+            assert_eq!(
+                ctx.pty, b"\x1b[<0;10;5M",
+                "the report is re-encoded by the gate at margin 0, not forwarded raw"
+            );
+            assert_eq!(ctx.input.hold_deadline, None);
+        }
+
+        /// The ugly case, asserted honestly rather than wished away: a mouse report
+        /// split by a slow link past the hold leaks its prefix as literal text
+        /// carrying raw physical coordinates. The mitigation is a longer hold, not
+        /// a cleverer scanner.
+        #[test]
+        fn split_mouse_report_flushes_as_literal_text() {
+            let mut ctx = ctx();
+            ctx.renderer.parser.process(b"\x1b[?1000h\x1b[?1006h");
+            ctx.send(b"\x1b[<0;42");
+            ctx.advance(HOLD_MS);
+            assert_eq!(ctx.pty, b"\x1b[<0;42", "the fragment leaks verbatim");
+            ctx.send(b";5M");
+            assert_eq!(ctx.pty, b"\x1b[<0;42;5M", "and so does its tail");
+        }
+    }
+
+    /// Modal resize-mode state machine, driven through the shared [`Ctx`].
+    /// `run_with_resizer` is nested here (rather than a top-level sibling module) so
+    /// it can reach `VirtualClock`/`MockTerminal`, which are private to this
+    /// `mod tests` — a sibling module cannot see them.
     mod resize_mode {
         use super::*;
-        use crossterm::event::{KeyCode, KeyEventKind, KeyEventState, KeyModifiers};
-        use std::cell::RefCell;
-
-        /// A recording [`PtyResizer`], local to this module (the sibling `mod
-        /// resize`'s copy is private to it).
-        #[derive(Default)]
-        struct RecResizer {
-            calls: RefCell<Vec<(u16, u16)>>,
-        }
-        impl PtyResizer for RecResizer {
-            fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
-                self.calls.borrow_mut().push((cols, rows));
-                Ok(())
-            }
-        }
-
-        fn mode_renderer(width: u16, rows: u16, real_cols: u16, cfg: Width) -> Renderer {
-            Renderer::new(
-                width,
-                rows,
-                real_cols,
-                Layout::Center,
-                cfg,
-                false,
-                Box::new(std::io::sink()),
-                0,
-            )
-        }
-
-        fn press(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
-            KeyEvent { code, modifiers: mods, kind: KeyEventKind::Press, state: KeyEventState::NONE }
-        }
-
-        fn release_key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
-            KeyEvent { code, modifiers: mods, kind: KeyEventKind::Release, state: KeyEventState::NONE }
-        }
-
-        /// Bundles the state `apply_message` needs so tests read as a script of
-        /// `send`/`enter` calls rather than repeating six `&mut` arguments.
-        struct Ctx {
-            clock: VirtualClock,
-            renderer: Renderer,
-            resize: ResizeCtl<u64>,
-            term: MockTerminal,
-            pty: Vec<u8>,
-            resizer: RecResizer,
-        }
-
-        impl Ctx {
-            fn new(width: u16, rows: u16, real_cols: u16, cfg: Width) -> Self {
-                Self {
-                    clock: VirtualClock::new(vec![]),
-                    renderer: mode_renderer(width, rows, real_cols, cfg),
-                    resize: ResizeCtl::inactive(),
-                    term: MockTerminal::new(),
-                    pty: Vec::new(),
-                    resizer: RecResizer::default(),
-                }
-            }
-
-            fn send(&mut self, ev: KeyEvent) -> Flow {
-                apply_message(
-                    Msg::Input(Event::Key(ev)),
-                    &mut self.clock,
-                    &mut self.renderer,
-                    &mut self.resize,
-                    &mut self.term,
-                    &mut self.pty,
-                    &self.resizer,
-                )
-            }
-
-            fn enter(&mut self) {
-                let c = KeyChord::default();
-                self.send(press(c.code, c.mods));
-            }
-        }
 
         /// Drive the real loop (needed only by the idle tests, which exercise
         /// `run`'s Phase-A bounded wait and top-of-frame idle check — behaviour
@@ -3128,7 +3786,7 @@ line two\r\n\
         fn enter_then_l_grows_one_column() {
             let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
             ctx.enter();
-            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            ctx.send(b"l");
 
             assert_eq!(ctx.renderer.width, 81);
             assert_eq!(ctx.renderer.width_config, Width::Cols(81));
@@ -3140,9 +3798,9 @@ line two\r\n\
         fn h_l_jump_ten() {
             let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
             ctx.enter();
-            ctx.send(press(KeyCode::Char('L'), KeyModifiers::SHIFT));
+            ctx.send(b"L");
             assert_eq!(ctx.renderer.width, 90, "L jumps by ten");
-            ctx.send(press(KeyCode::Char('H'), KeyModifiers::SHIFT));
+            ctx.send(b"H");
             assert_eq!(ctx.renderer.width, 80, "H jumps back by ten");
         }
 
@@ -3150,7 +3808,7 @@ line two\r\n\
         fn percent_unit_preserved() {
             let mut ctx = Ctx::new(100, 24, 200, Width::Percent(50));
             ctx.enter();
-            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            ctx.send(b"l");
             assert_eq!(ctx.renderer.width_config, Width::Percent(51), "unit stays percentage");
             assert_eq!(ctx.renderer.width, 102, "51% of 200 = 102");
         }
@@ -3159,7 +3817,7 @@ line two\r\n\
         fn shrink_clamps_at_min_w_silently() {
             let mut ctx = Ctx::new(20, 24, 200, Width::Cols(20));
             ctx.enter();
-            ctx.send(press(KeyCode::Char('h'), KeyModifiers::NONE));
+            ctx.send(b"h");
             assert_eq!(ctx.renderer.width, 20, "MIN_W floor holds");
             assert!(
                 ctx.resizer.calls.borrow().is_empty(),
@@ -3171,7 +3829,7 @@ line two\r\n\
         fn grow_clamps_at_real_cols_silently() {
             let mut ctx = Ctx::new(200, 24, 200, Width::Cols(200));
             ctx.enter();
-            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            ctx.send(b"l");
             assert_eq!(ctx.renderer.width, 200, "real_cols ceiling holds");
             assert!(ctx.resizer.calls.borrow().is_empty());
         }
@@ -3180,9 +3838,13 @@ line two\r\n\
         fn esc_exits_then_keys_pass_through() {
             let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
             ctx.enter();
-            ctx.send(press(KeyCode::Esc, KeyModifiers::NONE));
-            assert!(!ctx.resize.active(), "Esc exits the mode");
-            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            // A bare Escape is ambiguous until the hold expires — it could still be
+            // the start of a mouse report.
+            ctx.send(b"\x1b");
+            assert!(ctx.resize.active(), "the mode holds while the Escape is ambiguous");
+            ctx.expire_hold();
+            assert!(!ctx.resize.active(), "Esc exits the mode once the hold resolves it");
+            ctx.send(b"l");
             assert_eq!(ctx.pty, b"l", "once exited, l reaches the child instead of stepping");
             assert_eq!(ctx.renderer.width, 80, "no step happened after exit");
         }
@@ -3199,22 +3861,63 @@ line two\r\n\
         fn swallow_stays_in_mode_no_pty() {
             let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
             ctx.enter();
-            ctx.send(press(KeyCode::Char('z'), KeyModifiers::NONE));
+            ctx.send(b"z");
             assert!(ctx.pty.is_empty(), "an unrecognised key must not leak to the child");
             assert!(ctx.resize.active(), "mode persists after a swallowed key");
-            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            ctx.send(b"l");
             assert_eq!(ctx.renderer.width, 81, "still in mode: l still steps");
         }
 
+        /// The chord's kitty release form must not read as a second chord press and
+        /// toggle straight back out. Only reachable once the child has pushed kitty's
+        /// `REPORT_EVENT_TYPES`, which the relay carries out for it (ADR-021).
         #[test]
         fn chord_release_does_not_toggle() {
             let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
             ctx.enter();
-            let c = KeyChord::default();
-            ctx.send(release_key(c.code, c.mods));
+            ctx.send(b"\x1b[92;5:3u");
             assert!(ctx.resize.active(), "the chord's own release must not exit the mode");
-            ctx.send(press(KeyCode::Char('l'), KeyModifiers::NONE));
+            ctx.send(b"l");
             assert_eq!(ctx.renderer.width, 81, "l still steps after the release");
+            assert!(ctx.pty.is_empty());
+        }
+
+        /// A chunk can carry the chord and step keys together: the classifier
+        /// re-reads the mode at every byte, so the mode flips mid-run and both
+        /// steps land.
+        #[test]
+        fn mid_chunk_mode_flip_applies_the_following_steps() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.send(b"\x1cll");
+            assert!(ctx.resize.active());
+            assert_eq!(ctx.renderer.width, 82, "both step keys in the chunk applied");
+            assert!(ctx.pty.is_empty(), "nothing in the chunk leaked to the child");
+        }
+
+        /// Out of mode every in-mode byte form is forwarded untouched.
+        #[test]
+        fn out_of_mode_the_in_mode_keys_pass_through() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.send(b"hlHL-+=");
+            ctx.send(b"\x1b[D");
+            ctx.send(b"\x1bOC");
+            assert_eq!(ctx.pty, b"hlHL-+=\x1b[D\x1bOC");
+            assert_eq!(ctx.renderer.width, 80, "no step happened");
+        }
+
+        /// Arrows step in both cursor-key modes; a modified arrow is swallowed
+        /// rather than treated as a coarse step.
+        #[test]
+        fn arrows_step_in_both_cursor_key_modes() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            ctx.send(b"\x1b[C");
+            assert_eq!(ctx.renderer.width, 81, "CSI Right grows one");
+            ctx.send(b"\x1bOD");
+            assert_eq!(ctx.renderer.width, 80, "SS3 Left shrinks one");
+            ctx.send(b"\x1b[1;2D");
+            assert_eq!(ctx.renderer.width, 80, "Shift+Left is swallowed, not a coarse step");
+            assert!(ctx.resize.active());
             assert!(ctx.pty.is_empty());
         }
 
@@ -3225,7 +3928,7 @@ line two\r\n\
             let mut ctx = Ctx::new(100, 6, 120, Width::Cols(100));
             ctx.renderer.outer_alt_active = true;
             ctx.enter();
-            ctx.send(press(KeyCode::Char('h'), KeyModifiers::NONE)); // shrink one step
+            ctx.send(b"h"); // shrink one step
 
             assert_eq!(ctx.renderer.width, 99);
             let expected_margin = geometry::margin(ctx.renderer.layout, 120, 99);
@@ -3238,12 +3941,11 @@ line two\r\n\
 
         #[test]
         fn idle_auto_exit_via_virtual_clock() {
-            let c = KeyChord::default();
             let script = vec![
-                (0, Msg::Input(Event::Key(press(c.code, c.mods)))), // enter at t0
+                (0, Msg::Input(CHORD.to_vec())), // enter at t0
                 // Well past the ~3s idle window: the bounded Phase-A wait times
                 // out at the deadline, exiting the mode, before this is delivered.
-                (5000, Msg::Input(Event::Key(press(KeyCode::Char('l'), KeyModifiers::NONE)))),
+                (5000, Msg::Input(b"l".to_vec())),
                 (0, Msg::ChildExited(ExitStatus::with_exit_code(0))),
             ];
             let (pty, renderer, code, resizer, _term) =
@@ -3257,14 +3959,13 @@ line two\r\n\
 
         #[test]
         fn idle_refreshes_on_step() {
-            let c = KeyChord::default();
             let script = vec![
-                (0, Msg::Input(Event::Key(press(c.code, c.mods)))), // enter at t0
+                (0, Msg::Input(CHORD.to_vec())), // enter at t0
                 // A step at t0+2000 re-arms the idle deadline to ~t0+5000, not
                 // ~t0+3000 — so this key, another 5s later, still finds the mode
                 // active until the RE-ARMED deadline.
-                (2000, Msg::Input(Event::Key(press(KeyCode::Char('l'), KeyModifiers::NONE)))),
-                (5000, Msg::Input(Event::Key(press(KeyCode::Char('l'), KeyModifiers::NONE)))),
+                (2000, Msg::Input(b"l".to_vec())),
+                (5000, Msg::Input(b"l".to_vec())),
                 (0, Msg::ChildExited(ExitStatus::with_exit_code(0))),
             ];
             let (pty, renderer, code, resizer, _term) =
@@ -3274,6 +3975,77 @@ line two\r\n\
             assert_eq!(renderer.width, 81, "the in-mode step before idle-exit applied");
             assert_eq!(*resizer.calls.borrow(), vec![(81, 24)], "exactly one resize, from the step");
             assert_eq!(pty, b"l", "the delayed key after idle-exit passes through to the child");
+        }
+
+        /// A paste span with the chord byte in it, once the child has asked for paste
+        /// guards. Every byte reaches the child and none of it is read as input
+        /// protocol: no resize mode, and a pasted mouse report arrives verbatim rather
+        /// than margin-translated (or dropped for being malformed).
+        fn paste_span() -> Vec<u8> {
+            b"\x1b[200~ab\x1cc\x1b[<0;10;5M\x1b[<99Md\x1b[201~".to_vec()
+        }
+
+        /// Put the mirror into paste mode the way production does — the child asks,
+        /// the frame mirrors.
+        fn mirror_paste_on(ctx: &mut Ctx) {
+            ctx.renderer.parser.process(b"\x1b[?2004h");
+            render_once(&mut ctx.renderer, &mut ctx.term).unwrap();
+            assert!(ctx.renderer.mode_mirror.bracketed_paste());
+        }
+
+        #[test]
+        fn pasted_bytes_reach_the_child_untouched_under_the_guards() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            mirror_paste_on(&mut ctx);
+            ctx.send(&paste_span());
+
+            assert_eq!(ctx.pty, paste_span(), "every pasted byte, verbatim");
+            assert!(!ctx.resize.active(), "a pasted 0x1C is text, not the chord");
+        }
+
+        /// The gate is a gate. Without the mirror the same span is ordinary input, so
+        /// the `0x1C` enters resize mode and the mouse report is extracted and
+        /// translated.
+        #[test]
+        fn the_same_span_is_scanned_normally_with_the_mirror_off() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.send(&paste_span());
+
+            assert!(ctx.resize.active(), "the bare 0x1C enters resize mode");
+            assert!(
+                !ctx.pty.windows(6).any(|w| w == b"\x1b[<0;1"),
+                "the mouse report was extracted, not forwarded: {:?}",
+                ctx.pty
+            );
+        }
+
+        /// A paste that arrives while the resize overlay is up. The mode swallows
+        /// keystrokes, but a paste is not keystrokes: it reaches the child whole,
+        /// guards and all, and leaves the mode where it found it.
+        #[test]
+        fn a_paste_arriving_in_resize_mode_still_reaches_the_child_whole() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            mirror_paste_on(&mut ctx);
+            ctx.enter();
+            ctx.send(&paste_span());
+
+            assert_eq!(ctx.pty, paste_span(), "every pasted byte, verbatim");
+            assert!(ctx.resize.active(), "the paste is the child's, not the mode's");
+            assert_eq!(ctx.renderer.width, 80, "and it stepped nothing");
+        }
+
+        /// The child disabling paste mode mid-paste re-arms normal scanning at once.
+        #[test]
+        fn clearing_paste_mode_mid_paste_re_arms_the_scanner() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            mirror_paste_on(&mut ctx);
+            ctx.send(b"\x1b[200~ab");
+            assert_eq!(ctx.pty, b"\x1b[200~ab");
+
+            ctx.renderer.parser.process(b"\x1b[?2004l");
+            render_once(&mut ctx.renderer, &mut ctx.term).unwrap();
+            ctx.send(&[0x1c]);
+            assert!(ctx.resize.active(), "the tail is scanned normally again");
         }
     }
 
@@ -3285,28 +4057,14 @@ line two\r\n\
         use super::super::{
             dispatch, render_once, run, suspend_cycle, Flow, Renderer, ResizeCtl, SuspendOutcome,
         };
-        use super::{left_renderer, NoopResizer, VirtualClock};
+        use super::{left_renderer, NoopResizer, RecResizer, VirtualClock};
         use crate::msg::Msg;
-        use crate::pty::PtyResizer;
         use crate::suspend::mock::{MockSuspender, OrderLog};
         use crate::terminal::mock::{Call, MockTerminal};
         use crate::terminal::OuterTerminal;
         use portable_pty::ExitStatus;
         use std::cell::RefCell;
         use std::rc::Rc;
-
-        /// A recording resizer that captures the `(cols, rows)` the resume
-        /// resize-catch-up drives into the child PTY.
-        #[derive(Default)]
-        struct RecResizer {
-            calls: RefCell<Vec<(u16, u16)>>,
-        }
-        impl PtyResizer for RecResizer {
-            fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
-                self.calls.borrow_mut().push((cols, rows));
-                Ok(())
-            }
-        }
 
         /// The lifecycle + suspend markers that carry the ordering; render-output
         /// noise (MoveTo/WriteRow/Flush/PlaceCursor/…) is filtered out.
@@ -3317,13 +4075,12 @@ line two\r\n\
                         c,
                         Call::EnterAltScreen
                             | Call::LeaveAltScreen
-                            | Call::PushKeyboardFlags
-                            | Call::PopKeyboardFlags
                             | Call::EnableMouse
                             | Call::DisableMouse
                             | Call::EnableRawMode
                             | Call::DisableRawMode
                             | Call::ShowCursor
+                            | Call::Relay(_)
                             | Call::SuspendSelf
                             | Call::ContinueChild
                     )
@@ -3332,20 +4089,17 @@ line two\r\n\
                 .collect()
         }
 
-        /// Build a shared-log terminal + renderer, simulate main.rs's eager setup
-        /// (mouse capture, and kitty flags when capable) so park has something to
-        /// pop/disable, then clear the log so only the cycle is recorded.
-        fn harness(kitty: bool) -> (OrderLog, MockTerminal, Renderer) {
+        /// Build a shared-log terminal + renderer, simulate main.rs's eager mouse
+        /// capture so park has something to disable, then clear the log so only the
+        /// cycle is recorded.
+        fn harness() -> (OrderLog, MockTerminal, Renderer) {
             let log: OrderLog = Rc::new(RefCell::new(Vec::new()));
             let mut term = MockTerminal::with_log(log.clone());
             // Report the renderer's own size so the resume resize-catch-up is a no-op
             // unless a test deliberately flips it.
             term.set_terminal_size(40, 10);
             term.enable_mouse().unwrap();
-            if kitty {
-                term.push_keyboard_flags().unwrap();
-            }
-            let renderer = left_renderer(40, 10, kitty);
+            let renderer = left_renderer(40, 10);
             log.borrow_mut().clear();
             term.calls.clear();
             (log, term, renderer)
@@ -3374,7 +4128,7 @@ line two\r\n\
         /// `dispatch(ChildStopped)` maps to `Flow::Suspend`.
         #[test]
         fn child_stopped_dispatches_to_suspend() {
-            let mut renderer = left_renderer(40, 10, false);
+            let mut renderer = left_renderer(40, 10);
             let mut term = MockTerminal::new();
             let mut pty: Vec<u8> = Vec::new();
             let flow = dispatch(
@@ -3391,7 +4145,7 @@ line two\r\n\
         /// with the full restore-before-self-stop / raw-first-on-resume ordering.
         #[test]
         fn ordering_child_in_alt() {
-            let (log, mut term, mut renderer) = harness(true);
+            let (log, mut term, mut renderer) = harness();
             // Child (and outer) already in the alt screen — no step-2 enter edge.
             renderer.parser.process(b"\x1b[?1049h");
             renderer.outer_alt_active = true;
@@ -3403,13 +4157,11 @@ line two\r\n\
                 significant(&log.borrow()),
                 vec![
                     Call::LeaveAltScreen,
-                    Call::PopKeyboardFlags,
                     Call::DisableMouse,
                     Call::ShowCursor,
                     Call::DisableRawMode,
                     Call::SuspendSelf,
                     Call::EnableRawMode,
-                    Call::PushKeyboardFlags,
                     Call::EnableMouse,
                     Call::EnterAltScreen,
                     Call::ContinueChild,
@@ -3422,7 +4174,7 @@ line two\r\n\
         /// re-setup.
         #[test]
         fn ordering_primary_inline() {
-            let (log, mut term, mut renderer) = harness(true);
+            let (log, mut term, mut renderer) = harness();
             renderer.ever_painted_inline = true;
 
             let outcome = drive(&log, &mut term, &mut renderer);
@@ -3431,17 +4183,19 @@ line two\r\n\
             assert_eq!(
                 significant(&log.borrow()),
                 vec![
-                    Call::PopKeyboardFlags,
                     Call::DisableMouse,
                     Call::ShowCursor,
                     Call::DisableRawMode,
                     Call::SuspendSelf,
                     Call::EnableRawMode,
-                    Call::PushKeyboardFlags,
                     Call::EnableMouse,
                     Call::ContinueChild,
                 ],
                 "no alt enter/leave on the primary screen"
+            );
+            assert!(
+                !log.borrow().iter().any(|c| matches!(c, Call::Relay(_))),
+                "a child that asked for no keyboard mode gets none relayed at park"
             );
             assert!(
                 term.calls.contains(&Call::Newline),
@@ -3453,18 +4207,69 @@ line two\r\n\
             );
         }
 
-        /// Non-kitty outer terminal: no keyboard-flag push/pop anywhere in the cycle.
+        /// A child that negotiated keyboard modes adds one step at each end of the
+        /// cycle (ADR-021): park undoes them before the shell gets the terminal, and
+        /// unpark replays them after raw mode is back and before mouse capture. The
+        /// replayed bytes are the canonical ones originally relayed, in the order the
+        /// child issued them, so the terminal comes back at the same stack depth and
+        /// a later pop from the child still lines up.
         #[test]
-        fn ordering_non_kitty_skips_keyboard_flags() {
-            let (log, mut term, mut renderer) = harness(false);
+        fn ordering_relayed_modes_reset_at_park_and_replayed_at_resume() {
+            let (log, mut term, mut renderer) = harness();
             renderer.ever_painted_inline = true;
+            // The child pushed a kitty level and turned modifyOtherKeys on.
+            renderer.parser.process(b"\x1b[>1u\x1b[>4;2m");
 
-            drive(&log, &mut term, &mut renderer);
+            let outcome = drive(&log, &mut term, &mut renderer);
+            assert!(matches!(outcome, SuspendOutcome::Resumed));
 
-            let sig = significant(&log.borrow());
-            assert!(
-                !sig.contains(&Call::PushKeyboardFlags) && !sig.contains(&Call::PopKeyboardFlags),
-                "a non-kitty outer terminal never pushes/pops keyboard flags: {sig:?}"
+            assert_eq!(
+                significant(&log.borrow()),
+                vec![
+                    Call::Relay(b"\x1b[<1u\x1b[>4;0m".to_vec()),
+                    Call::DisableMouse,
+                    Call::ShowCursor,
+                    Call::DisableRawMode,
+                    Call::SuspendSelf,
+                    Call::EnableRawMode,
+                    Call::Relay(b"\x1b[>1u\x1b[>4;2m".to_vec()),
+                    Call::EnableMouse,
+                    Call::ContinueChild,
+                ],
+                "reset before the hand-back, replay after raw mode is re-taken"
+            );
+        }
+
+        /// The mirrored input modes (ADR-022) come off before the shell gets the
+        /// terminal and go back on after `fg` — and the re-assert is the ordinary
+        /// per-frame poll finding the child's live modes disagreeing with a mirror park
+        /// cleared, so there is no replay list and no `rearm` call anywhere.
+        #[test]
+        fn ordering_mirrored_modes_reset_at_park_and_re_polled_at_resume() {
+            let (log, mut term, mut renderer) = harness();
+            renderer.ever_painted_inline = true;
+            // The child asked its terminal for application cursor keys and paste guards.
+            renderer.parser.process(b"\x1b[?1h\x1b[?2004h");
+            render_once(&mut renderer, &mut term).unwrap();
+            log.borrow_mut().clear();
+
+            let outcome = drive(&log, &mut term, &mut renderer);
+            assert!(matches!(outcome, SuspendOutcome::Resumed));
+
+            assert_eq!(
+                significant(&log.borrow()),
+                vec![
+                    Call::Relay(b"\x1b[?1l\x1b[?2004l".to_vec()),
+                    Call::DisableMouse,
+                    Call::ShowCursor,
+                    Call::DisableRawMode,
+                    Call::SuspendSelf,
+                    Call::EnableRawMode,
+                    Call::EnableMouse,
+                    Call::ContinueChild,
+                    Call::Relay(b"\x1b[?1h\x1b[?2004h".to_vec()),
+                ],
+                "off before the hand-back, back on from the resume repaint's poll"
             );
         }
 
@@ -3472,7 +4277,7 @@ line two\r\n\
         /// before the terminal is parked, and the mode is left.
         #[test]
         fn resize_mode_overlay_cleared_before_park() {
-            let (log, mut term, mut renderer) = harness(false);
+            let (log, mut term, mut renderer) = harness();
             renderer.ever_painted_inline = true;
 
             let mut clock = VirtualClock::new(vec![]);
@@ -3508,7 +4313,7 @@ line two\r\n\
         /// without ever self-stopping or parking the terminal (no double restore).
         #[test]
         fn abort_when_child_dies_in_drain() {
-            let (log, mut term, mut renderer) = harness(false);
+            let (log, mut term, mut renderer) = harness();
             renderer.ever_painted_inline = true;
 
             let mut clock =
@@ -3544,7 +4349,7 @@ line two\r\n\
         /// size.
         #[test]
         fn missed_resize_catch_up_before_continue() {
-            let (log, mut term, mut renderer) = harness(false);
+            let (log, mut term, mut renderer) = harness();
             renderer.ever_painted_inline = true;
 
             // The shell resized the terminal to 50x12 while gutter was stopped.
@@ -3593,7 +4398,7 @@ line two\r\n\
         /// `[stale_base_row, rows)` span that still holds the user's shell output.
         #[test]
         fn resume_resize_interior_clear_spares_shell_history() {
-            let (log, mut term, mut renderer) = harness(false);
+            let (log, mut term, mut renderer) = harness();
             renderer.ever_painted_inline = true;
             // The band was anchored mid-screen before the stop; the shell then scrolled
             // under it, leaving base_row pointing into live shell output.
@@ -3645,7 +4450,7 @@ line two\r\n\
         /// the next frame to fully repaint.
         #[test]
         fn child_continued_forces_repaint_no_suspend() {
-            let mut renderer = left_renderer(40, 3, false);
+            let mut renderer = left_renderer(40, 3);
             let mut term = MockTerminal::new();
             let mut pty: Vec<u8> = Vec::new();
 
@@ -3677,7 +4482,7 @@ line two\r\n\
         /// is stale after park).
         #[test]
         fn cursor_shape_reasserted_on_resume() {
-            let (log, mut term, mut renderer) = harness(false);
+            let (log, mut term, mut renderer) = harness();
             renderer.ever_painted_inline = true;
 
             // Child requested a steady bar (CSI 6 SP q); mirror it once, then isolate.
@@ -3715,7 +4520,7 @@ line two\r\n\
             let mut term = MockTerminal::with_log(log.clone());
             // Match the renderer's size so the resume resize-catch-up is a no-op.
             term.set_terminal_size(40, 10);
-            let mut renderer = left_renderer(40, 10, false);
+            let mut renderer = left_renderer(40, 10);
             let mut pty: Vec<u8> = Vec::new();
             let suspender = MockSuspender::new(log.clone());
 
@@ -4733,16 +5538,7 @@ mod resize {
         layout: Layout,
         cfg: Width,
     ) -> Renderer {
-        Renderer::new(
-            width,
-            rows,
-            real_cols,
-            layout,
-            cfg,
-            false,
-            Box::new(std::io::sink()),
-            0,
-        )
+        Renderer::new(width, rows, real_cols, layout, cfg, Box::new(std::io::sink()), 0)
     }
 
     /// Resize ordering (ADR-008 gate). Drive one resize and assert `master.resize` was
@@ -4831,7 +5627,7 @@ mod resize {
         // Reference: a fresh parser at the new size fed only the post-resize
         // stream (the clear wipes the transient, so the settled grids match).
         let mut reference: vt100::Parser<GutterCallbacks> =
-            vt100::Parser::new_with_callbacks(24, w, 0, GutterCallbacks::new(false));
+            vt100::Parser::new_with_callbacks(24, w, 0, GutterCallbacks::baseline());
         reference.process(new_bytes);
 
         assert_eq!(r.parser.screen().size(), (24, w), "COLUMNS == W after settle");
@@ -5229,7 +6025,7 @@ mod margins {
     /// Build a renderer for the margins tests with an explicit layout + width
     /// config, sized to `width × rows` in a `real_cols`-wide terminal.
     fn renderer(width: u16, rows: u16, real_cols: u16, layout: Layout, cfg: Width) -> Renderer {
-        Renderer::new(width, rows, real_cols, layout, cfg, false, Box::new(std::io::sink()), 0)
+        Renderer::new(width, rows, real_cols, layout, cfg, Box::new(std::io::sink()), 0)
     }
 
     /// Alt screen: the clear spans the whole grid, `0..rows` (gutter owns the whole

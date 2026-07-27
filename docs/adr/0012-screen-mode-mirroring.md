@@ -17,7 +17,7 @@ survives gutter's exit.
 
 ## Consequences
 
-- Startup (raw mode, kitty probe, mouse capture) all happens on the primary screen;
+- Startup (raw mode, the anchor CPR, mouse capture) all happens on the primary screen;
   the child then drives the mode.
 - `outer_alt_active` is an edge-trigger flag, mirrored only on change.
 - An alt→primary edge forces a full repaint, because the cached alt frame is not a

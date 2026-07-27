@@ -17,9 +17,9 @@ Ctrl-Z, gutter's own process never receives SIGTSTP, for two independent reasons
 
 1. **gutter's side (the real terminal).** gutter runs `enable_raw_mode()` on the
    outer tty, which clears `ISIG`. The real terminal's line discipline never turns
-   `0x1A` into a signal — Ctrl-Z arrives at gutter as an ordinary crossterm
-   `KeyEvent`, re-encoded and written into the PTY master like any other key.
-   gutter's own process group gets nothing.
+   `0x1A` into a signal — Ctrl-Z arrives at gutter as an ordinary `0x1A` byte and
+   is forwarded into the PTY master like any other byte. gutter's own process
+   group gets nothing.
 2. **the child's side (the PTY).** portable-pty's unix spawn does `setsid()` +
    `TIOCSCTTY` in `pre_exec`, so the child is a session leader in its own session,
    the foreground process group of the PTY slave (pid == pgid == sid). SIGTSTP is

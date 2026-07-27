@@ -11,6 +11,7 @@
 use std::io::{self, Write};
 
 use crate::geometry::Rails;
+use crate::mouse::{MOUSE_DISABLE, MOUSE_ENABLE};
 
 /// The outer-terminal side effects the setup, render and teardown paths perform.
 ///
@@ -21,18 +22,6 @@ pub trait OuterTerminal {
     // --- Setup ---
     /// Enter raw mode. The first setup step once the PTY is up.
     fn enable_raw_mode(&mut self) -> io::Result<()>;
-    /// Probe whether the outer terminal supports the kitty keyboard protocol —
-    /// the inbound grant `vt100` cannot observe (ADR-003). The returned bool
-    /// clamps the child's kitty state and the encoder. Called once at startup,
-    /// after raw mode.
-    fn supports_keyboard_enhancement(&mut self) -> io::Result<bool>;
-    /// Push the kitty enhancement flags onto the outer terminal so crossterm
-    /// thereafter delivers `KeyEvent`s that distinguish Shift+Enter from Enter
-    /// (ADR-003). Called at startup only when the probe returned `true`; paired
-    /// with [`pop_keyboard_flags`] in teardown.
-    ///
-    /// [`pop_keyboard_flags`]: OuterTerminal::pop_keyboard_flags
-    fn push_keyboard_flags(&mut self) -> io::Result<()>;
     /// Enable mouse capture eagerly (ADR-005), emitting the fixed any-motion SGR
     /// bundle. Called once at startup; never re-issued to track the child's mode
     /// (the forwarding gate narrows in software). Paired with [`disable_mouse`].
@@ -44,9 +33,9 @@ pub trait OuterTerminal {
     /// child enters it.
     fn enter_alt_screen(&mut self) -> io::Result<()>;
     /// The outer terminal's current size as `(cols, rows)`. Read on resume to catch
-    /// a resize that happened while gutter was suspended (ADR-0019): crossterm's
-    /// pending SIGWINCH can coalesce a resize-and-back to a stale event, so the
-    /// cycle queries the real size explicitly.
+    /// a resize that happened while gutter was suspended (ADR-0019): a pending
+    /// SIGWINCH can coalesce a resize-and-back to a stale event, so the cycle
+    /// queries the real size explicitly.
     fn terminal_size(&mut self) -> io::Result<(u16, u16)>;
 
     // --- Render output (per frame) ---
@@ -104,14 +93,23 @@ pub trait OuterTerminal {
     /// Flush the queued frame to the real terminal. Exactly once per frame.
     fn flush(&mut self) -> io::Result<()>;
 
+    // --- Child-driven keyboard modes (ADR-021) ---
+    /// Write child-originated keyboard-mode bytes to the real terminal verbatim, and
+    /// flush them: the child may be blocked waiting on the round trip, and crossterm's
+    /// stdout is buffered. The bytes are the relay's canonical forms, so this method
+    /// neither builds nor inspects them.
+    ///
+    /// Distinct from [`write_row`] so the recorded call log keeps relay bytes apart
+    /// from row paints — the ADR-010 and ADR-019 ordering assertions read that log.
+    ///
+    /// [`write_row`]: OuterTerminal::write_row
+    fn relay(&mut self, bytes: &[u8]) -> io::Result<()>;
+
     // --- Teardown (ADR-010 order) ---
     /// Leave the alternate screen — conditional on the outer terminal actually
     /// being in it (ADR-012): a plain command never entered, so teardown skips the
     /// leave. Also called mid-run on the child's alt→primary edge.
     fn leave_alt_screen(&mut self) -> io::Result<()>;
-    /// Pop the kitty keyboard enhancement flags (teardown), only if they were
-    /// pushed.
-    fn pop_keyboard_flags(&mut self) -> io::Result<()>;
     /// Disable mouse capture (teardown). Pairs with [`enable_mouse`]. Runs via the
     /// explicit restore, not a `Drop` guard — `process::exit` skips destructors,
     /// which would leave the shell emitting mouse escapes after gutter dies.
@@ -128,9 +126,6 @@ pub trait OuterTerminal {
 /// The real outer terminal, backed by crossterm against stdout.
 pub struct CrosstermTerminal {
     out: io::Stdout,
-    /// Whether kitty flags were pushed at startup, so teardown pops only what it
-    /// set (ADR-003).
-    kitty_pushed: bool,
     /// Whether mouse capture was enabled at startup, so teardown disables only
     /// what it set.
     mouse_enabled: bool,
@@ -140,7 +135,6 @@ impl CrosstermTerminal {
     pub fn new() -> Self {
         Self {
             out: io::stdout(),
-            kitty_pushed: false,
             mouse_enabled: false,
         }
     }
@@ -157,28 +151,8 @@ impl OuterTerminal for CrosstermTerminal {
         crossterm::terminal::enable_raw_mode()
     }
 
-    fn supports_keyboard_enhancement(&mut self) -> io::Result<bool> {
-        crossterm::terminal::supports_keyboard_enhancement()
-    }
-
-    fn push_keyboard_flags(&mut self) -> io::Result<()> {
-        use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-        use crossterm::queue;
-        queue!(
-            self.out,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-            )
-        )?;
-        self.out.flush()?;
-        self.kitty_pushed = true;
-        Ok(())
-    }
-
     fn enable_mouse(&mut self) -> io::Result<()> {
-        use crossterm::{event::EnableMouseCapture, queue};
-        queue!(self.out, EnableMouseCapture)?;
+        self.out.write_all(MOUSE_ENABLE)?;
         self.out.flush()?;
         self.mouse_enabled = true;
         Ok(())
@@ -300,23 +274,15 @@ impl OuterTerminal for CrosstermTerminal {
         self.out.flush()
     }
 
+    fn relay(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.out.write_all(bytes)?;
+        self.out.flush()
+    }
+
     fn leave_alt_screen(&mut self) -> io::Result<()> {
         use crossterm::{queue, terminal::LeaveAlternateScreen};
         queue!(self.out, LeaveAlternateScreen)?;
         self.out.flush()
-    }
-
-    fn pop_keyboard_flags(&mut self) -> io::Result<()> {
-        // Pop only what was pushed (ADR-003); popping flags we never set would
-        // corrupt unrelated terminal state.
-        if self.kitty_pushed {
-            use crossterm::event::PopKeyboardEnhancementFlags;
-            use crossterm::queue;
-            queue!(self.out, PopKeyboardEnhancementFlags)?;
-            self.out.flush()?;
-            self.kitty_pushed = false;
-        }
-        Ok(())
     }
 
     fn disable_mouse(&mut self) -> io::Result<()> {
@@ -324,8 +290,7 @@ impl OuterTerminal for CrosstermTerminal {
         // never captured would be harmless, but mirroring the push/pop rule keeps
         // the contract clean.
         if self.mouse_enabled {
-            use crossterm::{event::DisableMouseCapture, queue};
-            queue!(self.out, DisableMouseCapture)?;
+            self.out.write_all(MOUSE_DISABLE)?;
             self.out.flush()?;
             self.mouse_enabled = false;
         }
@@ -357,8 +322,6 @@ pub mod mock {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Call {
         EnableRawMode,
-        SupportsKeyboardEnhancement,
-        PushKeyboardFlags,
         EnableMouse,
         EnterAltScreen,
         MoveTo(u16, u16),
@@ -377,9 +340,13 @@ pub mod mock {
         SetCursorVisible(bool),
         /// `set_cursor_shape(bytes)` — the mirrored `CSI Ps SP q`.
         SetCursorShape(Vec<u8>),
+        /// `relay(bytes)` — a keyboard-mode request forwarded on the child's behalf,
+        /// or the reset/replay that undoes and re-applies them (ADR-021). Its own
+        /// variant so the ordering filters can see it without confusing it with a
+        /// row paint.
+        Relay(Vec<u8>),
         Flush,
         LeaveAltScreen,
-        PopKeyboardFlags,
         DisableMouse,
         ShowCursor,
         DisableRawMode,
@@ -395,12 +362,6 @@ pub mod mock {
     #[derive(Default)]
     pub struct MockTerminal {
         pub calls: Vec<Call>,
-        /// What the kitty-capability probe reports. Lets the teardown test drive
-        /// both the push-then-pop and neither paths without a real terminal.
-        pub supports_kitty: bool,
-        /// Tracks whether [`OuterTerminal::push_keyboard_flags`] was called, so
-        /// the mock pops only when flags were pushed — mirroring the real rule.
-        kitty_pushed: bool,
         /// Tracks whether [`OuterTerminal::enable_mouse`] was called, so the mock
         /// disables only when capture was enabled — mirroring the real rule.
         mouse_enabled: bool,
@@ -425,14 +386,6 @@ pub mod mock {
         pub fn with_log(log: std::rc::Rc<std::cell::RefCell<Vec<Call>>>) -> Self {
             Self {
                 log: Some(log),
-                ..Self::default()
-            }
-        }
-
-        /// A mock that reports the outer terminal as kitty-capable.
-        pub fn kitty_capable() -> Self {
-            Self {
-                supports_kitty: true,
                 ..Self::default()
             }
         }
@@ -466,7 +419,7 @@ pub mod mock {
                     matches!(
                         c,
                         Call::LeaveAltScreen
-                            | Call::PopKeyboardFlags
+                            | Call::Relay(_)
                             | Call::DisableMouse
                             | Call::ShowCursor
                             | Call::DisableRawMode
@@ -558,6 +511,17 @@ pub mod mock {
                 .collect()
         }
 
+        /// The outer terminal's own input modes, as the relayed bytes left them:
+        /// `(application_cursor, application_keypad, bracketed_paste)` (ADR-022).
+        pub fn outer_input_modes(&self) -> (bool, bool, bool) {
+            let s = self.parser.screen();
+            (
+                s.application_cursor(),
+                s.application_keypad(),
+                s.bracketed_paste(),
+            )
+        }
+
         /// The lines in the recorder's scrollback, oldest first, each read across
         /// the band columns `[0, width)` (the tests paint a margin-0 band).
         pub fn scrollback_top_rows(&mut self, width: u16) -> Vec<String> {
@@ -580,12 +544,6 @@ pub mod mock {
 
     impl OuterTerminal for RecordingGrid {
         fn enable_raw_mode(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-        fn supports_keyboard_enhancement(&mut self) -> io::Result<bool> {
-            Ok(false)
-        }
-        fn push_keyboard_flags(&mut self) -> io::Result<()> {
             Ok(())
         }
         fn enable_mouse(&mut self) -> io::Result<()> {
@@ -691,10 +649,15 @@ pub mod mock {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
-        fn leave_alt_screen(&mut self) -> io::Result<()> {
+        fn relay(&mut self, bytes: &[u8]) -> io::Result<()> {
+            // Relayed bytes paint nothing — that is the premise of both the keyboard
+            // allowlist (ADR-021) and the mode mirror (ADR-022) — but feeding them to
+            // the parser lets a test read back the outer terminal's resulting input
+            // modes instead of matching on byte spelling.
+            self.parser.process(bytes);
             Ok(())
         }
-        fn pop_keyboard_flags(&mut self) -> io::Result<()> {
+        fn leave_alt_screen(&mut self) -> io::Result<()> {
             Ok(())
         }
         fn disable_mouse(&mut self) -> io::Result<()> {
@@ -711,15 +674,6 @@ pub mod mock {
     impl OuterTerminal for MockTerminal {
         fn enable_raw_mode(&mut self) -> io::Result<()> {
             self.record(Call::EnableRawMode);
-            Ok(())
-        }
-        fn supports_keyboard_enhancement(&mut self) -> io::Result<bool> {
-            self.record(Call::SupportsKeyboardEnhancement);
-            Ok(self.supports_kitty)
-        }
-        fn push_keyboard_flags(&mut self) -> io::Result<()> {
-            self.record(Call::PushKeyboardFlags);
-            self.kitty_pushed = true;
             Ok(())
         }
         fn enable_mouse(&mut self) -> io::Result<()> {
@@ -781,16 +735,12 @@ pub mod mock {
             self.record(Call::Flush);
             Ok(())
         }
-        fn leave_alt_screen(&mut self) -> io::Result<()> {
-            self.record(Call::LeaveAltScreen);
+        fn relay(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.record(Call::Relay(bytes.to_vec()));
             Ok(())
         }
-        fn pop_keyboard_flags(&mut self) -> io::Result<()> {
-            // Mirror the real impl: only pop what was actually pushed.
-            if self.kitty_pushed {
-                self.record(Call::PopKeyboardFlags);
-                self.kitty_pushed = false;
-            }
+        fn leave_alt_screen(&mut self) -> io::Result<()> {
+            self.record(Call::LeaveAltScreen);
             Ok(())
         }
         fn disable_mouse(&mut self) -> io::Result<()> {
