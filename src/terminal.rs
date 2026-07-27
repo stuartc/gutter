@@ -326,6 +326,103 @@ impl OuterTerminal for CrosstermTerminal {
 }
 
 #[cfg(test)]
+mod tests {
+    //! [`CrosstermTerminal`] against a plain file: the sink is whatever `File` it
+    //! was handed, so its buffering is testable without a terminal.
+
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A temp path that removes itself, so a test can read back what the sink wrote.
+    struct SinkFile(PathBuf);
+
+    impl SinkFile {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("gutter-sink-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            Self(path)
+        }
+
+        fn terminal(&self) -> CrosstermTerminal {
+            CrosstermTerminal::new(File::create(&self.0).expect("create the sink file"))
+        }
+
+        fn contents(&self) -> Vec<u8> {
+            std::fs::read(&self.0).expect("read the sink file")
+        }
+    }
+
+    impl Drop for SinkFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// The sink is buffered, so a queued frame reaches the terminal only when
+    /// something flushes it. `process::exit` runs no destructor that would land it
+    /// (ADR-010).
+    #[test]
+    fn queued_output_lands_only_on_flush() {
+        let sink = SinkFile::new("flush");
+        let mut term = sink.terminal();
+
+        term.move_to(4, 2).expect("move to the band");
+        term.write_row(b"band").expect("write a row");
+        assert!(
+            sink.contents().is_empty(),
+            "queued output must not reach the terminal before the flush"
+        );
+
+        term.flush().expect("flush the sink");
+        let out = sink.contents();
+        assert!(
+            out.ends_with(b"band"),
+            "the flush must land the queued frame, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// `show_cursor` is the last byte-producing step of the ordered restore, and it
+    /// flushes — so everything the teardown queued ahead of it lands.
+    #[test]
+    fn show_cursor_lands_what_teardown_queued_before_it() {
+        let sink = SinkFile::new("teardown");
+        let mut term = sink.terminal();
+
+        term.move_to(0, 5).expect("move below the band");
+        term.write_row(b"\r\n\x1b[2mExited with: 3\x1b[0m")
+            .expect("write the hand-back status");
+        term.show_cursor().expect("show the cursor");
+
+        let out = String::from_utf8_lossy(&sink.contents()).into_owned();
+        assert!(
+            out.contains("Exited with: 3"),
+            "the restore's queued bytes must land, got {out:?}"
+        );
+    }
+
+    /// The probe writes through the band's own sink: its query and the frames that
+    /// follow it are the same buffered stream to the same terminal.
+    #[test]
+    fn the_probe_writes_through_the_band_sink() {
+        let sink = SinkFile::new("probe");
+        let mut term = sink.terminal();
+
+        term.writer().write_all(b"\x1b[6n").expect("write the query");
+        term.write_row(b"band").expect("write a row");
+        term.flush().expect("flush the sink");
+
+        let out = sink.contents();
+        assert_eq!(
+            out,
+            b"\x1b[6nband",
+            "query and band must share one sink, in order"
+        );
+    }
+}
+
+#[cfg(test)]
 pub mod mock {
     //! A recording [`OuterTerminal`] for the restore-order and offset-repaint
     //! tests.
