@@ -75,14 +75,13 @@ fn run() -> i32 {
         }
     };
 
-    // gutter talks to exactly one terminal, its controlling terminal: the band's
-    // sink, the keyboard and the clipboard all open `/dev/tty`, so `gutter cmd > log`
-    // paints on screen and leaves the log empty. The open is also the guard —
-    // `/dev/tty` resolves only for a process that has a controlling terminal — and it
-    // runs here, ahead of the CPR probe that would otherwise stall waiting for a reply
-    // no one is going to send.
-    let tty_out = match open_tty_write() {
-        Ok(f) => f,
+    // gutter talks to exactly one terminal: the band's sink, the keyboard and the
+    // clipboard are all opens of the one device `open_tty_write` resolved, so
+    // `gutter cmd > log` paints on screen and leaves the log empty. The open is also
+    // the guard — no terminal resolves, no run — and it runs here, ahead of the CPR
+    // probe that would otherwise stall waiting for a reply no one is going to send.
+    let (tty_out, tty_path) = match open_tty_write() {
+        Ok(resolved) => resolved,
         Err(e) => {
             eprintln!("gutter: no controlling terminal: {e}");
             return 1;
@@ -90,7 +89,7 @@ fn run() -> i32 {
     };
     // The tty gutter reads input from. Opened ONCE here: the CPR probe below and
     // Thread 3 must share one file description, or they would race for the reply.
-    let input_tty = match open_input_tty() {
+    let input_tty = match open_input_tty(&tty_path) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("gutter: no controlling terminal: {e}");
@@ -211,16 +210,17 @@ fn run() -> i32 {
         eprintln!("gutter: failed to enable mouse capture: {e}");
     }
 
-    // The OSC-52 clipboard sink: a third open of /dev/tty (ADR-004), so a clipboard
-    // write and a frame repaint never share fd state. Degrades to a discarding sink
-    // rather than aborting startup.
-    let clipboard_out: Box<dyn std::io::Write + Send> = match clipboard::open_tty_read_write() {
-        Ok(tty) => Box::new(tty),
-        Err(e) => {
-            eprintln!("gutter: /dev/tty unavailable, clipboard disabled: {e}");
-            Box::new(std::io::sink())
-        }
-    };
+    // The OSC-52 clipboard sink: a third open of the same device (ADR-004), so a
+    // clipboard write and a frame repaint never share fd state. Degrades to a
+    // discarding sink rather than aborting startup.
+    let clipboard_out: Box<dyn std::io::Write + Send> =
+        match clipboard::open_tty_read_write(&tty_path) {
+            Ok(tty) => Box::new(tty),
+            Err(e) => {
+                eprintln!("gutter: terminal unavailable, clipboard disabled: {e}");
+                Box::new(std::io::sink())
+            }
+        };
 
     // Thread 2: the render loop, on the main thread.
     let mut renderer = Renderer::new(

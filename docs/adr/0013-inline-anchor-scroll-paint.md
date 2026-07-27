@@ -45,7 +45,7 @@ run of `gutter cmd > log`.
 Since [ADR-023](0023-controlling-terminal-fd-model.md) the query goes out through the
 band's own sink, so query and reply are the same terminal by construction. The "no tty
 at all" arm of the capture is gone with it: startup has already refused a run with no
-controlling terminal, so the only fallback left is the one that always mattered — the
+terminal to paint on, so the only fallback left is the one that always mattered — the
 terminal did not answer in time, and the anchor takes `rows - 1`. Never row 0, which is
 the overpaint this record exists to prevent.
 

@@ -8,6 +8,8 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 const ESC: u8 = 0x1b;
 const OSC_INTRODUCER: u8 = b']';
@@ -17,15 +19,23 @@ const SEP: u8 = b';';
 /// with BEL.
 const BEL: u8 = 0x07;
 
-/// Opens `/dev/tty` read-write for the clipboard sink. See ADR-004.
+/// Opens the terminal read-write for the clipboard sink. See ADR-004.
 ///
-/// A distinct open from the render sink's, so a clipboard write and a frame
-/// repaint never share fd state. Opened read-write rather than write-only to
-/// leave room for a later read-response relay; the clipboard's own read half is
-/// unused, but [`crate::anchor::open_input_tty`] opens the input tty through here
-/// and reads it.
-pub fn open_tty_read_write() -> io::Result<File> {
-    OpenOptions::new().read(true).write(true).open("/dev/tty")
+/// `tty` is the device the render sink was opened from ([`crate::terminal::open_tty_write`]),
+/// so gutter keeps one answer to which terminal it is talking to. A distinct open from
+/// the render sink's, so a clipboard write and a frame repaint never share fd state.
+/// Opened read-write rather than write-only to leave room for a later read-response
+/// relay; the clipboard's own read half is unused, but
+/// [`crate::anchor::open_input_tty`] opens the input tty through here and reads it.
+///
+/// `O_NOCTTY` for the same reason the sink's open carries it: naming the terminal must
+/// not make it gutter's controlling terminal.
+pub fn open_tty_read_write(tty: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(tty)
 }
 
 /// Builds the wire bytes `ESC ] 52 ; ty ; data BEL` from the callback's slices.
@@ -97,7 +107,7 @@ mod tests {
     #[test]
     fn tty_opens_read_write() {
         use std::io::Read;
-        let mut file = match open_tty_read_write() {
+        let mut file = match open_tty_read_write(Path::new("/dev/tty")) {
             Ok(f) => f,
             Err(_) => return, // no controlling terminal here.
         };

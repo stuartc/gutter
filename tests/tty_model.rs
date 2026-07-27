@@ -1,16 +1,21 @@
-//! gutter talks to exactly one terminal: its controlling terminal. The band, the
-//! keyboard and the startup CPR probe all reach it through `/dev/tty`, so stdout is
-//! never written and a redirect never captures the band — the tmux behaviour. The
-//! same open is the guard: no controlling terminal, no run.
+//! gutter talks to exactly one terminal. The band, the keyboard and the startup CPR
+//! probe all reach it through `/dev/tty` — or, when there is no controlling terminal,
+//! through the terminal stdin names. stdout is never written and a redirect never
+//! captures the band, the tmux behaviour. The same open is the guard: no terminal
+//! either way, no run.
 
 mod common;
 
-use std::fs;
+use std::ffi::{CStr, OsStr};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::{
     answer_cpr, drain_window, first_painted_col, outer_grid, pty_guard, spawn_gutter,
@@ -75,6 +80,134 @@ fn no_controlling_terminal_refuses_before_spawning_the_child() {
     assert!(
         !stderr.contains("failed to spawn"),
         "the guard must refuse before the child is spawned, got {stderr:?}"
+    );
+}
+
+/// A `cols × rows` PTY pair, made here in the parent. The slave is opened here too,
+/// deliberately: opening a terminal is how a session leader acquires a controlling
+/// terminal, so a child that only inherits the descriptor ends up with a terminal on
+/// its stdio and no controlling terminal — the shape this file's fallback test needs.
+fn pty_pair(cols: u16, rows: u16) -> (File, File) {
+    // SAFETY: each call is checked before its result is used; `ptsname`'s pointer is
+    // copied out before anything else can overwrite its static buffer, and the master
+    // fd is handed to `File` exactly once.
+    unsafe {
+        let master_fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(master_fd >= 0, "posix_openpt failed");
+        assert_eq!(libc::grantpt(master_fd), 0, "grantpt failed");
+        assert_eq!(libc::unlockpt(master_fd), 0, "unlockpt failed");
+        let name = libc::ptsname(master_fd);
+        assert!(!name.is_null(), "ptsname failed");
+        let path = PathBuf::from(OsStr::from_bytes(CStr::from_ptr(name).to_bytes()));
+        assert_eq!(
+            libc::fcntl(master_fd, libc::F_SETFL, libc::O_NONBLOCK),
+            0,
+            "O_NONBLOCK failed"
+        );
+        let slave = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(&path)
+            .expect("open the PTY slave");
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ as _, &size),
+            0,
+            "TIOCSWINSZ failed: {}",
+            std::io::Error::last_os_error()
+        );
+        (File::from_raw_fd(master_fd), slave)
+    }
+}
+
+/// Read `master` until `marker` appears or `deadline` elapses. The master is
+/// non-blocking, so an empty read is nothing-yet rather than end-of-stream.
+fn read_until_marker(master: &mut File, marker: &str, deadline: Duration) -> Vec<u8> {
+    let start = Instant::now();
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    while start.elapsed() < deadline {
+        match master.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if String::from_utf8_lossy(&out).contains(marker) {
+                    break;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => break,
+        }
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    out
+}
+
+/// A terminal on descriptors 0/1/2 that was never made the controlling terminal:
+/// `setsid gutter bash`, `subprocess.Popen` with a PTY but no `start_new_session`, a
+/// Go `exec` without `Setsid`+`Setctty`. `/dev/tty` does not open there, but there is
+/// a perfectly usable screen on stdin — gutter names it with `ttyname(0)`, reopens it,
+/// and paints, rather than refusing.
+///
+/// 120×40 with a centred 40-column band: the band starts at column 40 on this
+/// terminal, and at column 20 if `crossterm::terminal::size`'s own 80×24 fallback is
+/// what answered — so the geometry proves gutter read the size off the same terminal
+/// it painted on.
+#[test]
+fn a_terminal_with_no_controlling_terminal_still_paints() {
+    let _guard = pty_guard();
+    let (mut master, slave) = pty_pair(120, 40);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gutter"));
+    cmd.args([
+        "--width",
+        "40",
+        "--center",
+        "sh",
+        "-c",
+        "printf hi-no-ctty; sleep 0.5",
+    ]);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("GUTTER_FORCE_ANCHOR_ROW", "0");
+    cmd.stdin(Stdio::from(slave.try_clone().expect("clone the slave")));
+    cmd.stdout(Stdio::from(slave.try_clone().expect("clone the slave")));
+    cmd.stderr(Stdio::from(slave.try_clone().expect("clone the slave")));
+    // SAFETY: `setsid` is async-signal-safe and touches nothing the child allocated.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("spawn gutter on a PTY it does not control");
+
+    let out = read_until_marker(&mut master, "hi-no-ctty", Duration::from_secs(5));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let parser = outer_grid(&out, 120, 40);
+    let screen = parser.screen();
+    let rows: Vec<String> = screen.rows(0, 120).collect();
+    assert!(
+        !rows.iter().any(|r| r.contains("no controlling terminal")),
+        "gutter must not refuse with a usable terminal on stdin: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("hi-no-ctty")),
+        "the band must paint on the terminal stdin names: {rows:?}"
+    );
+    assert_eq!(
+        first_painted_col(screen, 120),
+        Some(40),
+        "the band must be centred in that terminal's own 120 columns; rows: {rows:?}"
     );
 }
 

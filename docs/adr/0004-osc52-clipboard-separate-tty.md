@@ -43,7 +43,7 @@ and a frame repaint still cannot fight over fd state.
 Two smaller corrections follow from the same change. `open_tty_read_write` is now shared:
 `anchor::open_input_tty` makes the keyboard handle through it and reads that one, so it is
 the *clipboard's* read half specifically that stays unused. And the degrade to `io::sink()`
-is now all but unreachable — startup has already refused the run if `/dev/tty` would not
+is now all but unreachable — startup has already refused the run if no terminal would
 open — but it is kept, because it costs a match arm and the alternative is a crash on a
 path nobody can rehearse.
 

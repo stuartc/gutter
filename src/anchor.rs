@@ -10,6 +10,7 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::clipboard;
@@ -18,10 +19,10 @@ use crate::clipboard;
 /// answers in a millisecond or two.
 pub const CPR_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// The tty gutter reads input from: `/dev/tty`, a separate open from the
-/// clipboard's (ADR-004) and from the render sink's.
-pub fn open_input_tty() -> io::Result<File> {
-    clipboard::open_tty_read_write()
+/// The tty gutter reads input from: another open of the device the render sink came
+/// from, separate from the clipboard's (ADR-004) and from the sink's own.
+pub fn open_input_tty(tty: &Path) -> io::Result<File> {
+    clipboard::open_tty_read_write(tty)
 }
 
 /// Ask the terminal where the cursor is (DSR-CPR, `ESC [ 6 n`) on `out` and read the
@@ -136,13 +137,14 @@ fn digits_end(buf: &[u8], from: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{find_cpr, open_input_tty, wait_readable};
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     /// The macOS `/dev/tty` guard: `poll()` there returns `POLLNVAL` at once, so a
     /// probe built on it gives up before the terminal can answer.
     #[test]
     fn waiting_on_an_idle_tty_uses_the_whole_timeout() {
-        let Ok(tty) = open_input_tty() else {
+        let Ok(tty) = open_input_tty(Path::new("/dev/tty")) else {
             return; // No tty at all (CI): nothing to wait on.
         };
         if wait_readable(&tty, Duration::from_millis(0)) {

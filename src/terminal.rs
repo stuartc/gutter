@@ -2,9 +2,9 @@
 //! output sink, behind one injectable trait so the render path can be tested
 //! against a recording mock.
 //!
-//! The sink is the process's controlling terminal, not stdout: gutter paints the
-//! band on the screen the keyboard, the size and the clipboard already come from,
-//! and `gutter cmd > log` leaves the log empty.
+//! The sink is the process's terminal, not stdout: gutter paints the band on the
+//! screen the keyboard, the size and the clipboard already come from, and
+//! `gutter cmd > log` leaves the log empty.
 //!
 //! Lifecycle is raw mode, the mirrored alt screen, and an explicit ordered
 //! restore (ADR-010). Teardown runs before `process::exit`, which skips
@@ -12,8 +12,12 @@
 //! symmetric: each restore step undoes only what was actually set up. The alt
 //! screen is not forced at setup; it mirrors the child's mode (ADR-012).
 
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::queue;
@@ -132,13 +136,56 @@ pub trait OuterTerminal {
     fn disable_raw_mode(&mut self) -> io::Result<()>;
 }
 
-/// Opens the controlling terminal for writing — the band's sink.
+/// Opens the terminal for writing — the band's sink — and names the device it came
+/// from, so every other handle gutter opens is opened from that same device.
 ///
-/// The open doubles as gutter's terminal guard: `/dev/tty` resolves only for a
-/// process that has a controlling terminal, so a failure here means there is no
-/// screen to render a band on.
-pub fn open_tty_write() -> io::Result<File> {
-    OpenOptions::new().write(true).open("/dev/tty")
+/// `/dev/tty`, the controlling terminal, first. A process handed a terminal on its
+/// stdio without that terminal being made its controlling terminal has no `/dev/tty`
+/// to open — `setsid gutter bash`, or any launcher that attaches a PTY but omits
+/// `TIOCSCTTY` — so the terminal stdin names is the second route, reopened **by name**:
+/// `dup`ing descriptor 0 would hand back the caller's file description, where the
+/// clipboard (ADR-004) and the probe/Thread-3 split both need independent ones.
+///
+/// The open doubles as gutter's terminal guard: both routes failing means there is no
+/// screen to render a band on. The error reported is `/dev/tty`'s, the usual cause.
+pub fn open_tty_write() -> io::Result<(File, PathBuf)> {
+    let dev_tty = Path::new("/dev/tty");
+    match open_write(dev_tty) {
+        Ok(f) => Ok((f, dev_tty.to_path_buf())),
+        Err(e) => {
+            let Some(path) = stdin_tty_path() else {
+                return Err(e);
+            };
+            match open_write(&path) {
+                Ok(f) => Ok((f, path)),
+                Err(_) => Err(e),
+            }
+        }
+    }
+}
+
+/// `O_NOCTTY`: naming a terminal must not make it gutter's controlling terminal.
+/// Where the fallback fires gutter is a session leader with none, and on Linux a
+/// plain `open` of a free terminal would silently adopt it — the fallback widens how
+/// gutter finds a screen, not what session it is in.
+fn open_write(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(path)
+}
+
+/// The path of the terminal on descriptor 0, if there is one.
+fn stdin_tty_path() -> Option<PathBuf> {
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: `ttyname_r` writes at most `buf.len()` bytes into the buffer it is
+    // given, and STDIN_FILENO is always a valid descriptor number to ask about.
+    let rc = unsafe { libc::ttyname_r(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0)?;
+    (end > 0).then(|| PathBuf::from(OsStr::from_bytes(&buf[..end])))
 }
 
 /// The real outer terminal, backed by crossterm against the controlling terminal.
