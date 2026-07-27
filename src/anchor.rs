@@ -8,8 +8,8 @@
 //! the probe hands them back instead.
 
 use std::fs::File;
-use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use crate::clipboard;
@@ -18,24 +18,24 @@ use crate::clipboard;
 /// answers in a millisecond or two.
 pub const CPR_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// The tty gutter reads input from: `/dev/tty` (a separate open from the
-/// clipboard's, ADR-004), falling back to a `dup` of stdin.
-pub fn open_input_tty() -> Option<File> {
-    if let Ok(tty) = clipboard::open_tty_read_write() {
-        return Some(tty);
-    }
-    // SAFETY: `dup` returns a fresh descriptor this process owns outright, so
-    // handing it to `File` transfers a genuinely exclusive ownership.
-    let fd = unsafe { libc::dup(0) };
-    (fd >= 0).then(|| unsafe { File::from_raw_fd(fd) })
+/// The tty gutter reads input from: `/dev/tty`, a separate open from the
+/// clipboard's (ADR-004) and from the render sink's.
+pub fn open_input_tty() -> io::Result<File> {
+    clipboard::open_tty_read_write()
 }
 
-/// Ask the terminal where the cursor is (DSR-CPR, `ESC [ 6 n`) and read the
+/// Ask the terminal where the cursor is (DSR-CPR, `ESC [ 6 n`) on `out` and read the
 /// `ESC [ row ; col R` answer back off the input tty. Returns the 0-based row and
 /// **everything else that was read** — bytes the user typed while gutter was
 /// starting, which the caller must not drop.
-pub fn probe_cursor_row(tty: &File, timeout: Duration) -> (Option<u16>, Vec<u8>) {
-    let mut out = std::io::stdout();
+///
+/// `out` is the band's sink: query and reply have to travel over the same terminal,
+/// or nothing ever answers.
+pub fn probe_cursor_row(
+    out: &mut impl Write,
+    tty: &File,
+    timeout: Duration,
+) -> (Option<u16>, Vec<u8>) {
     if out.write_all(b"\x1b[6n").is_err() || out.flush().is_err() {
         return (None, Vec::new());
     }
@@ -140,7 +140,7 @@ mod tests {
     /// probe built on it gives up before the terminal can answer.
     #[test]
     fn waiting_on_an_idle_tty_uses_the_whole_timeout() {
-        let Some(tty) = open_input_tty() else {
+        let Ok(tty) = open_input_tty() else {
             return; // No tty at all (CI): nothing to wait on.
         };
         if wait_readable(&tty, Duration::from_millis(0)) {

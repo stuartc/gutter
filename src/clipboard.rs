@@ -19,9 +19,11 @@ const BEL: u8 = 0x07;
 
 /// Opens `/dev/tty` read-write for the clipboard sink. See ADR-004.
 ///
-/// A distinct fd from crossterm's stdout, so a clipboard write and a frame
+/// A distinct open from the render sink's, so a clipboard write and a frame
 /// repaint never share fd state. Opened read-write rather than write-only to
-/// leave room for a later read-response relay; the read half is unused today.
+/// leave room for a later read-response relay; the clipboard's own read half is
+/// unused, but [`crate::anchor::open_input_tty`] opens the input tty through here
+/// and reads it.
 pub fn open_tty_read_write() -> io::Result<File> {
     OpenOptions::new().read(true).write(true).open("/dev/tty")
 }
@@ -86,24 +88,6 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         forward_osc52(&mut buf, b"c", b"aGVsbG8=").unwrap();
         assert_eq!(buf, b"\x1b]52;c;aGVsbG8=\x07");
-    }
-
-    /// The clipboard `/dev/tty` fd must differ from the stdout repaint fd
-    /// (ADR-004). Skips when no controlling tty is present; the separateness is
-    /// structural regardless, since `/dev/tty` is opened independently of stdout.
-    #[test]
-    fn tty_fd_is_distinct_from_stdout() {
-        use std::os::fd::AsRawFd;
-        let tty = match open_tty_read_write() {
-            Ok(f) => f,
-            Err(_) => return, // no controlling terminal here.
-        };
-        let stdout_fd = io::stdout().as_raw_fd();
-        assert_ne!(
-            tty.as_raw_fd(),
-            stdout_fd,
-            "the clipboard /dev/tty fd must be distinct from the stdout repaint fd"
-        );
     }
 
     /// `/dev/tty` is opened read AND write (ADR-004), so a later read-response

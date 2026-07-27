@@ -57,7 +57,7 @@ use std::thread;
 use anchor::{open_input_tty, probe_cursor_row, CPR_TIMEOUT};
 use clock::RealClock;
 use render::Renderer;
-use terminal::{CrosstermTerminal, OuterTerminal};
+use terminal::{open_tty_write, CrosstermTerminal, OuterTerminal};
 
 fn main() {
     let code = run();
@@ -72,6 +72,29 @@ fn run() -> i32 {
         Err(msg) => {
             eprintln!("{msg}");
             return 2;
+        }
+    };
+
+    // gutter talks to exactly one terminal, its controlling terminal: the band's
+    // sink, the keyboard and the clipboard all open `/dev/tty`, so `gutter cmd > log`
+    // paints on screen and leaves the log empty. The open is also the guard —
+    // `/dev/tty` resolves only for a process that has a controlling terminal — and it
+    // runs here, ahead of the CPR probe that would otherwise stall waiting for a reply
+    // no one is going to send.
+    let tty_out = match open_tty_write() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("gutter: no controlling terminal: {e}");
+            return 1;
+        }
+    };
+    // The tty gutter reads input from. Opened ONCE here: the CPR probe below and
+    // Thread 3 must share one file description, or they would race for the reply.
+    let input_tty = match open_input_tty() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("gutter: no controlling terminal: {e}");
+            return 1;
         }
     };
 
@@ -140,16 +163,11 @@ fn run() -> i32 {
     // screen (ADR-012): the render thread mirrors the child's mode. gutter asks
     // the outer terminal for no keyboard mode of its own — that is the child's to
     // negotiate (ADR-020).
-    let mut terminal = CrosstermTerminal::new();
+    let mut terminal = CrosstermTerminal::new(tty_out);
     if let Err(e) = terminal.enable_raw_mode() {
         eprintln!("gutter: failed to enable raw mode: {e}");
         return 1;
     }
-
-    // The tty gutter reads input from. Opened ONCE here: the CPR probe below and
-    // Thread 3 must share one file description, or they would race for the reply.
-    // A separate open from the clipboard's (ADR-004); nothing ever reads that one.
-    let input_tty = open_input_tty();
 
     // Capture the launch cursor row, the inline anchor (ADR-013), before Thread 3
     // starts draining the same fd.
@@ -160,13 +178,10 @@ fn run() -> i32 {
     // 0, which would reproduce the overpaint the anchor exists to prevent.
     let (anchor_row, leftover) = match std::env::var("GUTTER_FORCE_ANCHOR_ROW").ok() {
         Some(v) => (v.parse::<u16>().unwrap_or(rows.saturating_sub(1)), Vec::new()),
-        None => match input_tty.as_ref() {
-            Some(tty) => {
-                let (row, leftover) = probe_cursor_row(tty, CPR_TIMEOUT);
-                (row.unwrap_or(rows.saturating_sub(1)), leftover)
-            }
-            None => (rows.saturating_sub(1), Vec::new()),
-        },
+        None => {
+            let (row, leftover) = probe_cursor_row(terminal.writer(), &input_tty, CPR_TIMEOUT);
+            (row.unwrap_or(rows.saturating_sub(1)), leftover)
+        }
     };
 
     // Anything the probe read that was not the reply is a keystroke typed during
@@ -179,11 +194,9 @@ fn run() -> i32 {
 
     // Thread 3: input reader, DETACHED. Spawned but never joined; the
     // un-interruptible `read()` is reaped by process::exit on teardown (ADR-010).
-    if let Some(tty) = input_tty {
+    {
         let merged_tx = merged_tx.clone();
-        thread::spawn(move || input::run(tty, merged_tx));
-    } else {
-        eprintln!("gutter: /dev/tty unavailable, keyboard input is disabled");
+        thread::spawn(move || input::run(input_tty, merged_tx));
     }
 
     // Thread 5: SIGWINCH → Msg::Resize. Detached like Thread 3, and the only
@@ -198,9 +211,9 @@ fn run() -> i32 {
         eprintln!("gutter: failed to enable mouse capture: {e}");
     }
 
-    // The OSC-52 clipboard sink: a separately-opened /dev/tty (ADR-004), distinct
-    // from crossterm's stdout repaint sink. With no controlling tty, degrade to a
-    // discarding sink rather than aborting startup.
+    // The OSC-52 clipboard sink: a third open of /dev/tty (ADR-004), so a clipboard
+    // write and a frame repaint never share fd state. Degrades to a discarding sink
+    // rather than aborting startup.
     let clipboard_out: Box<dyn std::io::Write + Send> = match clipboard::open_tty_read_write() {
         Ok(tty) => Box::new(tty),
         Err(e) => {
@@ -235,7 +248,11 @@ fn run() -> i32 {
         &suspender,
     );
 
-    // The render loop already ran the ordered restore before returning. A None
-    // (channel disconnected without ChildExited) counts as success.
+    // The render loop already ran the ordered restore before returning; nothing
+    // writes to the buffered sink after it, and `process::exit` runs no destructor
+    // that would land those last bytes (ADR-010).
+    let _ = terminal.flush();
+
+    // A None (channel disconnected without ChildExited) counts as success.
     code.unwrap_or(0)
 }

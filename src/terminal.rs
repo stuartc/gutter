@@ -2,20 +2,25 @@
 //! output sink, behind one injectable trait so the render path can be tested
 //! against a recording mock.
 //!
+//! The sink is the process's controlling terminal, not stdout: gutter paints the
+//! band on the screen the keyboard, the size and the clipboard already come from,
+//! and `gutter cmd > log` leaves the log empty.
+//!
 //! Lifecycle is raw mode, the mirrored alt screen, and an explicit ordered
 //! restore (ADR-010). Teardown runs before `process::exit`, which skips
 //! destructors — so it cannot be a `Drop` guard. Setup and teardown are
 //! symmetric: each restore step undoes only what was actually set up. The alt
 //! screen is not forced at setup; it mirrors the child's mode (ADR-012).
 
-use std::io::{self, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Write};
 
 use crate::geometry::Rails;
 use crate::mouse::{MOUSE_DISABLE, MOUSE_ENABLE};
 
 /// The outer-terminal side effects the setup, render and teardown paths perform.
 ///
-/// [`CrosstermTerminal`] wraps crossterm against stdout; [`mock::MockTerminal`]
+/// [`CrosstermTerminal`] wraps crossterm against `/dev/tty`; [`mock::MockTerminal`]
 /// records the ordered calls so the restore-order and offset-repaint tests can
 /// assert against them.
 pub trait OuterTerminal {
@@ -123,26 +128,38 @@ pub trait OuterTerminal {
     fn disable_raw_mode(&mut self) -> io::Result<()>;
 }
 
-/// The real outer terminal, backed by crossterm against stdout.
+/// Opens the controlling terminal for writing — the band's sink.
+///
+/// The open doubles as gutter's terminal guard: `/dev/tty` resolves only for a
+/// process that has a controlling terminal, so a failure here means there is no
+/// screen to render a band on.
+pub fn open_tty_write() -> io::Result<File> {
+    OpenOptions::new().write(true).open("/dev/tty")
+}
+
+/// The real outer terminal, backed by crossterm against the controlling terminal.
 pub struct CrosstermTerminal {
-    out: io::Stdout,
+    /// Buffered: one `move_to` is several small writes, and unbuffered they would
+    /// be several syscalls. Every write here is landed by an explicit flush — no
+    /// destructor runs before `process::exit` (ADR-010).
+    out: BufWriter<File>,
     /// Whether mouse capture was enabled at startup, so teardown disables only
     /// what it set.
     mouse_enabled: bool,
 }
 
 impl CrosstermTerminal {
-    pub fn new() -> Self {
+    pub fn new(tty: File) -> Self {
         Self {
-            out: io::stdout(),
+            out: BufWriter::new(tty),
             mouse_enabled: false,
         }
     }
-}
 
-impl Default for CrosstermTerminal {
-    fn default() -> Self {
-        Self::new()
+    /// The band's sink, for the startup CPR probe: its query has to leave by the
+    /// same terminal the reply comes back from.
+    pub fn writer(&mut self) -> &mut impl Write {
+        &mut self.out
     }
 }
 
