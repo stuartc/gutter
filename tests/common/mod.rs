@@ -20,15 +20,28 @@ pub fn pty_guard() -> MutexGuard<'static, ()> {
 }
 
 /// Spawn gutter under a real `cols × rows` outer PTY wrapping `gutter_args` (a
-/// single string, so the inner `sh` parses any nested quoting).
-pub fn spawn_gutter(cols: u16, rows: u16, gutter_args: &str) -> OsSession {
+/// single string, so the inner `sh` parses any nested quoting), with the band
+/// anchored at `anchor_row` and after `prelude` — `;`-terminated shell commands, or
+/// `""` — has run on the outer terminal.
+pub fn spawn_gutter_anchored(
+    cols: u16,
+    rows: u16,
+    anchor_row: u16,
+    prelude: &str,
+    gutter_args: &str,
+) -> OsSession {
     let script = format!(
-        "stty cols {cols} rows {rows}; exec env GUTTER_FORCE_ANCHOR_ROW=0 TERM=xterm-256color {} {gutter_args}",
+        "stty cols {cols} rows {rows}; {prelude} exec env GUTTER_FORCE_ANCHOR_ROW={anchor_row} TERM=xterm-256color {} {gutter_args}",
         env!("CARGO_BIN_EXE_gutter")
     );
-    let mut cmd = std::process::Command::new("/bin/sh");
+    let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(script);
     OsSession::spawn(cmd).expect("spawn gutter under PTY")
+}
+
+/// [`spawn_gutter_anchored`] at row 0 with nothing seeded on the outer terminal.
+pub fn spawn_gutter(cols: u16, rows: u16, gutter_args: &str) -> OsSession {
+    spawn_gutter_anchored(cols, rows, 0, "", gutter_args)
 }
 
 /// Spawn gutter directly (no shell in between) wrapping `child_argv`, under a real
@@ -74,24 +87,26 @@ pub fn spawn_gutter_probing(cols: u16, rows: u16, gutter_args: &str) -> OsSessio
     OsSession::spawn(cmd).expect("spawn gutter under PTY")
 }
 
-/// Play terminal for the startup probe: read the outer PTY until gutter's `ESC[6n`
-/// query appears, then answer `ESC[<row>;1R` the way a real terminal would. Panics
-/// if the query never arrives. Must beat `CPR_TIMEOUT`, hence the tight poll.
-pub fn answer_cpr(session: &mut OsSession, row_1based: u16, deadline: Duration) {
-    use std::io::Write;
-    let mut seen = Vec::new();
+/// Poll the outer PTY with non-blocking reads until `done` accepts everything read
+/// so far or `deadline` elapses, returning the elapsed time and every byte read.
+/// Stops early on EOF. The non-blocking reads are what make the deadline a real cap
+/// even while the child holds the PTY open.
+pub fn poll_until(
+    session: &mut OsSession,
+    deadline: Duration,
+    interval: Duration,
+    mut done: impl FnMut(&[u8]) -> bool,
+) -> (Duration, Vec<u8>) {
+    let mut out = Vec::new();
     let mut buf = [0u8; 8192];
     let start = Instant::now();
     while start.elapsed() < deadline {
         match session.try_read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                seen.extend_from_slice(&buf[..n]);
-                if find(&seen, b"\x1b[6n").is_some() {
-                    let reply = format!("\x1b[{row_1based};1R");
-                    session.write_all(reply.as_bytes()).expect("answer the CPR");
-                    session.flush().expect("flush the CPR answer");
-                    return;
+                out.extend_from_slice(&buf[..n]);
+                if done(&out) {
+                    break;
                 }
             }
             Err(ref e)
@@ -99,30 +114,31 @@ pub fn answer_cpr(session: &mut OsSession, row_1based: u16, deadline: Duration) 
                     || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => break,
         }
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::sleep(interval);
     }
-    panic!("gutter never sent its CPR query (ESC[6n)");
+    (start.elapsed(), out)
 }
 
-/// Drain a bounded wall-clock window with non-blocking reads, returning every byte
-/// the outer terminal saw. The non-blocking reads are what make the window a real
-/// cap even while the child holds the PTY open. Stops early on EOF.
+/// Play terminal for the startup probe: read the outer PTY until gutter's `ESC[6n`
+/// query appears, then answer `ESC[<row>;1R` the way a real terminal would. Panics
+/// if the query never arrives. Must beat `CPR_TIMEOUT`, hence the 1 ms poll.
+pub fn answer_cpr(session: &mut OsSession, row_1based: u16, deadline: Duration) {
+    use std::io::Write;
+    let (_, seen) = poll_until(session, deadline, Duration::from_millis(1), |b| {
+        find(b, b"\x1b[6n").is_some()
+    });
+    assert!(
+        find(&seen, b"\x1b[6n").is_some(),
+        "gutter never sent its CPR query (ESC[6n)"
+    );
+    let reply = format!("\x1b[{row_1based};1R");
+    session.write_all(reply.as_bytes()).expect("answer the CPR");
+    session.flush().expect("flush the CPR answer");
+}
+
+/// Drain a bounded wall-clock window, returning every byte the outer terminal saw.
 pub fn drain_window(session: &mut OsSession, window: Duration) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    let start = Instant::now();
-    while start.elapsed() < window {
-        match session.try_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    out
+    poll_until(session, window, Duration::from_millis(3), |_| false).1
 }
 
 /// Where `needle` first appears in `hay`.
@@ -130,13 +146,45 @@ pub fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// A screen's rows joined to a single string, so a test can search for content
+/// regardless of which row it landed on.
+pub fn screen_text(screen: &vt100::Screen, cols: u16) -> String {
+    screen.rows(0, cols).collect::<Vec<_>>().join("\n")
+}
+
 /// The outer terminal's bytes parsed at its physical size and joined to a single
-/// string, so a test can search for echoed content regardless of which row it
-/// landed on.
+/// string.
 pub fn grid_text(bytes: &[u8], cols: u16, rows: u16) -> String {
-    let mut parser = vt100::Parser::new(rows, cols, 0);
-    parser.process(bytes);
-    parser.screen().rows(0, cols).collect::<Vec<_>>().join("\n")
+    let parser = outer_grid(bytes, cols, rows);
+    screen_text(parser.screen(), cols)
+}
+
+/// The first non-empty row's trimmed text, or "" if the screen is blank.
+pub fn first_content_row(screen: &vt100::Screen, cols: u16) -> String {
+    screen
+        .rows(0, cols)
+        .map(|r| r.trim_end().to_string())
+        .find(|r| !r.is_empty())
+        .unwrap_or_default()
+}
+
+/// Whether `tag` is anywhere in the parsed stream at any of the scrollback
+/// `offsets` (in rows back from the visible window). Leaves the view at offset 0.
+pub fn recoverable_from_scrollback(
+    parser: &mut vt100::Parser,
+    cols: u16,
+    tag: &str,
+    offsets: std::ops::RangeInclusive<usize>,
+) -> bool {
+    for offset in offsets {
+        parser.screen_mut().set_scrollback(offset);
+        if screen_text(parser.screen(), cols).contains(tag) {
+            parser.screen_mut().set_scrollback(0);
+            return true;
+        }
+    }
+    parser.screen_mut().set_scrollback(0);
+    false
 }
 
 /// Run a child that emits `emit` and lingers, and return everything the outer
@@ -153,26 +201,10 @@ pub fn outer_bytes_for(emit: &str) -> Vec<u8> {
 /// child blocked on an unanswered query only emits its marker once its own read
 /// times out.
 pub fn read_until(session: &mut OsSession, marker: &str, deadline: Duration) -> (Duration, String) {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 8192];
-    let start = Instant::now();
-    while start.elapsed() < deadline {
-        match session.try_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                out.extend_from_slice(&buf[..n]);
-                if String::from_utf8_lossy(&out).contains(marker) {
-                    break;
-                }
-            }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
-    (start.elapsed(), String::from_utf8_lossy(&out).into_owned())
+    let (elapsed, out) = poll_until(session, deadline, Duration::from_millis(3), |b| {
+        String::from_utf8_lossy(b).contains(marker)
+    });
+    (elapsed, String::from_utf8_lossy(&out).into_owned())
 }
 
 /// The outer terminal's bytes parsed at its physical size, so a test can inspect

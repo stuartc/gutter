@@ -1,4 +1,4 @@
-//! SGR mouse forwarding PTY round-trips (slice 07 acceptance criteria).
+//! SGR mouse forwarding PTY round-trips.
 //!
 //! Mouse reports are the one keystroke-shaped thing gutter does NOT pass through:
 //! their coordinates carry the band's left margin, so gutter's own scanner
@@ -31,16 +31,14 @@ use std::io::Write;
 use std::time::Duration;
 
 mod common;
-use common::{drain_window, grid_text, spawn_gutter};
+use common::{drain_window, grid_text, pty_guard, spawn_gutter};
 
 /// A child that negotiates SGR press/release mouse, then idles. The tty driver is
 /// in cooked mode, so any bytes gutter forwards to the child's stdin are echoed
 /// back in caret notation (`ESC` → `^[`) and rendered onto gutter's band — the
 /// child-side oracle. The long `sleep` keeps the child alive so the echo stays on
 /// the live alt-screen frame the drain captures.
-fn sgr_mouse_child() -> String {
-    "/bin/sh -c 'printf \"\\033[?1000h\\033[?1006h\"; sleep 5'".to_string()
-}
+const SGR_MOUSE_CHILD: &str = "/bin/sh -c 'printf \"\\033[?1000h\\033[?1006h\"; sleep 5'";
 
 /// **First post-negotiation click delivered AND margin subtracted.** The child
 /// negotiates SGR mouse; gutter runs centred in a 120-col outer with `--width 40`
@@ -50,8 +48,8 @@ fn sgr_mouse_child() -> String {
 /// negotiation — the dropped-first-click race is gone by construction.
 #[test]
 fn first_click_delivered_with_margin_subtracted() {
-    let child = sgr_mouse_child();
-    let mut session = spawn_gutter(120, 40, &format!("--width 40 --center {child}"));
+    let _g = pty_guard();
+    let mut session = spawn_gutter(120, 40, &format!("--width 40 --center {SGR_MOUSE_CHILD}"));
     // Let gutter come up and the child negotiate mouse (vt100 must see the DECSET
     // so the gate forwards — eager capture is already on the outer terminal).
     std::thread::sleep(Duration::from_millis(600));
@@ -79,8 +77,8 @@ fn first_click_delivered_with_margin_subtracted() {
 /// so no echoed SGR report appears on the band.
 #[test]
 fn gutter_click_delivers_nothing() {
-    let child = sgr_mouse_child();
-    let mut session = spawn_gutter(120, 40, &format!("--width 40 --center {child}"));
+    let _g = pty_guard();
+    let mut session = spawn_gutter(120, 40, &format!("--width 40 --center {SGR_MOUSE_CHILD}"));
     std::thread::sleep(Duration::from_millis(600));
 
     // Click at wire col 6 (0-based phys 5) — left of the margin-40 band.
@@ -106,8 +104,8 @@ fn gutter_click_delivers_nothing() {
 /// decoded button is what loses it.
 #[test]
 fn shift_click_keeps_the_modifier_bit() {
-    let child = sgr_mouse_child();
-    let mut session = spawn_gutter(120, 40, &format!("--width 40 --center {child}"));
+    let _g = pty_guard();
+    let mut session = spawn_gutter(120, 40, &format!("--width 40 --center {SGR_MOUSE_CHILD}"));
     std::thread::sleep(Duration::from_millis(600));
 
     session.write_all(b"\x1b[<4;46;5M").unwrap();

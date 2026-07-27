@@ -1,4 +1,4 @@
-//! PTY-driven integration tests (the slice-02 acceptance criteria).
+//! PTY-driven integration tests.
 //!
 //! These drive the real `gutter` binary through a real PTY (via `expectrl` /
 //! `ptyprocess`) and assert on what the child and the outer terminal actually
@@ -30,23 +30,9 @@ use std::time::{Duration, Instant};
 
 mod common;
 use common::{
-    assert_cols_blank, drain_window, first_painted_col, outer_grid, pty_guard, spawn_gutter,
-    wait_exit,
+    assert_cols_blank, drain_window, first_content_row, first_painted_col, outer_grid, pty_guard,
+    recoverable_from_scrollback, screen_text, spawn_gutter, wait_exit,
 };
-
-/// The first non-empty row's trimmed text, or "" if the screen is blank.
-fn first_content_row(screen: &vt100::Screen, cols: u16) -> String {
-    screen
-        .rows(0, cols)
-        .map(|r| r.trim_end().to_string())
-        .find(|r| !r.is_empty())
-        .unwrap_or_default()
-}
-
-/// Assert the gutter columns `[band, outer)` hold no painted glyph on any row.
-fn assert_gutters_empty(screen: &vt100::Screen, band: u16, outer_cols: u16, rows: u16) {
-    assert_cols_blank(screen, band, outer_cols, rows);
-}
 
 /// **Child sees `COLUMNS == W`** — asserted from inside the child (`stty size`
 /// prints `rows W`), not from gutter internals. gutter sizes the child PTY to
@@ -167,7 +153,7 @@ fn content_in_band_gutters_empty() {
         row0.starts_with("HELLO_FROM_THE_BAND"),
         "content must start at the left margin (row 0 = {row0:?})"
     );
-    assert_gutters_empty(screen, 100, 120, 40);
+    assert_cols_blank(screen, 100, 120, 40);
 }
 
 /// **Cursor tracking.** After the repaint the real cursor lands inside the band
@@ -234,15 +220,7 @@ fn vim_renders_inside_band() {
         "vim edit must render at the band's left margin (row 0 = {row0:?})"
     );
     // Content stays inside the band — gutter columns still empty.
-    for c in 100..120u16 {
-        if let Some(cell) = screen.cell(0, c) {
-            let s = cell.contents();
-            assert!(
-                s.is_empty() || s == " ",
-                "vim content must not bleed into the gutter at col {c}"
-            );
-        }
-    }
+    assert_cols_blank(screen, 100, 120, 1);
 
     // Quit vim without saving so the process exits cleanly.
     session.write_all(b"\x1b:q!\r").unwrap();
@@ -386,21 +364,20 @@ fn multi_mb_scroll_stays_bounded() {
         .any(|row| row.contains("of the flood test"));
     assert!(shows_flood, "the settled frame must show flood output");
     // Even under a flood the band edge holds — no bleed into the gutter.
-    assert_gutters_empty(screen, 100, 120, 40);
+    assert_cols_blank(screen, 100, 120, 40);
 
     // Drop the session explicitly so the child (and its `sleep`) is reaped now.
     drop(session);
 }
 
-/// **Scroll-off survival (the slice-04 gate, ADR-013).** A plain command that
+/// **Scroll-off survival (ADR-013).** A plain command that
 /// prints MORE than one screenful on the primary screen — 40 distinctly-tagged
 /// lines on a 24-row terminal — must have its early (scrolled-off) lines reach the
 /// **real terminal's own scrollback**, present in the drained bytes even though
 /// they are NOT in the visible last screenful. gutter keeps vt100 at
 /// `scrollback=0` and emits each departed top line into the terminal as it scrolls
 /// off, so the early tags appear in the stream via the scroll emit, not the band
-/// repaint. This flips the scroll-off case from slice 03's "last screenful
-/// survives" to "all lines reach scrollback".
+/// repaint. Not just "the last screenful survives" — every line reaches scrollback.
 ///
 /// The child paces one line per ~25ms so each render frame advances roughly one
 /// line — the count-based emit then captures every departed line deterministically
@@ -427,14 +404,14 @@ fn scroll_off_lines_reach_real_terminal_scrollback() {
     // Parse the outer-terminal bytes through a vt100 WITH scrollback — modelling
     // the real terminal's own scrollback store. The discriminator: with the scroll
     // emit, each departed top line was `\r\n`-advanced into scrollback, so the
-    // early lines survive in the scrollback region; without it (slice 03's in-place
-    // `[0, rows)` repaint) they would have been overwritten and NOT recoverable.
+    // early lines survive in the scrollback region; an in-place `[0, rows)` repaint
+    // would have overwritten them, leaving them NOT recoverable.
     let mut parser = vt100::Parser::new(24, 80, 1000);
     parser.process(&bytes);
 
     // The final visible frame (offset 0) holds the LAST screenful — the early
     // lines must NOT be visible there (they scrolled off).
-    let visible_text: String = parser.screen().rows(0, 80).collect::<Vec<_>>().join("\n");
+    let visible_text = screen_text(parser.screen(), 80);
     assert!(
         !visible_text.contains("SCROLLTAG-00"),
         "the earliest line must have scrolled OFF the visible window, but it is \
@@ -446,22 +423,10 @@ fn scroll_off_lines_reach_real_terminal_scrollback() {
     );
 
     // Scroll the view up through the scrollback and assert the early scrolled-off
-    // lines are recoverable from the terminal's own scrollback — the slice-04 gate.
-    // Without the scroll emit these lines were repainted in place at `[0, rows)`
-    // and overwritten, so they would NOT be in scrollback.
-    let recovered = |parser: &mut vt100::Parser, tag: &str| -> bool {
-        for offset in 1..=60 {
-            parser.screen_mut().set_scrollback(offset);
-            let text: String = parser.screen().rows(0, 80).collect::<Vec<_>>().join("\n");
-            if text.contains(tag) {
-                return true;
-            }
-        }
-        false
-    };
+    // lines are recoverable from the terminal's own scrollback.
     for tag in ["SCROLLTAG-00", "SCROLLTAG-01", "SCROLLTAG-02", "SCROLLTAG-03"] {
         assert!(
-            recovered(&mut parser, tag),
+            recoverable_from_scrollback(&mut parser, 80, tag, 1..=60),
             "early scrolled-off line {tag:?} must reach the real terminal's own \
              scrollback (recoverable by scrolling back), got {} bytes of stream",
             bytes.len()
@@ -475,8 +440,8 @@ fn scroll_off_lines_reach_real_terminal_scrollback() {
     );
 }
 
-/// **Scroll-off survival under a COALESCED BURST (the slice-04 gate's hard case,
-/// ADR-007 + ADR-013).** The same > rows print, but emitted as fast as the child
+/// **Scroll-off survival under a COALESCED BURST (ADR-007 + ADR-013).** The same
+/// more-than-a-screenful print, but emitted as fast as the child
 /// can — no per-line pacing — so the render loop drains a whole 16 ms window of
 /// PTY bytes into the parser before one `render_once`, advancing the content by
 /// far more than one band-height in a single frame (the real `cat largefile` /
@@ -487,7 +452,7 @@ fn scroll_off_lines_reach_real_terminal_scrollback() {
 /// machinery) still lands every departed line in the real terminal's scrollback.
 ///
 /// This is the discriminator the paced test cannot make: it deliberately drives a
-/// single-frame advance >= the band height, the exact gap the verifier flagged.
+/// single-frame advance >= the band height.
 #[test]
 fn scroll_off_burst_reaches_scrollback_without_pacing() {
     let _guard = pty_guard();
@@ -511,7 +476,7 @@ fn scroll_off_burst_reaches_scrollback_without_pacing() {
 
     // The final visible frame holds the LAST screenful; the earliest line scrolled
     // off and the last line is visible.
-    let visible_text: String = parser.screen().rows(0, 80).collect::<Vec<_>>().join("\n");
+    let visible_text = screen_text(parser.screen(), 80);
     assert!(
         !visible_text.contains("BURSTTAG-000"),
         "the earliest burst line must have scrolled OFF the visible window: {visible_text:?}"
@@ -523,16 +488,6 @@ fn scroll_off_burst_reaches_scrollback_without_pacing() {
 
     // The early lines — including ones that arrived and left within a single
     // coalesced frame — must be recoverable from the terminal's own scrollback.
-    let recovered = |parser: &mut vt100::Parser, tag: &str| -> bool {
-        for offset in 1..=200 {
-            parser.screen_mut().set_scrollback(offset);
-            let text: String = parser.screen().rows(0, 80).collect::<Vec<_>>().join("\n");
-            if text.contains(tag) {
-                return true;
-            }
-        }
-        false
-    };
     // Sample across the whole departed range, including the middle (the lines most
     // likely to have arrived-and-departed inside one coalesced frame).
     for tag in [
@@ -543,7 +498,7 @@ fn scroll_off_burst_reaches_scrollback_without_pacing() {
         "BURSTTAG-090",
     ] {
         assert!(
-            recovered(&mut parser, tag),
+            recoverable_from_scrollback(&mut parser, 80, tag, 1..=200),
             "burst-scrolled-off line {tag:?} must reach scrollback under coalescing \
              (the count-based emit must not drop a whole-frame turnover), got {} \
              bytes of stream",
@@ -558,12 +513,12 @@ fn scroll_off_burst_reaches_scrollback_without_pacing() {
     );
 }
 
-/// **Non-zero exit shows the dim `Exited with: N` status line (slice 02/03,
-/// reworked as the inline hand-back in slice 10/ADR-013).** A plain child that prints
+/// **Non-zero exit shows the dim `Exited with: N` status line (the inline hand-back,
+/// ADR-013).** A plain child that prints
 /// inline output and then exits non-zero: gutter mirrors the child's mode (ADR-012),
 /// so it never forces the alt screen, and the teardown hand-back emits the dim
 /// `\r\n\x1b[2mExited with: N\x1b[0m` below the band on exit. The hand-back is gated
-/// on the positive `ever_painted_inline` signal (slice 10/ADR-013): the status line
+/// on the positive `ever_painted_inline` signal (ADR-013): the status line
 /// captions the band, so it surfaces when a non-zero exit follows real inline output.
 /// Asserted on the raw teardown bytes: the status line is present AND gutter never
 /// emits `?1049h`/`?1049l` for this plain command.
@@ -594,7 +549,7 @@ fn non_zero_exit_shows_dim_status_line() {
     );
 }
 
-/// **A no-output non-zero exit is silent (slice 10/ADR-013, BUG[1]).** The inline
+/// **A no-output non-zero exit is silent (ADR-013).** The inline
 /// hand-back is gated on `ever_painted_inline` alone, never the exit code: a child
 /// that prints nothing (`gutter false`) has no band to caption, so no dim status
 /// line is stamped onto the restored shell — and crucially the exit code still
@@ -620,7 +575,7 @@ fn no_output_nonzero_exit_is_silent() {
     );
 }
 
-/// **Zero exit is silent (slice 02/03).** A plain child that exits cleanly:
+/// **Zero exit is silent.** A plain child that exits cleanly:
 /// gutter must emit NO status line — a clean run leaves a clean screen — and,
 /// mirroring the child's mode (ADR-012), must never enter or leave the alt screen
 /// for a plain command. Asserted on the raw teardown bytes.

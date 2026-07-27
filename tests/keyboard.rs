@@ -41,21 +41,26 @@ fn band_text(bytes: &[u8]) -> String {
 }
 
 /// A `cat -v` child in raw mode: what it prints is a caret-notation transcript of
-/// exactly the bytes that reached it.
-const CARET_ECHO_CHILD: &str = "/bin/sh -c 'stty raw -echo; exec cat -v'";
+/// exactly the bytes that reached it. It announces `READY` once its own `stty raw`
+/// has landed — a `0x1A` written before that is SUSP and stops the child instead of
+/// reaching `cat`, so waiting on a fixed sleep is a race rather than a delay.
+const CARET_ECHO_CHILD: &str = "/bin/sh -c 'stty raw -echo; printf READY; exec cat -v'";
 
 /// The same child without `-v`, for the cases where caret notation would obscure
 /// what is being asserted (`cat -v` renders every non-ASCII byte as `M-…`).
-const RAW_ECHO_CHILD: &str = "/bin/sh -c 'stty raw -echo; exec cat'";
+const RAW_ECHO_CHILD: &str = "/bin/sh -c 'stty raw -echo; printf READY; exec cat'";
 
 /// Write `payload` into a fresh `cat -v` session and return the band transcript.
 fn transcript(payload: &[u8]) -> String {
     echo_transcript(CARET_ECHO_CHILD, payload)
 }
 
+/// Write `payload` once the child has announced itself, and return the band
+/// transcript.
 fn echo_transcript(child: &str, payload: &[u8]) -> String {
     let mut session = spawn_gutter(OUTER_COLS, OUTER_ROWS, &format!("--width 100 {child}"));
-    std::thread::sleep(Duration::from_millis(400));
+    let (_, seen) = read_until(&mut session, "READY", Duration::from_secs(5));
+    assert!(seen.contains("READY"), "the child never came up");
 
     session.write_all(payload).unwrap();
     session.flush().unwrap();
@@ -129,32 +134,6 @@ fn modified_and_alt_keys_arrive_byte_identical() {
     assert_all_arrive(cases, "must arrive byte-identical");
 }
 
-/// The same child, announcing itself once its own `stty raw` has landed.
-const READY_CARET_ECHO_CHILD: &str =
-    "/bin/sh -c 'stty raw -echo; printf READY; exec cat -v'";
-
-/// Write `payload` only once the child has printed `READY`, and return the band
-/// transcript. For payloads carrying a byte the line discipline would act on: a
-/// `0x1A` written before the child's `stty raw` lands is SUSP, and stops the child
-/// instead of reaching `cat`, so a fixed sleep is a race rather than a delay.
-fn ready_transcript(payload: &[u8]) -> String {
-    let mut session = spawn_gutter(
-        OUTER_COLS,
-        OUTER_ROWS,
-        &format!("--width 100 {READY_CARET_ECHO_CHILD}"),
-    );
-    let (_, seen) = read_until(&mut session, "READY", Duration::from_secs(5));
-    assert!(seen.contains("READY"), "the child never came up");
-
-    session.write_all(payload).unwrap();
-    session.flush().unwrap();
-
-    let bytes = drain_window(&mut session, Duration::from_millis(700));
-    let text = band_text(&bytes);
-    drop(session);
-    text
-}
-
 /// The bare control bytes, which have no escape-sequence shape for the scanner to
 /// recognise and so must simply fall through. `0x7f` is what Backspace sends on
 /// nearly every terminal; `0x1a` is the byte a cooked-mode Ctrl-Z relies on
@@ -162,7 +141,7 @@ fn ready_transcript(payload: &[u8]) -> String {
 #[test]
 fn bare_control_bytes_reach_the_child() {
     let _g = pty_guard();
-    let text = ready_transcript(b"A\x7fB\x1aC");
+    let text = transcript(b"A\x7fB\x1aC");
     assert!(
         text.contains("A^?B^ZC"),
         "DEL and SUB must arrive verbatim; transcript was {text:?}"
@@ -202,7 +181,7 @@ fn the_reserved_chord_byte_never_reaches_the_child() {
 /// A `cat -v` child that first asks its terminal to bracket pastes, so gutter
 /// mirrors `?2004h` outward and the scanner's paste gate is live (ADR-022).
 const PASTE_ECHO_CHILD: &str =
-    "/bin/sh -c 'stty raw -echo; printf \"\\033[?2004h\"; exec cat -v'";
+    "/bin/sh -c 'stty raw -echo; printf \"\\033[?2004hREADY\"; exec cat -v'";
 
 /// **A pasted chord byte is text.** Under the guards nothing is interpreted, so the
 /// `0x1C` that would otherwise open resize mode mid-paste reaches the child like any

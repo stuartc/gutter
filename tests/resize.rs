@@ -1,5 +1,5 @@
-//! PTY-driven integration tests for slice 05 (resize + `--center`/`--left` +
-//! proportional `--width Npct`).
+//! PTY-driven integration tests for resize, `--center`/`--left` and proportional
+//! `--width Npct`.
 //!
 //! These drive the real `gutter` binary through a real PTY (via `expectrl` /
 //! `ptyprocess`) and assert on what the outer terminal actually shows — never on
@@ -22,7 +22,9 @@
 use std::time::Duration;
 
 mod common;
-use common::{assert_cols_blank, drain_window, first_painted_col, outer_grid, spawn_gutter};
+use common::{
+    assert_cols_blank, drain_window, first_content_row, first_painted_col, outer_grid, spawn_gutter,
+};
 
 /// **`--center` centres the band with gutters on BOTH sides.** Outer 120,
 /// `--width 100` → margin (120-100)/2 = 10. Content fills row 0; it must start at
@@ -71,12 +73,7 @@ fn proportional_width_pct_at_launch() {
     let bytes = drain_window(&mut session, Duration::from_millis(800));
 
     let parser = outer_grid(&bytes, 200, 40);
-    let row = parser
-        .screen()
-        .rows(0, 200)
-        .map(|r| r.trim_end().to_string())
-        .find(|r| !r.is_empty())
-        .unwrap_or_default();
+    let row = first_content_row(parser.screen(), 200);
     // 50% of 200 = 100 columns.
     assert!(
         row.contains("100"),
@@ -91,12 +88,7 @@ fn proportional_width_percent_alias_at_launch() {
     let bytes = drain_window(&mut session, Duration::from_millis(800));
 
     let parser = outer_grid(&bytes, 160, 40);
-    let row = parser
-        .screen()
-        .rows(0, 160)
-        .map(|r| r.trim_end().to_string())
-        .find(|r| !r.is_empty())
-        .unwrap_or_default();
+    let row = first_content_row(parser.screen(), 160);
     // 50% of 160 = 80.
     assert!(
         row.contains("80"),

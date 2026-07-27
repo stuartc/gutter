@@ -1,5 +1,5 @@
-//! Slice-08 end-to-end Definition-of-Done re-runs against the real-target
-//! fixture, driven through the real `gutter` binary over a real PTY.
+//! End-to-end re-runs against the real-target fixture, driven through the real
+//! `gutter` binary over a real PTY.
 //!
 //! These re-exercise existing code paths (resize ordering, the ADR-010 restore
 //! chain) on the *real* Claude Code byte stream — denser and weirder than any
@@ -18,78 +18,20 @@
 
 use std::time::Duration;
 
-use expectrl::session::OsSession;
-
 mod common;
-use common::{assert_cols_blank, drain_window, outer_grid, wait_exit};
+use common::{
+    assert_cols_blank, drain_window, outer_grid, recoverable_from_scrollback, screen_text,
+    spawn_gutter, spawn_gutter_anchored, wait_exit,
+};
 
-fn gutter_bin() -> String {
-    env!("CARGO_BIN_EXE_gutter").to_string()
+/// A checked-in fixture's path, so a shell child can `cat` it into gutter (the
+/// same bytes the offline gate replays).
+fn fixture(name: &str) -> String {
+    format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
-/// The checked-in real-target fixture, on disk so a shell child can `cat` it
-/// into gutter (the same bytes the offline gate replays).
-fn fixture_path() -> String {
-    format!("{}/tests/fixtures/claude-code-flow.cast", env!("CARGO_MANIFEST_DIR"))
-}
-
-/// The plain non-alt-screen scrolling fixture (slice 06, A2): SGR-coloured lines
-/// past one screenful, no `?1049h`, ending in a marker line.
-fn plain_scroll_path() -> String {
-    format!("{}/tests/fixtures/plain-scroll.cast", env!("CARGO_MANIFEST_DIR"))
-}
-
-/// The wide-char-at-band-edge fixture (slice 06, A2): a settled alt-screen frame
-/// with CJK glyphs and an emoji at the band edge. Shared with the offline gate;
-/// here it feeds the resize content-equivalence assertion (the wide glyphs must
-/// re-wrap correctly when the band width changes — only an E2E test can resize).
-fn wide_edge_path() -> String {
-    format!("{}/tests/fixtures/wide-edge.cast", env!("CARGO_MANIFEST_DIR"))
-}
-
-/// Run gutter inside an outer terminal of the given size, wrapping a shell child
-/// that emits the fixture bytes (via `cat`) then idles so the live frame is
-/// captured.
-fn gutter_replaying_fixture(
-    outer_cols: u16,
-    outer_rows: u16,
-    gutter_flags: &str,
-    fixture: &str,
-) -> OsSession {
-    // The child: dump the recorded stream, then sleep so gutter's live frame
-    // stays painted for the capture window.
-    let child = format!("/bin/sh -c 'cat {fixture}; sleep 4'");
-    let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_flags} {child}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    OsSession::spawn(cmd).expect("spawn gutter under PTY")
-}
-
-/// Run gutter wrapping a shell child that `cat`s the fixture at `fixture` then
-/// **exits** (no idle tail) — so teardown runs and the test reads the post-exit
-/// stream. The mirror of [`gutter_replaying_fixture`] for the cases that drain
-/// through teardown (the plain-command primary-screen regression).
-fn gutter_replaying_then_exit(
-    outer_cols: u16,
-    outer_rows: u16,
-    gutter_flags: &str,
-    fixture: &str,
-) -> OsSession {
-    let child = format!("/bin/sh -c 'cat {fixture}; exit 0'");
-    let script = format!(
-        "stty cols {outer_cols} rows {outer_rows}; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} {gutter_flags} {child}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    OsSession::spawn(cmd).expect("spawn gutter under PTY")
-}
-
-/// **Reverse-video statusline highlight stops at the band edge (slice 09, the
-/// Bug B end-to-end gate).** A child paints a full-width reverse-video row — the
+/// **Reverse-video statusline highlight stops at the band edge.**
+/// A child paints a full-width reverse-video row — the
 /// nvim/Claude statusline: `ESC[7m` then a row-final `ESC[K` (attributed-but-
 /// empty, the single unbounded sequence vt100 emits) — across the band, then
 /// idles. Through the real gutter binary at a centred band, the highlight must
@@ -106,13 +48,7 @@ fn reverse_video_statusline_highlight_stops_at_band_edge() {
     // frame is captured cleanly, paint a full-width reverse-video row, then idle.
     let child =
         "/bin/sh -c 'printf \"\\033[?1049h\\033[?25l\\033[1;1H\\033[7m\\033[K\"; sleep 4'";
-    let script = format!(
-        "stty cols 80 rows 24; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} --width 60 --center {child}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    let mut session = OsSession::spawn(cmd).expect("spawn gutter under PTY");
+    let mut session = spawn_gutter(80, 24, &format!("--width 60 --center {child}"));
 
     let bytes = drain_window(&mut session, Duration::from_millis(900));
     assert!(!bytes.is_empty(), "gutter must paint the statusline frame");
@@ -150,9 +86,9 @@ fn reverse_video_statusline_highlight_stops_at_band_edge() {
     drop(session);
 }
 
-/// **End-to-end resize-stress against the live-target fixture (slice 05's
-/// guarantee re-run on real content), now with wide-line content equivalence
-/// (slice 06, A2).** Replay the **wide-edge** fixture — CJK glyphs and an emoji
+/// **End-to-end resize-stress against the live-target fixture, with wide-line
+/// content equivalence.** Replay the **wide-edge** fixture — a settled alt-screen
+/// frame with CJK glyphs and an emoji
 /// laid at the band edge, reflow-sensitive content the alt-screen keystone can't
 /// reach — through gutter, then drive a sequence of outer resizes. Assert gutter
 /// survives every resize with no panic (the binary stays alive and keeps
@@ -170,7 +106,14 @@ fn resize_stress_against_fixture_no_panic_no_stale_gutter() {
     // Absolute --width 80 (the width the wide-edge fixture was recorded at),
     // centred so a resize moves the margin and would strand cells if the gutter
     // clear failed. The child idles after the cat so the live frame stays painted.
-    let mut session = gutter_replaying_fixture(120, 30, "--width 80 --center", &wide_edge_path());
+    let mut session = spawn_gutter(
+        120,
+        30,
+        &format!(
+            "--width 80 --center /bin/sh -c 'cat {}; sleep 4'",
+            fixture("wide-edge.cast")
+        ),
+    );
 
     // Let the first frame land.
     let _ = drain_window(&mut session, Duration::from_millis(500));
@@ -205,7 +148,7 @@ fn resize_stress_against_fixture_no_panic_no_stale_gutter() {
     assert_cols_blank(screen, 0, 20, 30);
     assert_cols_blank(screen, 100, 120, 30);
 
-    // Content equivalence after the reflow (slice 06): the wide glyphs survive
+    // Content equivalence after the reflow: the wide glyphs survive
     // the resize stress, intact and inside the band's physical columns
     // `[20, 100)`. A wide glyph mangled by a bad re-wrap would lose its character
     // or strand a half in the gutter — both caught here. We assert at least one
@@ -230,7 +173,7 @@ fn resize_stress_against_fixture_no_panic_no_stale_gutter() {
 }
 
 /// **Plain non-alt-screen output survives to the primary screen (the E2
-/// regression, fixture-driven; slice 06, A2 + ADR-012).** Replay the checked-in
+/// regression, fixture-driven; ADR-012).** Replay the checked-in
 /// `plain-scroll.cast` — SGR-coloured lines past one screenful, ending in a
 /// marker line, that **never** emit `?1049h` — through the real gutter binary and
 /// drain through teardown. gutter must mirror the child's (primary) mode, never
@@ -239,13 +182,18 @@ fn resize_stress_against_fixture_no_panic_no_stale_gutter() {
 /// are NEVER emitted. This is the only corpus fixture that can catch E2 — every
 /// alt-screen fixture forces `?1049h` at phase 1, which is exactly why E2 is
 /// invisible to them.
-///
-/// Slice 03 (the E2 fix) has landed, so this passes directly. (Had it been built
-/// before slice 03 the DoD prescribed landing it `#[ignore]`d pointing at E2; it
-/// is not ignored because the fix is present.)
 #[test]
 fn plain_command_output_survives_to_primary_screen() {
-    let mut session = gutter_replaying_then_exit(80, 24, "--width 60 --left", &plain_scroll_path());
+    // The child exits rather than idling, so teardown runs and the test reads the
+    // post-exit stream.
+    let mut session = spawn_gutter(
+        80,
+        24,
+        &format!(
+            "--width 60 --left /bin/sh -c 'cat {}; exit 0'",
+            fixture("plain-scroll.cast")
+        ),
+    );
 
     // Drain through teardown: the output is on the primary screen, so it survives
     // (no forced alt screen to wipe it).
@@ -266,7 +214,7 @@ fn plain_command_output_survives_to_primary_screen() {
     let mut parser = vt100::Parser::new(24, 80, 1000);
     parser.process(&bytes);
 
-    let visible: String = parser.screen().rows(0, 80).collect::<Vec<_>>().join("\n");
+    let visible = screen_text(parser.screen(), 80);
     assert!(
         visible.contains("PLAIN-SCROLL-DONE-MARKER"),
         "the marker line must survive on the primary screen, got {visible:?}"
@@ -275,18 +223,8 @@ fn plain_command_output_survives_to_primary_screen() {
     // An earlier line that scrolled off the visible window must be recoverable
     // from the terminal's own scrollback — it was NOT discarded by an alt-screen
     // leave (the E2 bug), it scrolled into the real terminal's history.
-    let mut found_early = false;
-    for offset in 0..=80 {
-        parser.screen_mut().set_scrollback(offset);
-        let text: String = parser.screen().rows(0, 80).collect::<Vec<_>>().join("\n");
-        if text.contains("line 05") {
-            found_early = true;
-            break;
-        }
-    }
-    parser.screen_mut().set_scrollback(0);
     assert!(
-        found_early,
+        recoverable_from_scrollback(&mut parser, 80, "line 05", 0..=80),
         "an earlier line (line 05) must survive in the real terminal's scrollback, \
          not be discarded — the E2 regression"
     );
@@ -298,8 +236,7 @@ fn plain_command_output_survives_to_primary_screen() {
     );
 }
 
-/// **End-to-end child-exit-restore against the live target (slices 01/04/07
-/// restore ordering re-run on real content).** A child that replays the
+/// **End-to-end child-exit-restore against the live target.** A child that replays the
 /// fixture's alt-screen negotiation then exits mid-alt-screen with a specific
 /// code: gutter must fully restore the outer terminal (leave alt screen, show
 /// cursor) with NO keystroke and propagate the exit code.
@@ -309,13 +246,7 @@ fn child_exit_mid_alt_screen_restores_and_propagates_code() {
     // little, then exits 7 WHILE STILL in the alt screen — the wedged-alt-screen
     // failure mode the ADR-010 restore must prevent.
     let child = "/bin/sh -c 'printf \"\\033[?1049h\\033[?25l\\033[1;1Hclaude\"; exit 7'";
-    let script = format!(
-        "stty cols 100 rows 30; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} --width 70 --center {child}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    let mut session = OsSession::spawn(cmd).expect("spawn gutter under PTY");
+    let mut session = spawn_gutter(100, 30, &format!("--width 70 --center {child}"));
 
     // Read to the teardown this time — we WANT the restore sequence.
     let bytes = drain_window(&mut session, Duration::from_secs(3));
@@ -345,15 +276,9 @@ fn child_sees_band_width_while_replaying_fixture() {
     // Replace the idle tail with `stty size` so the child reports its columns.
     let child = format!(
         "/bin/sh -c 'cat {}; stty size; sleep 3'",
-        fixture_path()
+        fixture("claude-code-flow.cast")
     );
-    let script = format!(
-        "stty cols 120 rows 30; exec env GUTTER_FORCE_ANCHOR_ROW=0 {} --width 80 --left {child}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    let mut session = OsSession::spawn(cmd).expect("spawn gutter under PTY");
+    let mut session = spawn_gutter(120, 30, &format!("--width 80 --left {child}"));
 
     let bytes = drain_window(&mut session, Duration::from_millis(900));
     let parser = outer_grid(&bytes, 120, 30);
@@ -366,24 +291,19 @@ fn child_sees_band_width_while_replaying_fixture() {
     drop(session);
 }
 
-/// **Inline anchor no-top-overlap (slice 10 / ADR-013 — the gate for this slice).**
+/// **Inline anchor no-top-overlap (ADR-013).**
 /// Seed ten history lines on the real terminal, then launch gutter with the band
 /// anchored at row 10 (`GUTTER_FORCE_ANCHOR_ROW` — the kernel PTY can't answer the
 /// CPR query). A child prints three band lines and idles. The history above the
 /// anchor must survive untouched and the band must paint at physical rows `>= 10` —
-/// never over row 0, the absolute-paint overpaint this slice exists to fix. This is
-/// the test most likely to fail first if the offset paint regresses to absolute rows.
+/// never over row 0. This is the test most likely to fail first if the offset paint
+/// regresses to absolute rows.
 #[test]
 fn inline_anchor_does_not_overpaint_history_above() {
     let child = "/bin/sh -c 'printf \"BAND-A\\nBAND-B\\nBAND-C\"; sleep 4'";
     let seed = "i=1; while [ $i -le 10 ]; do printf 'HIST-%02d\\n' \"$i\"; i=$((i+1)); done;";
-    let script = format!(
-        "stty cols 80 rows 24; {seed} exec env GUTTER_FORCE_ANCHOR_ROW=10 {} --width 60 --left {child}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    let mut session = OsSession::spawn(cmd).expect("spawn gutter under PTY");
+    let mut session =
+        spawn_gutter_anchored(80, 24, 10, seed, &format!("--width 60 --left {child}"));
 
     let bytes = drain_window(&mut session, Duration::from_millis(900));
     assert!(!bytes.is_empty(), "gutter must paint the band frame");
@@ -398,7 +318,7 @@ fn inline_anchor_does_not_overpaint_history_above() {
         "history line 1 must survive at row 0, got {:?}",
         rows_text[0]
     );
-    // Row 0 was NOT overpainted by the band — the bug this slice fixes.
+    // Row 0 was NOT overpainted by the band.
     assert!(
         !rows_text[0].contains("BAND"),
         "the band must not overpaint the top of the screen, row 0 = {:?}",
@@ -417,7 +337,7 @@ fn inline_anchor_does_not_overpaint_history_above() {
     drop(session);
 }
 
-/// **Inline clean hand-back, zero and non-zero (slice 10 / ADR-013).** A plain child
+/// **Inline clean hand-back, zero and non-zero (ADR-013).** A plain child
 /// prints three lines from a mid-screen anchor (row 3) and exits. The lines survive
 /// on the primary screen, the final cursor lands on a **fresh line below** the band
 /// (a following prompt would not overlap it), and the dim status line is present
@@ -426,13 +346,8 @@ fn inline_anchor_does_not_overpaint_history_above() {
 fn inline_clean_hand_back_below_band() {
     for (exit_code, expect_status) in [(0i32, false), (5i32, true)] {
         let child = format!("/bin/sh -c \"printf 'HB-1\\nHB-2\\nHB-3'; exit {exit_code}\"");
-        let script = format!(
-            "stty cols 80 rows 24; exec env GUTTER_FORCE_ANCHOR_ROW=3 {} --width 60 --left {child}",
-            gutter_bin()
-        );
-        let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.arg("-c").arg(script);
-        let mut session = OsSession::spawn(cmd).expect("spawn gutter under PTY");
+        let mut session =
+            spawn_gutter_anchored(80, 24, 3, "", &format!("--width 60 --left {child}"));
 
         let bytes = drain_window(&mut session, Duration::from_secs(3));
         let s = String::from_utf8_lossy(&bytes);
@@ -475,23 +390,18 @@ fn inline_clean_hand_back_below_band() {
     }
 }
 
-/// **Inline mid-screen scroll-through preserves history (slice 10 / ADR-013).** Seed
+/// **Inline mid-screen scroll-through preserves history (ADR-013).** Seed
 /// twelve history lines, anchor the band mid-screen (row 12), and have the child
-/// print well past a screenful so the band fills, `base_row` reaches 0, and slice
-/// 04's scroll-emit engine takes over. The seeded history above the band must
+/// print well past a screenful so the band fills, `base_row` reaches 0, and the
+/// scroll-emit engine takes over. The seeded history above the band must
 /// survive into the **real terminal's own scrollback** through the `base_row → 0`
 /// transition, and the band's own early lines must reach scrollback too.
 #[test]
 fn inline_mid_screen_scroll_through_preserves_history() {
     let child = "/bin/sh -c 'i=0; while [ $i -lt 40 ]; do printf \"FLOW-%02d\\n\" \"$i\"; i=$((i+1)); done; sleep 1'";
     let seed = "i=1; while [ $i -le 12 ]; do printf 'OLD-%02d\\n' \"$i\"; i=$((i+1)); done;";
-    let script = format!(
-        "stty cols 80 rows 24; {seed} exec env GUTTER_FORCE_ANCHOR_ROW=12 {} --width 60 --left {child}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    let mut session = OsSession::spawn(cmd).expect("spawn gutter under PTY");
+    let mut session =
+        spawn_gutter_anchored(80, 24, 12, seed, &format!("--width 60 --left {child}"));
 
     let bytes = drain_window(&mut session, Duration::from_secs(3));
 
@@ -499,32 +409,19 @@ fn inline_mid_screen_scroll_through_preserves_history() {
     let mut parser = vt100::Parser::new(24, 80, 2000);
     parser.process(&bytes);
 
-    let recovered = |parser: &mut vt100::Parser, tag: &str| -> bool {
-        for offset in 0..=300 {
-            parser.screen_mut().set_scrollback(offset);
-            let text: String = parser.screen().rows(0, 80).collect::<Vec<_>>().join("\n");
-            if text.contains(tag) {
-                parser.screen_mut().set_scrollback(0);
-                return true;
-            }
-        }
-        parser.screen_mut().set_scrollback(0);
-        false
-    };
-
     assert!(
-        recovered(&mut parser, "OLD-01"),
+        recoverable_from_scrollback(&mut parser, 80, "OLD-01", 0..=300),
         "seeded history must survive into the terminal's scrollback through base_row -> 0"
     );
     assert!(
-        recovered(&mut parser, "FLOW-00"),
+        recoverable_from_scrollback(&mut parser, 80, "FLOW-00", 0..=300),
         "the band's early lines must reach scrollback once the engine takes over"
     );
 
     drop(session);
 }
 
-/// **Inline alt excursion preserves the anchor (bash->vim->bash, slice 10 / ADR-013).**
+/// **Inline alt excursion preserves the anchor (bash->vim->bash, ADR-013).**
 /// A child prints two inline lines, enters the alt screen and paints a frame, leaves
 /// the alt screen, prints two more inline lines, then exits — the bash->vim->bash
 /// shape. gutter must toggle the outer alt screen exactly once each way, restore the
@@ -533,13 +430,8 @@ fn inline_mid_screen_scroll_through_preserves_history() {
 #[test]
 fn inline_alt_excursion_preserves_anchor() {
     let child = "/bin/sh -c \"printf 'PRE-1\\nPRE-2\\n'; sleep 0.3; printf '\\033[?1049h\\033[1;1HALT-FRAME'; sleep 0.3; printf '\\033[?1049l'; sleep 0.1; printf 'POST-1\\nPOST-2'; exit 0\"";
-    let script = format!(
-        "stty cols 80 rows 24; exec env GUTTER_FORCE_ANCHOR_ROW=5 {} --width 60 --left {child}",
-        gutter_bin()
-    );
-    let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(script);
-    let mut session = OsSession::spawn(cmd).expect("spawn gutter under PTY");
+    let mut session =
+        spawn_gutter_anchored(80, 24, 5, "", &format!("--width 60 --left {child}"));
 
     let bytes = drain_window(&mut session, Duration::from_secs(3));
     let s = String::from_utf8_lossy(&bytes);
