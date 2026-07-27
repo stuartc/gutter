@@ -61,6 +61,49 @@ pub fn spawn_gutter_argv(child_argv: &[&str]) -> OsSession {
     spawn_gutter_argv_with(child_argv, |_| {})
 }
 
+/// Spawn gutter under a real `cols × rows` outer PTY *without*
+/// `GUTTER_FORCE_ANCHOR_ROW`, so the startup CPR probe really runs and the test has
+/// to answer it — see [`answer_cpr`].
+pub fn spawn_gutter_probing(cols: u16, rows: u16, gutter_args: &str) -> OsSession {
+    let script = format!(
+        "stty cols {cols} rows {rows}; exec env TERM=xterm-256color {} {gutter_args}",
+        env!("CARGO_BIN_EXE_gutter")
+    );
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(script);
+    OsSession::spawn(cmd).expect("spawn gutter under PTY")
+}
+
+/// Play terminal for the startup probe: read the outer PTY until gutter's `ESC[6n`
+/// query appears, then answer `ESC[<row>;1R` the way a real terminal would. Panics
+/// if the query never arrives. Must beat `CPR_TIMEOUT`, hence the tight poll.
+pub fn answer_cpr(session: &mut OsSession, row_1based: u16, deadline: Duration) {
+    use std::io::Write;
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 8192];
+    let start = Instant::now();
+    while start.elapsed() < deadline {
+        match session.try_read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                seen.extend_from_slice(&buf[..n]);
+                if find(&seen, b"\x1b[6n").is_some() {
+                    let reply = format!("\x1b[{row_1based};1R");
+                    session.write_all(reply.as_bytes()).expect("answer the CPR");
+                    session.flush().expect("flush the CPR answer");
+                    return;
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("gutter never sent its CPR query (ESC[6n)");
+}
+
 /// Drain a bounded wall-clock window with non-blocking reads, returning every byte
 /// the outer terminal saw. The non-blocking reads are what make the window a real
 /// cap even while the child holds the PTY open. Stops early on EOF.

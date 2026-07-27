@@ -65,16 +65,34 @@ pub fn probe_cursor_row(tty: &File, timeout: Duration) -> (Option<u16>, Vec<u8>)
 }
 
 /// Whether `tty` has readable bytes within `timeout`.
+///
+/// `select`, not `poll`: on macOS the `/dev/tty` cloning device answers `poll()`
+/// with `POLLNVAL` straight away instead of waiting, so the probe would give up
+/// before the terminal had a chance to reply. `select()` waits correctly on both
+/// macOS and Linux.
 fn wait_readable(tty: &File, timeout: Duration) -> bool {
-    let mut pfd = libc::pollfd {
-        fd: tty.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-    // SAFETY: one initialised pollfd, described honestly by the count.
-    let n = unsafe { libc::poll(&mut pfd, 1, ms) };
-    n > 0 && pfd.revents & libc::POLLIN != 0
+    let fd = tty.as_raw_fd();
+    if fd < 0 || fd >= libc::FD_SETSIZE as i32 {
+        return false;
+    }
+    // SAFETY: a zeroed `fd_set` is a valid empty set, `fd` is owned by `tty` and
+    // checked to be in range, and `select` is given the matching nfds.
+    unsafe {
+        let mut set: libc::fd_set = std::mem::zeroed();
+        libc::FD_SET(fd, &mut set);
+        let mut tv = libc::timeval {
+            tv_sec: timeout.as_secs().min(i32::MAX as u64) as libc::time_t,
+            tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+        };
+        let n = libc::select(
+            fd + 1,
+            &mut set,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut tv,
+        );
+        n > 0 && libc::FD_ISSET(fd, &set)
+    }
 }
 
 /// Locate a `ESC [ <row> ; <col> R` reply: its byte span and the 0-based row.
@@ -115,7 +133,27 @@ fn find_cpr(buf: &[u8]) -> Option<(usize, usize, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::find_cpr;
+    use super::{find_cpr, open_input_tty, wait_readable};
+    use std::time::{Duration, Instant};
+
+    /// The macOS `/dev/tty` guard: `poll()` there returns `POLLNVAL` at once, so a
+    /// probe built on it gives up before the terminal can answer.
+    #[test]
+    fn waiting_on_an_idle_tty_uses_the_whole_timeout() {
+        let Some(tty) = open_input_tty() else {
+            return; // No tty at all (CI): nothing to wait on.
+        };
+        if wait_readable(&tty, Duration::from_millis(0)) {
+            return; // Something is already pending; the wait would prove nothing.
+        }
+        let start = Instant::now();
+        assert!(!wait_readable(&tty, Duration::from_millis(100)));
+        assert!(
+            start.elapsed() >= Duration::from_millis(90),
+            "returned after {:?}, so it never waited",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn cpr_reply_is_located_and_the_row_is_zero_based() {
