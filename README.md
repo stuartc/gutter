@@ -137,13 +137,15 @@ keyboard from. Like `tmux`, it needs one to run and it ignores where descriptor
   `session.log` empty. The child's output goes to its own pseudo-terminal and
   reaches you as band paint; it is not teed into the file. There is no capture
   mode — if you want a transcript, ask the program for one.
-- Started without a controlling terminal but with one on its input — `setsid
-  gutter claude`, or a launcher that hands over a pseudo-terminal without making
-  it the controlling one — gutter names that terminal, reopens it, and paints
-  there. Window resizes never reach a process in that position, so the band and
-  the child stay at the size they started at.
-- With no terminal at all — cron, CI, a pipeline — gutter prints
-  `gutter: no controlling terminal: …` and exits 1 without starting the child.
+- Started without a controlling terminal but with one on its standard
+  descriptors — `setsid gutter claude`, or a launcher that hands over a
+  pseudo-terminal without making it the controlling one — gutter names that
+  terminal, reopens it, and paints there. Window resizes never reach a process in
+  that position, so the band and the child stay at the size they started at.
+- With no terminal on any of those routes — cron, CI, a `systemd` unit — gutter
+  prints `gutter: no controlling terminal: …` and exits 1 without starting the
+  child. A pipe or a redirect on stdout is not that case: your terminal is still
+  there, so gutter runs and paints on it, and the pipe gets nothing.
 
 ## Working on it
 

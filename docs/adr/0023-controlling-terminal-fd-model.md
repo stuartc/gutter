@@ -35,34 +35,48 @@ Three consequences, all measured rather than theorised:
 ## Decision
 
 **One terminal.** Every side gutter has on the outer terminal goes through one device
-— `/dev/tty`, the controlling terminal, or, when the process has none, the terminal
-`ttyname(STDIN_FILENO)` names (*the terminal stdin names* below) — and stdout is not
-touched, bar one thing, the termios state, which crossterm still owns and which *The
-one thing still not on the controlling terminal* below records in full.
+— `/dev/tty`, the controlling terminal, or, when the process has none, the terminal its
+own stdio names (*the terminal gutter's stdio names* below) — and stdout is never
+written.
 
 | Side | Handle |
 |---|---|
 | The band's paint sink | The resolved terminal, opened write-only, wrapped in a `BufWriter`. This open is what resolves it |
 | The keyboard, and the CPR probe's reply | The same device, opened read-write, **once**, shared by the probe and Thread 3 |
 | The OSC-52 clipboard | The same device, its own read-write open (ADR-004) |
-| The terminal's size | `/dev/tty`, opened by crossterm inside `terminal::size`, falling through to stdout where there is none |
-| Raw mode | **stdin** whenever stdin is a terminal — crossterm's `tty_fd()`, the exception |
+| The terminal's size | `TIOCGWINSZ` on the sink's own descriptor (`terminal::tty_size`), at startup and on every resize |
+| Raw mode | `tcgetattr`/`tcsetattr` on the sink's own descriptor |
+
+Nothing asks crossterm which terminal it is, which is what makes the table one answer
+rather than three: `terminal::size` runs its own `/dev/tty`-then-stdout-then-`tput`
+resolution, and `enable_raw_mode` its own stdin-then-`/dev/tty` one. Both are replaced by
+an ioctl on the descriptor gutter already holds. The size matters most — it is the one
+number that positions the band and sizes the child's PTY — and the line settings live on
+the *device*, not the descriptor, so setting them through the write-only sink is what the
+read side sees too.
 
 gutter never writes stdout, and reads stdin in no code of its own — with no controlling
-terminal it asks descriptor 0 for its name and nothing more, and crossterm's raw-mode
-helpers are the only other thing that touches it. stderr carries gutter's own
-diagnostics — the startup refusals, and a failed clipboard write — never the child's
-output, which goes to its PTY and reaches the screen only as band paint.
+terminal it asks its three standard descriptors for a name and nothing more. stderr
+carries gutter's own diagnostics — the startup refusal, a keyboard that would not open,
+and a failed clipboard write — never the child's output, which goes to its PTY and
+reaches the screen only as band paint.
 
-**The open is the guard.** A terminal that opens is a terminal gutter can paint on, so
-there is no separate `isatty` check to write and no way for the check and the handle to
-disagree — the thing gutter tests is the very thing it then uses. Both opens run at the
-top of `run()`, before the child's PTY is spawned and before anything is probed. Either
-failure prints one line,
-`gutter: no controlling terminal: <reason>`, and returns 1, matching the existing
-startup-error shape in `main.rs`. Placing them first is also what removes the stall:
-the probe can no longer be waiting for an answer that was never going to arrive,
-because a run with nothing to answer it does not get that far.
+**The write open is the guard.** A terminal that opens for writing is a terminal gutter
+can paint on, so there is no separate `isatty` check to write and no way for the check
+and the handle to disagree — the thing gutter tests is the very thing it then uses. It
+runs at the top of `run()`, before the child's PTY is spawned and before anything is
+probed. Failing prints one line, `gutter: no controlling terminal: <reason>`, and returns
+1, matching the existing startup-error shape in `main.rs`. Placing it first is also what
+removes the stall: the probe can no longer be waiting for an answer that was never going
+to arrive, because a run with nothing to answer it does not get that far.
+
+The read open is **not** the guard. It asks for more than the sink did — read as well as
+write — so it can be refused on a terminal that just opened for writing, a `/dev/pts`
+node owned by another user being the realistic shape. A terminal gutter can paint on is
+not a run to refuse: the keyboard is dropped, `gutter: keyboard input disabled: <reason>`
+goes to stderr, the CPR probe is skipped rather than left to time out on a handle that
+cannot answer, and Thread 3 is never spawned. Folding the two opens into one guard
+would refuse those runs and report the wrong cause while doing it.
 
 **One file description on the read side.** The startup probe and Thread 3 share a
 single open, which the probe reads to completion and then hands over, leftover
@@ -89,15 +103,23 @@ paints on the screen and leaves the log empty. gutter now behaves the same way, 
 deliberately does **not** tee the child's output into the redirect target — an empty
 log is the chosen behaviour, not a gap.
 
-### The terminal stdin names
+### The terminal gutter's stdio names
 
 `/dev/tty` is asked first, and answers for nearly every run. It fails for a process
 that has no controlling terminal — `setsid gutter bash`, a `subprocess.Popen` handed a
 PTY without `start_new_session=True` from a caller that has no terminal of its own, a
 Go `exec` that attaches a PTY but omits `Setsid`+`Setctty`. In every one of those there
-is a usable screen on descriptors 0/1/2, so gutter asks `ttyname(STDIN_FILENO)` for its
-path and **reopens it by name** — the tmux and screen mechanism, reached as a fallback
-rather than as the primary route.
+is a usable screen on descriptors 0/1/2, so gutter asks `ttyname` for its path and
+**reopens it by name** — the tmux and screen mechanism, reached as a fallback rather than
+as the primary route.
+
+All three descriptors are asked, stdin first, where tmux asks only stdin. A launcher that
+attaches a PTY normally puts it on all three and stdin answers; a supervisor that pipes
+gutter's input — `setsid sh -c 'true | gutter bash'` — leaves a usable screen on 1 or 2
+and nothing on 0, and refusing there would be refusing a terminal gutter can see. Asking
+the other two costs two `ttyname_r` calls. It only became reachable once raw mode moved
+off crossterm's stdin-first path: a run with a pipe on stdin resolved and painted, then
+failed to go raw and refused anyway.
 
 Reopening by name is load-bearing, not incidental. `dup(0)` would hand back the
 caller's own file description, shared offset and flags and all; a fresh `open` is an
@@ -109,9 +131,15 @@ free terminal would silently adopt it. What widens is how gutter *finds* a scree
 what session it is in.
 
 Order matters more than mechanism here, and `/dev/tty` stays first for two reasons. It
-is the process's own answer, so it keeps working when stdin is redirected — tmux refuses
-`tmux < input.txt`, gutter runs. And when only one of the two resolves, `/dev/tty` is
-the one that cannot be pointed somewhere unrelated by a caller's plumbing.
+is the process's own answer, so it keeps working when the stdio is redirected — tmux
+refuses `tmux < input.txt`, gutter runs. And when only one of the two resolves,
+`/dev/tty` is the one that cannot be pointed somewhere unrelated by a caller's plumbing.
+
+Which route failed is in the refusal. The fallback's error names the device it could not
+open — `gutter: no controlling terminal: /dev/pts/7: Permission denied` — because
+reporting `/dev/tty`'s reason for a failure on a different device sends the reader at the
+wrong one, with nothing in the line to say that gutter did find a screen and was turned
+away reopening it.
 
 tmux's own reason for avoiding `/dev/tty` does not apply to gutter. tmux is a client and
 a long-lived server: the client works out the terminal's *path* and hands that name to
@@ -138,23 +166,16 @@ case above; it is left as tmux's behaviour, not gutter's.
   in `open_input_tty` is still gone; what replaces it is a whole terminal, resolved by
   name and used for the sink, the keyboard and the clipboard alike, so the two-handle
   disagreement this record exists to remove cannot come back through it.
-- The degraded "keyboard input is disabled" branch is deleted with it. A run without a
-  keyboard is no longer reachable: the same device must open for the paint sink first.
+- The degraded "keyboard input is disabled" branch survives, on a narrower trigger: the
+  read-write open being refused on a device the write-only one accepted, rather than
+  `/dev/tty` being missing altogether. The band still paints; the session is watch-only.
 - The clipboard's separateness (ADR-004) survives unchanged, but its rule is now
   stated correctly: a distinct **open**, not a fd that differs from stdout.
-- Both guard failures print the same line, so the message does not say which open
-  failed. The second can realistically only fail if the controlling terminal is
-  revoked in the microseconds between the two calls; distinguishing them is not worth
-  the prose.
-- The size still comes from crossterm, which opens `/dev/tty` itself and falls back to
-  stdout, then to `tput`, then to gutter's own `80×24` default. On the `/dev/tty` route
-  the stdout fallback is unreachable, the guard having already proved `/dev/tty` opens.
-  On the fallback route it is what answers, and it lands on the right terminal because
-  the shape that gets there is a terminal on 0/1/2. A run that reaches the fallback with
-  stdout redirected elsewhere gets `tput`, or the `80×24` default: the band paints
-  correctly and is sized for a terminal that may not be this one. Measured: `setsid`,
-  a 200×50 terminal on stdin, stdout to a file, `--width 40 --center` centres for 80
-  columns and gives the child 24 rows.
+- The size is read off the sink's own descriptor, so it cannot answer for a terminal the
+  band is not on, and `80×24` is reached only when that ioctl itself fails. `setsid`, a
+  200×50 terminal on stdin, stdout to a file, `--width 40 --center`: the band centres for
+  200 columns and the child gets 50 rows. Under crossterm's resolution the same run
+  centred for 80 and gave the child 24.
 - The fallback route also never sees a resize. `SIGWINCH` goes to the foreground process
   group of the terminal's session, and a process that reached this route is by definition
   in neither — so Thread 5 never fires, `handle_resize` never runs, and both the band and
@@ -163,35 +184,34 @@ case above; it is left as tmux's behaviour, not gutter's.
   dropping it would let gutter adopt a terminal no session owns and get the signal back,
   at the cost of adopting terminals it should not.
 
-### The one thing still not on the controlling terminal
+### Raw mode on the resolved device
 
-Raw mode. crossterm's `enable_raw_mode`/`disable_raw_mode` go through its `tty_fd()`,
-which uses **stdin** whenever stdin is a terminal and only opens `/dev/tty` otherwise.
-So with stdin on one terminal and `/dev/tty` on another, the termios flags are set on
-stdin while everything else in this record talks to `/dev/tty` — the same shape of bug,
-in the one corner crossterm still owns.
+crossterm's `enable_raw_mode`/`disable_raw_mode` go through its `tty_fd()`, which uses
+**stdin** whenever stdin is a terminal and only opens `/dev/tty` otherwise. With stdin on
+one terminal and `/dev/tty` on another that set the flags on stdin while everything else
+here talked to `/dev/tty`, and the cost was not cosmetic: the terminal gutter paints on
+and reads the keyboard from was left cooked, so keystrokes echoed over the band and only
+reached the child on Enter, while a terminal gutter otherwise never touched was left raw
+for the whole run. Measured on a pair of PTYs — the band on `/dev/tty`, `ECHO` still set
+there and clear on the stdin terminal. It also refused outright on the fallback route
+with a pipe on stdin, where its `/dev/tty` open is the one that already failed.
 
-The cost is not cosmetic in that shape: the terminal gutter paints on and reads the
-keyboard from is left cooked, so keystrokes echo over the band and only reach the child
-on Enter, and a second terminal gutter otherwise never touches is left in raw mode for
-the whole run — a launcher reading it loses its own line discipline. Measured on a pair
-of PTYs: the band lands on `/dev/tty`, `ECHO` is still set there and clear on the stdin
-terminal. gutter is effectively unusable when the two differ.
+So gutter owns the termios itself: `tcgetattr` on the sink's descriptor, `cfmakeraw`,
+`tcsetattr(TCSANOW)`. The settings as gutter found them are saved on the first enable and
+never overwritten — the park/unpark cycle (ADR-019) re-enables raw mode over a state park
+itself restored, and saving again there would make teardown hand the shell back what park
+left rather than what the user had. `disable_raw_mode` puts the saved settings back, or
+does nothing when raw mode was never taken, keeping its ADR-010 slot and its
+"undo only what was set up" rule.
 
-On the fallback route the exception disappears of its own accord: the device gutter
-resolved is the terminal on stdin, so crossterm sets the flags on the same one.
-
-It is left open deliberately. Closing it means dropping crossterm's raw-mode helpers
-for a direct `tcgetattr`/`tcsetattr` on gutter's own `/dev/tty` descriptor, and
-carrying the saved termios through the ordered teardown (ADR-010) and the park/unpark
-cycle (ADR-019) — which reshapes `OuterTerminal` and its mock. That is its own slice.
-The exposure is narrow: it needs two genuinely different terminals, and the ordinary
-redirect cases that used to trigger the stdout half of this bug no longer reach it.
+`TCSANOW` rather than `TCSADRAIN`: gutter's own frames are already in flight, and waiting
+on them would let the mode change lag the keystroke that caused it.
 
 ## Code anchors
 
 - `src/terminal.rs` — `open_tty_write`, the two routes, the startup guard and the path
-  it hands back; `stdin_tty_path`; the `BufWriter<File>` sink and the `writer()`
+  it hands back; `stdio_tty_path`; `tty_size`; the termios save/restore behind
+  `enable_raw_mode`/`disable_raw_mode`; the `BufWriter<File>` sink and the `writer()`
   accessor the probe borrows
 - `src/anchor.rs` — `open_input_tty`, the single read-side open; `probe_cursor_row`,
   which writes its query through the band's own sink

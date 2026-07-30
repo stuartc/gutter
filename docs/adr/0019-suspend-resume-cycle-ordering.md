@@ -50,6 +50,13 @@ cooked-mode window during which the already-running input thread (Thread 3, whic
 owns the tty read fd across the whole suspend) could see canonical rather than raw
 input.
 
+Every step is attempted whatever an earlier one returned, the same `BestEffort` shape as
+`park`'s restore ([ADR-010](0010-ordered-teardown.md)) and for the mirrored reason: a
+raw-mode re-take that exhausts its `EINTR` retries must not skip the alt re-entry, or
+`outer_alt_active` keeps the pre-park `true` while the terminal is on the primary screen
+park handed back — and teardown then emits a `?1049l` for an alt screen the terminal
+never entered, restoring a buffer that predates the run over what the user was looking at.
+
 **No CPR at resume.** It would need a round-trip read of the tty, which Thread 3
 already owns and never releases during suspend (it freezes with the process but
 never joins or restarts), so the reply would be eaten silently. There is no

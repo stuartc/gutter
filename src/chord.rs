@@ -79,7 +79,7 @@ impl Chord {
         if self.legacy_bytes().is_some_and(|b| b == unit) {
             return true;
         }
-        matches_kitty(unit, code, self.mods) || matches_modify_other_keys(unit, code, self.mods)
+        csi_key(unit).is_some_and(|k| k.code == code && k.mods == self.mods && k.press)
     }
 
     /// The classic byte form, when the modifier set has one. A Shift chord has
@@ -130,43 +130,73 @@ fn c0_byte(c: char) -> Option<u8> {
     })
 }
 
-/// kitty's `CSI <code> [; <mods+1> [: <event>]] u`.
-fn matches_kitty(unit: &[u8], code: u32, mods: u8) -> bool {
-    let Some(body) = csi_body(unit, b'u') else {
-        return false;
-    };
-    let mut fields = body.split(|&b| b == b';');
-    if fields.next().and_then(number) != Some(code) {
-        return false;
-    }
-    match fields.next() {
-        None => mods == 0,
-        Some(mod_field) => {
-            if fields.next().is_some() {
-                return false;
-            }
-            let mut parts = mod_field.split(|&b| b == b':');
-            let mods_ok = parts.next().and_then(number) == Some(mods as u32 + 1);
-            // Absent or `1` is a press; `2` (repeat) and `3` (release) are not.
-            let press = match parts.next() {
-                None => true,
-                Some(ev) => number(ev) == Some(1),
-            };
-            mods_ok && press && parts.next().is_none()
+/// One key, as one of the two CSI report forms a relayed keyboard mode produces
+/// (ADR-021) describes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CsiKey {
+    /// The Unicode codepoint the report names the key by — the *unshifted* one, so
+    /// Shift-h is codepoint 104 with the Shift bit set, not codepoint 72.
+    pub code: u32,
+    /// `SHIFT | ALT | CTRL`, decoded from the wire parameter's `1 + mask`.
+    pub mods: u8,
+    /// Whether this is a press. Absent or `1` is a press; `2` (repeat) and `3`
+    /// (release) are not.
+    pub press: bool,
+}
+
+impl CsiKey {
+    /// The byte this key would have arrived as with no keyboard mode negotiated, when
+    /// there is one: a printable ASCII key held with nothing but Shift.
+    ///
+    /// A Ctrl or Alt report is a different key and resolves to nothing, so the resize
+    /// mode cannot mistake `Ctrl-l` for `l`.
+    #[must_use]
+    pub fn literal(&self) -> Option<u8> {
+        if self.mods & (ALT | CTRL) != 0 {
+            return None;
         }
+        let byte = u8::try_from(self.code).ok()?;
+        if !byte.is_ascii_graphic() {
+            return None;
+        }
+        Some(if self.mods & SHIFT != 0 {
+            byte.to_ascii_uppercase()
+        } else {
+            byte
+        })
     }
 }
 
-/// xterm modifyOtherKeys: `CSI 27 ; <mods+1> ; <code> ~`.
-fn matches_modify_other_keys(unit: &[u8], code: u32, mods: u8) -> bool {
-    let Some(body) = csi_body(unit, b'~') else {
-        return false;
-    };
+/// Decode one scanned unit as a keyboard-protocol key report: kitty's
+/// `CSI <code> [; <mods+1> [: <event>]] u`, or xterm modifyOtherKeys'
+/// `CSI 27 ; <mods+1> ; <code> ~`. `None` for anything else, a bare byte included.
+#[must_use]
+pub fn csi_key(unit: &[u8]) -> Option<CsiKey> {
+    if let Some(body) = csi_body(unit, b'u') {
+        let mut fields = body.split(|&b| b == b';');
+        let code = fields.next().and_then(number)?;
+        let Some(mod_field) = fields.next() else {
+            return Some(CsiKey { code, mods: 0, press: true });
+        };
+        if fields.next().is_some() {
+            return None;
+        }
+        let mut parts = mod_field.split(|&b| b == b':');
+        let mods = u8::try_from(parts.next().and_then(number)?.checked_sub(1)?).ok()?;
+        let press = match parts.next() {
+            None => true,
+            Some(ev) => number(ev) == Some(1),
+        };
+        return parts.next().is_none().then_some(CsiKey { code, mods, press });
+    }
+    let body = csi_body(unit, b'~')?;
     let fields: Vec<&[u8]> = body.split(|&b| b == b';').collect();
-    fields.len() == 3
-        && number(fields[0]) == Some(27)
-        && number(fields[1]) == Some(mods as u32 + 1)
-        && number(fields[2]) == Some(code)
+    if fields.len() != 3 || number(fields[0]) != Some(27) {
+        return None;
+    }
+    let mods = u8::try_from(number(fields[1])?.checked_sub(1)?).ok()?;
+    // modifyOtherKeys has no event sub-parameter: every report is a press.
+    Some(CsiKey { code: number(fields[2])?, mods, press: true })
 }
 
 /// The parameter body of a CSI sequence ending in `final_byte`.
@@ -375,6 +405,33 @@ mod tests {
         assert_eq!(c.single_byte(), Some(0x1b));
         assert!(c.matches(&[0x1b]));
         assert!(c.matches(b"\x1b[27u"), "kitty reports Escape as codepoint 27");
+    }
+
+    #[test]
+    fn csi_reports_resolve_to_the_byte_the_key_would_have_sent() {
+        // Unmodified `l`, and the same key with Shift — which is what tells the resize
+        // mode's `l` (one column) from its `L` (ten).
+        assert_eq!(csi_key(b"\x1b[108u").unwrap().literal(), Some(b'l'));
+        assert_eq!(csi_key(b"\x1b[108;2u").unwrap().literal(), Some(b'L'));
+        // modifyOtherKeys spells the same two.
+        assert_eq!(csi_key(b"\x1b[27;1;108~").unwrap().literal(), Some(b'l'));
+        assert_eq!(csi_key(b"\x1b[27;2;108~").unwrap().literal(), Some(b'L'));
+        // Ctrl-l and Alt-l are different keys, not `l`.
+        assert_eq!(csi_key(b"\x1b[108;5u").unwrap().literal(), None);
+        assert_eq!(csi_key(b"\x1b[108;3u").unwrap().literal(), None);
+        // Escape has no printable byte — the exit key is matched as a chord instead.
+        assert_eq!(csi_key(b"\x1b[27u").unwrap().literal(), None);
+        // A bare byte and an unrelated sequence are not key reports at all.
+        assert_eq!(csi_key(b"l"), None);
+        assert_eq!(csi_key(b"\x1b[C"), None);
+    }
+
+    #[test]
+    fn csi_reports_carry_the_event_type() {
+        assert!(csi_key(b"\x1b[108u").unwrap().press);
+        assert!(csi_key(b"\x1b[108;1:1u").unwrap().press);
+        assert!(!csi_key(b"\x1b[108;1:2u").unwrap().press, "a repeat is not a press");
+        assert!(!csi_key(b"\x1b[108;1:3u").unwrap().press, "a release is not a press");
     }
 
     #[test]

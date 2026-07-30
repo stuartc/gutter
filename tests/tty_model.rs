@@ -132,14 +132,19 @@ fn pty_pair(cols: u16, rows: u16) -> (File, File) {
 /// a perfectly usable screen on stdin — gutter names it with `ttyname(0)`, reopens it,
 /// and paints, rather than refusing.
 ///
-/// 120×40 with a centred 40-column band: the band starts at column 40 on this
-/// terminal, and at column 20 if `crossterm::terminal::size`'s own 80×24 fallback is
-/// what answered — so the geometry proves gutter read the size off the same terminal
-/// it painted on.
+/// stdout goes to a **file**, deliberately: it is what makes the geometry assertion
+/// bite. crossterm's own `terminal::size` falls back to an ioctl on stdout when its
+/// `/dev/tty` open fails, which is exactly this route — with stdout on the same PTY it
+/// would answer 120×40 and a regression that never asked the resolved device would
+/// still look right. On a regular file that ioctl fails too, so 120×40 can only have
+/// come from the terminal gutter resolved. 120×40 with a centred 40-column band starts
+/// at column 40; the 80×24 fallback would start it at column 20.
 #[test]
 fn a_terminal_with_no_controlling_terminal_still_paints() {
     let _guard = pty_guard();
     let (mut master, slave) = pty_pair(120, 40);
+    let log = temp_path("no-ctty-stdout");
+    let _ = fs::remove_file(&log);
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gutter"));
     cmd.args([
@@ -153,7 +158,7 @@ fn a_terminal_with_no_controlling_terminal_still_paints() {
     cmd.env("TERM", "xterm-256color");
     cmd.env("GUTTER_FORCE_ANCHOR_ROW", "0");
     cmd.stdin(Stdio::from(slave.try_clone().expect("clone the slave")));
-    cmd.stdout(Stdio::from(slave.try_clone().expect("clone the slave")));
+    cmd.stdout(Stdio::from(File::create(&log).expect("create the stdout target")));
     cmd.stderr(Stdio::from(slave.try_clone().expect("clone the slave")));
     // SAFETY: `setsid` is async-signal-safe and touches nothing the child allocated.
     unsafe {
@@ -185,6 +190,74 @@ fn a_terminal_with_no_controlling_terminal_still_paints() {
     assert!(
         rows.iter().any(|r| r.contains("hi-no-ctty")),
         "the band must paint on the terminal stdin names: {rows:?}"
+    );
+    assert_eq!(
+        first_painted_col(screen, 120),
+        Some(40),
+        "the band must be centred in that terminal's own 120 columns; rows: {rows:?}"
+    );
+    let captured = fs::read(&log).expect("the stdout target must exist");
+    assert!(
+        captured.is_empty(),
+        "nothing may reach stdout on this route either, got {:?}",
+        String::from_utf8_lossy(&captured)
+    );
+
+    let _ = fs::remove_file(&log);
+}
+
+/// The same terminal, but on stdout with stdin fed from `/dev/null`: a supervisor that
+/// pipes gutter's input while leaving a screen on 1 and 2. `ttyname(0)` answers nothing
+/// there, so a fallback that only ever asks stdin would refuse a terminal it can see.
+#[test]
+fn a_terminal_on_stdout_alone_still_paints() {
+    let _guard = pty_guard();
+    let (mut master, slave) = pty_pair(120, 40);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gutter"));
+    cmd.args([
+        "--width",
+        "40",
+        "--center",
+        "sh",
+        "-c",
+        "printf hi-stdout-only; sleep 0.5",
+    ]);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("GUTTER_FORCE_ANCHOR_ROW", "0");
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::from(slave.try_clone().expect("clone the slave")));
+    cmd.stderr(Stdio::from(slave.try_clone().expect("clone the slave")));
+    // SAFETY: `setsid` is async-signal-safe and touches nothing the child allocated.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("spawn gutter with a terminal on stdout only");
+
+    let (_, out) = poll_bytes(
+        |buf| master.read(buf),
+        Duration::from_secs(5),
+        Duration::from_millis(3),
+        |b| String::from_utf8_lossy(b).contains("hi-stdout-only"),
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let parser = outer_grid(&out, 120, 40);
+    let screen = parser.screen();
+    let rows: Vec<String> = screen.rows(0, 120).collect();
+    assert!(
+        !rows.iter().any(|r| r.contains("no controlling terminal")),
+        "gutter must not refuse with a usable terminal on stdout: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("hi-stdout-only")),
+        "the band must paint on the terminal stdout names: {rows:?}"
     );
     assert_eq!(
         first_painted_col(screen, 120),

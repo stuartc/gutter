@@ -36,8 +36,17 @@ Each step is conditional on what was actually set up.
   row leaves its own attributes live, and `CSI 0 SP q` because a DECSCUSR the child
   emitted was mirrored outward. Without them the shell comes back tinted, or wearing
   the child's cursor. The attribute reset is unconditional — gutter painted the band,
-  so there is always an attribute run to end. The cursor reset is not: a child that
-  never asked for a shape leaves the user's own untouched.
+  so there is always an attribute run to end. The cursor reset is not: it fires only
+  when gutter actually *wrote* a shape, which is not the same as the child having asked
+  for one — a DECSCUSR emitted while the resize overlay owns the cursor is recorded and
+  never mirrored, and resetting on the request would replace a shape the user configured
+  for their own shell with the default.
+- `CSI 0 SP q` is what terminals that treat DECSCUSR as resettable — kitty, VTE, Ghostty,
+  iTerm2 — read as "back to the configured shape". On xterm's own table `Ps = 0` is a
+  blinking block, the same as `Ps = 1`. There is no portable "whatever it was before", so
+  on those terminals a run whose child changed the shape hands back the block rather than
+  the user's own; the reset is still worth having, because the alternative is handing back
+  the child's shape on every terminal.
 
 ## Amendment — the order is fixed, the steps are best-effort
 

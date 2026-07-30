@@ -80,14 +80,9 @@ fn run() -> i32 {
     // `gutter cmd > log` paints on screen and leaves the log empty. The open is also
     // the guard — no terminal resolves, no run — and it runs here, ahead of the CPR
     // probe that would otherwise stall waiting for a reply no one is going to send.
-    //
-    // The input side is opened ONCE, here: the CPR probe below and Thread 3 must share
-    // one file description, or they would race for the reply.
-    let resolved = open_tty_write().and_then(|(out, path)| {
-        let input = open_input_tty(&path)?;
-        Ok((out, path, input))
-    });
-    let (tty_out, tty_path, input_tty) = match resolved {
+    // Its size and line settings come from the same handle, so nothing asks crossterm
+    // which terminal this is.
+    let (tty_out, tty_path) = match open_tty_write() {
         Ok(handles) => handles,
         Err(e) => {
             eprintln!("gutter: no controlling terminal: {e}");
@@ -95,10 +90,30 @@ fn run() -> i32 {
         }
     };
 
+    // The input side is opened ONCE, here: the CPR probe below and Thread 3 must share
+    // one file description, or they would race for the reply.
+    //
+    // It is a read-write open where the sink's is write-only, so it can be refused on a
+    // terminal that opened for writing a line ago — a `/dev/pts` node owned by another
+    // user, say. That degrades to a watch-only session; a terminal gutter can paint on
+    // is not a run to refuse, and refusing it under the guard's message would name the
+    // wrong cause.
+    let input_tty = match open_input_tty(&tty_path) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("gutter: keyboard input disabled: {e}");
+            None
+        }
+    };
+
     // `W` is the one width the child is ever told about; it is sized into the PTY
     // below so the child lays out as if it owned a `W`-wide terminal. The real
     // terminal width only positions the band (the margin).
-    let (real_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    //
+    // Asked of the device just resolved, not of crossterm: crossterm resolves the
+    // terminal a second time and would answer for `/dev/tty` — or for stdout, or for
+    // nothing — where gutter painted somewhere else (ADR-023).
+    let (real_cols, rows) = terminal::tty_size(&tty_out).unwrap_or((80, 24));
     // `--width` omitted → a fixed 100-column band, clamped to a narrower terminal
     // by resolve_width and centred by the default Layout. `--width full` (or 100%)
     // is the escape hatch back to a terminal-tracking full-width passthrough
@@ -173,10 +188,14 @@ fn run() -> i32 {
     // answers CPR; when it is set the probe is skipped entirely. On a failed query,
     // fall back to the bottom line (`rows - 1`), the common launch point — NOT row
     // 0, which would reproduce the overpaint the anchor exists to prevent.
-    let (anchor_row, leftover) = match std::env::var("GUTTER_FORCE_ANCHOR_ROW").ok() {
-        Some(v) => (v.parse::<u16>().unwrap_or(rows.saturating_sub(1)), Vec::new()),
-        None => {
-            let (row, leftover) = probe_cursor_row(terminal.writer(), &input_tty, CPR_TIMEOUT);
+    let forced = std::env::var("GUTTER_FORCE_ANCHOR_ROW").ok();
+    let (anchor_row, leftover) = match (forced, &input_tty) {
+        (Some(v), _) => (v.parse::<u16>().unwrap_or(rows.saturating_sub(1)), Vec::new()),
+        // With no read side there is nothing to read a reply on, so the query is skipped
+        // rather than left to time out.
+        (None, None) => (rows.saturating_sub(1), Vec::new()),
+        (None, Some(tty)) => {
+            let (row, leftover) = probe_cursor_row(terminal.writer(), tty, CPR_TIMEOUT);
             (row.unwrap_or(rows.saturating_sub(1)), leftover)
         }
     };
@@ -191,7 +210,7 @@ fn run() -> i32 {
 
     // Thread 3: input reader, DETACHED. Spawned but never joined; the
     // un-interruptible `read()` is reaped by process::exit on teardown (ADR-010).
-    {
+    if let Some(input_tty) = input_tty {
         let merged_tx = merged_tx.clone();
         thread::spawn(move || input::run(input_tty, merged_tx));
     }

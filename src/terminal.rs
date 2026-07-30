@@ -15,6 +15,7 @@
 use std::ffi::{CStr, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -142,22 +143,58 @@ pub trait OuterTerminal {
 /// `/dev/tty`, the controlling terminal, first. A process handed a terminal on its
 /// stdio without that terminal being made its controlling terminal has no `/dev/tty`
 /// to open — `setsid gutter bash`, or any launcher that attaches a PTY but omits
-/// `TIOCSCTTY` — so the terminal stdin names is the second route, reopened **by name**:
-/// `dup`ing descriptor 0 would hand back the caller's file description, where the
-/// clipboard (ADR-004) and the probe/Thread-3 split both need independent ones.
+/// `TIOCSCTTY` — so the terminal gutter's own stdio names is the second route, reopened
+/// **by name**: `dup`ing a descriptor would hand back the caller's file description,
+/// where the clipboard (ADR-004) and the probe/Thread-3 split both need independent ones.
 ///
 /// The open doubles as gutter's terminal guard: both routes failing means there is no
-/// screen to render a band on. The error reported is `/dev/tty`'s, the usual cause.
+/// screen to render a band on. Which route failed is in the error — the fallback's
+/// names the device it could not open, so a refusal there does not read as `/dev/tty`'s.
 pub fn open_tty_write() -> io::Result<(File, PathBuf)> {
     let dev_tty = PathBuf::from("/dev/tty");
     let no_ctty = match open_write(&dev_tty) {
         Ok(f) => return Ok((f, dev_tty)),
         Err(e) => e,
     };
-    let Some(path) = stdin_tty_path() else {
+    let Some(path) = stdio_tty_path() else {
         return Err(no_ctty);
     };
-    open_write(&path).map(|f| (f, path)).map_err(|_| no_ctty)
+    match open_write(&path) {
+        Ok(f) => Ok((f, path)),
+        // Not `no_ctty`: gutter did find a screen and was refused when it reopened it,
+        // and reporting `/dev/tty`'s reason instead sends the reader at the wrong device.
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("{}: {e}", path.display()),
+        )),
+    }
+}
+
+/// The terminal's `(cols, rows)`, asked of the device gutter resolved.
+///
+/// Not crossterm's `terminal::size`, which runs its own resolution — its own `/dev/tty`
+/// open, then an ioctl on stdout, then `tput`, then 80×24. On the fallback route that
+/// answers for a different device than the band is painted on, or for no terminal at
+/// all with stdout redirected, and the size is the one number that positions the band
+/// and sizes the child's PTY (ADR-023).
+pub fn tty_size(tty: &File) -> io::Result<(u16, u16)> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: `TIOCGWINSZ` writes one `winsize` through the pointer it is given, and
+    // the descriptor is borrowed from a live `File` for the length of the call.
+    let rc = unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ as _, &mut ws) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // A terminal that reports a zero dimension has no usable geometry; treat it as a
+    // failed query so the caller takes its own fallback rather than laying out a
+    // zero-column band.
+    if ws.ws_col == 0 || ws.ws_row == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the terminal reports a zero dimension",
+        ));
+    }
+    Ok((ws.ws_col, ws.ws_row))
 }
 
 /// `O_NOCTTY`: naming a terminal must not make it gutter's controlling terminal.
@@ -171,12 +208,29 @@ fn open_write(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-/// The path of the terminal on descriptor 0, if there is one.
-fn stdin_tty_path() -> Option<PathBuf> {
+/// The path of the terminal on gutter's stdio, if any of the three descriptors names
+/// one.
+///
+/// All three, not stdin alone: a launcher that attaches a PTY usually puts it on 0, 1
+/// and 2, but a supervisor that pipes stdin — `setsid sh -c 'true | gutter bash'` — still
+/// leaves a usable screen on 1 or 2, and refusing to run there would be refusing a
+/// terminal gutter can see.
+fn stdio_tty_path() -> Option<PathBuf> {
+    [
+        libc::STDIN_FILENO,
+        libc::STDOUT_FILENO,
+        libc::STDERR_FILENO,
+    ]
+    .into_iter()
+    .find_map(tty_path)
+}
+
+/// The path of the terminal on `fd`, if it is one.
+fn tty_path(fd: i32) -> Option<PathBuf> {
     let mut buf = [0u8; libc::PATH_MAX as usize];
     // SAFETY: `ttyname_r` writes at most `buf.len()` bytes into the buffer it is
-    // given, and STDIN_FILENO is always a valid descriptor number to ask about.
-    let rc = unsafe { libc::ttyname_r(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), buf.len()) };
+    // given, and the three standard descriptor numbers are always valid to ask about.
+    let rc = unsafe { libc::ttyname_r(fd, buf.as_mut_ptr().cast(), buf.len()) };
     if rc != 0 {
         return None;
     }
@@ -184,7 +238,8 @@ fn stdin_tty_path() -> Option<PathBuf> {
     (!name.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(name)))
 }
 
-/// The real outer terminal, backed by crossterm against the controlling terminal.
+/// The real outer terminal, backed by crossterm against the terminal
+/// [`open_tty_write`] resolved.
 pub struct CrosstermTerminal {
     /// Buffered: one `move_to` is several small writes, and unbuffered they would
     /// be several syscalls. Every write here is landed by an explicit flush — no
@@ -193,6 +248,12 @@ pub struct CrosstermTerminal {
     /// Whether mouse capture was enabled at startup, so teardown disables only
     /// what it set.
     mouse_enabled: bool,
+    /// The terminal's line settings as gutter found them, saved on the first raw-mode
+    /// enable and never overwritten — the suspend cycle's park/unpark re-enables raw
+    /// mode over a state park itself restored, and saving again there would make
+    /// teardown hand the shell back what park left rather than what the user had.
+    /// `None` means raw mode was never taken, so there is nothing to put back.
+    saved_termios: Option<libc::termios>,
 }
 
 impl CrosstermTerminal {
@@ -200,6 +261,7 @@ impl CrosstermTerminal {
         Self {
             out: BufWriter::new(tty),
             mouse_enabled: false,
+            saved_termios: None,
         }
     }
 
@@ -208,11 +270,29 @@ impl CrosstermTerminal {
     pub fn writer(&mut self) -> &mut impl Write {
         &mut self.out
     }
+
+    fn fd(&self) -> i32 {
+        self.out.get_ref().as_raw_fd()
+    }
 }
 
 impl OuterTerminal for CrosstermTerminal {
+    /// Raw mode on the resolved device, by `termios` rather than through crossterm.
+    ///
+    /// crossterm sets it on stdin when stdin is a terminal and reopens `/dev/tty`
+    /// otherwise — a third answer to which terminal gutter is talking to, and one that
+    /// fails outright on the fallback route when stdin is a pipe. The line settings live
+    /// on the device, not on the descriptor, so setting them through the band's sink is
+    /// what the read side sees too (ADR-023).
     fn enable_raw_mode(&mut self) -> io::Result<()> {
-        crossterm::terminal::enable_raw_mode()
+        let fd = self.fd();
+        let mut termios = current_termios(fd)?;
+        if self.saved_termios.is_none() {
+            self.saved_termios = Some(termios);
+        }
+        // SAFETY: `cfmakeraw` only rewrites the flags of the struct it is handed.
+        unsafe { libc::cfmakeraw(&mut termios) };
+        set_termios(fd, &termios)
     }
 
     fn enable_mouse(&mut self) -> io::Result<()> {
@@ -228,7 +308,7 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn terminal_size(&mut self) -> io::Result<(u16, u16)> {
-        crossterm::terminal::size()
+        tty_size(self.out.get_ref())
     }
 
     fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
@@ -352,9 +432,36 @@ impl OuterTerminal for CrosstermTerminal {
         self.out.flush()
     }
 
+    /// Put back the line settings gutter found, if it ever took raw mode. Undoes only
+    /// what was set up (ADR-010), and restores the user's own settings rather than a
+    /// canonical default.
     fn disable_raw_mode(&mut self) -> io::Result<()> {
-        crossterm::terminal::disable_raw_mode()
+        match self.saved_termios {
+            Some(saved) => set_termios(self.fd(), &saved),
+            None => Ok(()),
+        }
     }
+}
+
+/// The terminal's current line settings.
+fn current_termios(fd: i32) -> io::Result<libc::termios> {
+    // SAFETY: `tcgetattr` writes one `termios` through the pointer it is given.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(termios)
+}
+
+/// Apply line settings, at once rather than after the output queue drains: gutter's own
+/// frames are already in flight, and waiting on them would let the mode change lag the
+/// keystroke that caused it.
+fn set_termios(fd: i32, termios: &libc::termios) -> io::Result<()> {
+    // SAFETY: `tcsetattr` only reads the `termios` it is given.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, termios) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -574,18 +681,25 @@ pub mod mock {
 
         /// The restore subsequence only, for the ADR-010 order assertion —
         /// filters out any render-output noise a frame emitted first.
+        ///
+        /// The attribute and cursor-shape resets are matched on their exact bytes, not
+        /// on their call variant: `write_row` and `set_cursor_shape` are how the render
+        /// path paints rows and mirrors the child's shape too, and a variant match would
+        /// pull every frame's output into the order assertion.
         pub fn restore_calls(&self) -> Vec<Call> {
             self.calls
                 .iter()
-                .filter(|c| {
-                    matches!(
-                        c,
-                        Call::LeaveAltScreen
-                            | Call::Relay(_)
-                            | Call::DisableMouse
-                            | Call::ShowCursor
-                            | Call::DisableRawMode
-                    )
+                .filter(|c| match c {
+                    Call::LeaveAltScreen
+                    | Call::Relay(_)
+                    | Call::DisableMouse
+                    | Call::ShowCursor
+                    | Call::DisableRawMode => true,
+                    Call::WriteRow(b) => b.as_slice() == crate::render::SGR_RESET,
+                    Call::SetCursorShape(b) => {
+                        b.as_slice() == crate::render::DEFAULT_CURSOR_SHAPE
+                    }
+                    _ => false,
                 })
                 .cloned()
                 .collect()
@@ -891,13 +1005,16 @@ pub mod mock {
             self.record(Call::LeaveAltScreen)
         }
         fn disable_mouse(&mut self) -> io::Result<()> {
-            // Mirror the real impl: only disable what was actually enabled.
+            // Mirror the real impl: only disable what was actually enabled, and a
+            // failed disable leaves the mouse still enabled — the real one's `?`
+            // returns before it clears the flag, so a later restore retries. Clearing
+            // it here regardless would let a regression that never re-disables pass.
             if !self.mouse_enabled {
                 return Ok(());
             }
-            let r = self.record(Call::DisableMouse);
+            self.record(Call::DisableMouse)?;
             self.mouse_enabled = false;
-            r
+            Ok(())
         }
         fn show_cursor(&mut self) -> io::Result<()> {
             self.record(Call::ShowCursor)

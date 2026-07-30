@@ -14,7 +14,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use crate::callbacks::GutterCallbacks;
-use crate::chord::Chord;
+use crate::chord::{self, Chord};
 use crate::clock::{Clock, Recv};
 use crate::geometry::{self, Layout, Width};
 use crate::modes::ModeMirror;
@@ -49,10 +49,17 @@ pub const TEARDOWN_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const SCROLL_TRACKER_SCROLLBACK: usize = 4096;
 
 /// What the two restore paths hand the shell back: no leftover attribute run from the
-/// band's last painted cell, and the terminal's default cursor shape rather than
-/// whatever DECSCUSR the child last asked for (ADR-010).
-const SGR_RESET: &[u8] = b"\x1b[0m";
-const DEFAULT_CURSOR_SHAPE: &[u8] = b"\x1b[0 q";
+/// band's last painted cell, and a default cursor shape rather than whatever DECSCUSR
+/// the child last asked for (ADR-010).
+///
+/// `Ps = 0` is what terminals that treat DECSCUSR as resettable — kitty, VTE, Ghostty,
+/// iTerm2 — read as "back to the configured shape". On xterm's own table it is a
+/// blinking block, the same as `Ps = 1`; there is no portable "whatever it was before",
+/// so a user whose xterm cursor is a bar and whose child changed it gets the block back.
+/// Only emitted when gutter actually wrote a shape, so a run that changed nothing leaves
+/// the user's cursor alone.
+pub(crate) const SGR_RESET: &[u8] = b"\x1b[0m";
+pub(crate) const DEFAULT_CURSOR_SHAPE: &[u8] = b"\x1b[0 q";
 
 /// The render thread's state: the parsers, the diff baseline, and the band geometry.
 pub struct Renderer {
@@ -120,6 +127,12 @@ pub struct Renderer {
     /// (which `render_once` can't see) so the per-frame cursor tail knows to suppress
     /// the mirrored child cursor while the resize overlay owns the band.
     resize_active: bool,
+    /// The codepoint of a key whose press gutter consumed, when that press arrived as a
+    /// keyboard-protocol report (ADR-021). Such a mode reports a key twice — press and
+    /// release — so consuming only the press hands the child a key-up with no key-down,
+    /// which is the very state it turned event reporting on to track. One slot: a key's
+    /// two reports arrive together, and the next sequence clears it either way.
+    consumed_press: Option<u32>,
 }
 
 impl Renderer {
@@ -174,7 +187,26 @@ impl Renderer {
             mouse_gate: MouseGate::default(),
             resize_key: Chord::default(),
             resize_active: false,
+            consumed_press: None,
         }
+    }
+
+    /// Whether `unit` is the follow-up report gutter owes a press it consumed — a
+    /// release or a repeat of the same key — and clear the slot either way, so a
+    /// consumed press never shadows more than the reports that came with it.
+    fn owed_key_report(&mut self, unit: &[u8]) -> bool {
+        match (self.consumed_press.take(), chord::csi_key(unit)) {
+            (Some(code), Some(key)) => key.code == code && !key.press,
+            _ => false,
+        }
+    }
+
+    /// Remember that gutter consumed this unit's press, so [`owed_key_report`] can
+    /// consume its release too. A unit that is not a key report leaves nothing owed.
+    ///
+    /// [`owed_key_report`]: Renderer::owed_key_report
+    fn note_consumed_press(&mut self, unit: &[u8]) {
+        self.consumed_press = chord::csi_key(unit).filter(|k| k.press).map(|k| k.code);
     }
 
     /// Override the resize-mode enter chord (from `--resize-key`). Called once at
@@ -332,6 +364,12 @@ enum KeyAction {
 /// The in-mode set is exact byte strings, no parsing. Repeats act on step keys
 /// (holding `h` keeps shrinking) automatically: an auto-repeating key simply
 /// sends its byte again, which is a fresh unit.
+///
+/// A relayed keyboard mode (ADR-021) reports those keys as `CSI` sequences rather than
+/// bare bytes, so a report is first reduced to the byte the key would have sent — the
+/// step keys as much as the exit. Widening the exit alone and leaving the steps on bare
+/// bytes would leave the mode half-working on exactly the terminals the widening is for:
+/// Escape gets you out, and until then every step key is silently swallowed.
 fn classify_unit(unit: &[u8], chord: &Chord, in_mode: bool) -> KeyAction {
     if chord.matches(unit) {
         return if in_mode { KeyAction::Exit } else { KeyAction::Enter };
@@ -344,6 +382,11 @@ fn classify_unit(unit: &[u8], chord: &Chord, in_mode: bool) -> KeyAction {
     if Chord::ESC.matches(unit) {
         return KeyAction::Exit;
     }
+    let reduced = chord::csi_key(unit).filter(|k| k.press).and_then(|k| k.literal());
+    let unit: &[u8] = match &reduced {
+        Some(b) => std::slice::from_ref(b),
+        None => unit,
+    };
     match unit {
         b"h" | b"-" => KeyAction::Step(-1),
         b"l" | b"+" | b"=" => KeyAction::Step(1),
@@ -713,23 +756,34 @@ fn walk_tokens<C, T, P, R>(
                 ) {
                     MouseDecision::Forward(bytes) => forward_to_child(pty_writer, &bytes),
                     MouseDecision::Swallow => {}
-                    MouseDecision::BailNonSgr => {
-                        // A reporting mode with a non-SGR encoding is out of v1
-                        // scope. Fail loud rather than feed the child a malformed
-                        // SGR report that would desync its mouse parser (ADR-005).
-                        panic!(
-                            "gutter: child negotiated an unsupported non-SGR mouse \
-                             encoding; SGR 1006 is the only supported encoding (v1)"
-                        );
-                    }
+                    // A reporting mode with a non-SGR encoding is out of v1 scope, so
+                    // the report is dropped rather than sent in a form that would
+                    // desync the child's mouse parser (ADR-005).
+                    //
+                    // Dropped, not fatal: a child that enables `?1000h` without
+                    // `?1006h` is ordinary, and the outer terminal reports in SGR
+                    // either way (the eager capture), so this is one click away on a
+                    // plain older TUI. Dying here would take the render thread down
+                    // with raw mode and mouse reporting still on and the ordered
+                    // restore never run (ADR-010) — the shell would need `reset`.
+                    MouseDecision::BailNonSgr => {}
                 }
             }
             // A complete escape sequence is atomic: matched whole or forwarded
             // whole, never split into an Escape plus literal characters.
             Token::Seq(bytes) => {
+                // The release half of a press gutter already consumed. It has to be
+                // caught before the classifier, because leaving the mode is what makes
+                // the release look like an ordinary key to forward.
+                if renderer.owed_key_report(bytes) {
+                    continue;
+                }
                 match classify_unit(bytes, &renderer.resize_key, resize.active()) {
                     KeyAction::PassThrough => forward_to_child(pty_writer, bytes),
-                    action => apply_key_action(action, clock, renderer, resize, term, resizer),
+                    action => {
+                        renderer.note_consumed_press(bytes);
+                        apply_key_action(action, clock, renderer, resize, term, resizer);
+                    }
                 }
             }
             Token::Text(run) => {
@@ -1610,9 +1664,9 @@ where
     SuspendOutcome::Resumed
 }
 
-/// A restore run in ADR-010 order: every step is attempted even after an earlier one
-/// fails, so a failed alt-leave cannot short-circuit the raw-mode drop and strand the
-/// shell in raw mode or mouse reporting. The first error is kept and returned.
+/// An ordered run of terminal steps where every one is attempted even after an earlier
+/// one fails, so a failed alt-leave cannot short-circuit the raw-mode drop and strand
+/// the shell in raw mode or mouse reporting. The first error is kept and returned.
 #[derive(Default)]
 struct BestEffort(Option<std::io::Error>);
 
@@ -1636,7 +1690,8 @@ impl BestEffort {
 /// shell a default cursor shape → undo the mirrored input modes (ADR-022) → undo the
 /// child's keyboard modes (ADR-021) → disable mouse → show the cursor → drop raw mode
 /// LAST. Each step undoes only what was actually set up — the cursor shape is reset only
-/// when the child asked for one, so a shape the user set for their own shell survives.
+/// when a shape gutter wrote is on the terminal, so one the user set for their own shell
+/// survives.
 ///
 /// The discriminator is the live `outer_alt_active`: a child that exits in the alt screen
 /// takes the leave-alt path; one that exits inline hands back below the band. The
@@ -1660,7 +1715,7 @@ fn ordered_restore<T: OuterTerminal>(
         restore.step(hand_back_inline(renderer, term, exit_code));
     }
     restore.step(term.write_row(SGR_RESET));
-    if renderer.parser.callbacks().cursor_shape.is_set() {
+    if renderer.parser.callbacks().cursor_shape.is_mirrored() {
         restore.step(term.set_cursor_shape(DEFAULT_CURSOR_SHAPE));
     }
     restore.step(mode_reset(renderer, term));
@@ -1693,13 +1748,19 @@ fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Res
 /// already-running input thread could read canonical input in. gutter asks the outer
 /// terminal for no keyboard mode of its own (ADR-020); what it re-asserts is what the
 /// child asked for, replayed from the relay's log (ADR-021).
+/// Best-effort per step like [`park`]'s restore, and for the same reason turned around: a
+/// failed raw-mode re-take must not skip the mouse re-enable or the alt re-entry, or the
+/// renderer's own screen-mode state would go out of step with the terminal and teardown
+/// would emit a `?1049l` for an alt screen the terminal never entered — restoring a buffer
+/// that predates the run over what the user was looking at.
 fn unpark<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
-    retry_enable_raw(term)?;
-    relay_replay(renderer, term)?;
-    term.enable_mouse()?;
+    let mut restore = BestEffort::default();
+    restore.step(retry_enable_raw(term));
+    restore.step(relay_replay(renderer, term));
+    restore.step(term.enable_mouse());
     let child_alt = renderer.parser.screen().alternate_screen();
     if child_alt {
-        term.enter_alt_screen()?;
+        restore.step(term.enter_alt_screen());
     }
     // Re-derive the outer alt state from the parser (the double meaning resolves
     // here — see ADR-0019).
@@ -1709,7 +1770,7 @@ fn unpark<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::R
     // Re-assert the child's cursor shape on the next repaint: park reset the outer
     // cursor to the default, so the watcher's mirrored state is stale.
     renderer.parser.callbacks_mut().cursor_shape.rearm();
-    Ok(())
+    restore.result()
 }
 
 /// Turn off the input modes gutter mirrored onto the outer terminal (ADR-022),
@@ -2245,6 +2306,7 @@ mod tests {
         assert_eq!(
             term.restore_calls(),
             vec![
+                Call::WriteRow(SGR_RESET.to_vec()),
                 Call::DisableMouse,
                 Call::ShowCursor,
                 Call::DisableRawMode,
@@ -2320,6 +2382,7 @@ mod tests {
             term.restore_calls(),
             vec![
                 Call::LeaveAltScreen,
+                Call::WriteRow(SGR_RESET.to_vec()),
                 Call::DisableMouse,
                 Call::ShowCursor,
                 Call::DisableRawMode,
@@ -2361,6 +2424,7 @@ mod tests {
                 // The child's own request, carried out to the terminal while it ran.
                 Call::Relay(b"\x1b[>1u\x1b[>4;2m".to_vec()),
                 Call::LeaveAltScreen,
+                Call::WriteRow(SGR_RESET.to_vec()),
                 Call::Relay(b"\x1b[<1u\x1b[>4;0m".to_vec()),
                 Call::DisableMouse,
                 Call::ShowCursor,
@@ -2555,6 +2619,7 @@ mod tests {
             term.restore_calls(),
             vec![
                 Call::LeaveAltScreen,
+                Call::WriteRow(SGR_RESET.to_vec()),
                 Call::DisableMouse,
                 Call::ShowCursor,
                 Call::DisableRawMode,
@@ -3095,19 +3160,27 @@ mod tests {
     }
 
     /// When the child negotiates a reporting mode but not SGR (`CSI ?1000h` with no
-    /// `?1006h` → Default encoding), a click must not produce a malformed SGR event.
-    /// gutter fails loud — the dispatch arm panics rather than forwarding garbage.
+    /// `?1006h` → Default encoding), a click must not produce a malformed SGR event —
+    /// and must not take the session down either. `?1000h` alone is what plenty of
+    /// older TUIs ask for, and the outer terminal reports in SGR regardless (the eager
+    /// capture), so the report is dropped and the run carries on: a panic here would
+    /// kill the render thread with raw mode and mouse reporting still on.
     #[test]
-    #[should_panic(expected = "non-SGR mouse encoding")]
-    fn mouse_non_sgr_encoding_panics_rather_than_forwarding_garbage() {
+    fn mouse_non_sgr_encoding_drops_the_report_rather_than_forwarding_garbage() {
         // No `?1006h`, so the encoding stays Default while the mode is reporting.
-        run_mouse(
+        let pty = run_mouse(
             10,
             40,
             vec![
                 (0u64, Msg::Pty(b"\x1b[?1000h".to_vec())),
                 (1, mouse_down(15, 0)),
+                (1, mouse_up(15, 0)),
             ],
+        );
+        assert!(
+            pty.is_empty(),
+            "an unsupported encoding forwards nothing, got {:?}",
+            String::from_utf8_lossy(&pty)
         );
     }
 
@@ -3427,6 +3500,28 @@ line two\r\n\
         );
     }
 
+    /// Teardown resets the cursor only when gutter wrote a shape, which is not the same
+    /// as the child having asked for one: a request made while the resize overlay owns
+    /// the cursor never reaches the terminal. Resetting on the request would replace the
+    /// shape the user configured for their own shell with the default.
+    #[test]
+    fn a_shape_gutter_never_wrote_is_not_reset_at_teardown() {
+        let mut renderer = left_renderer(20, 5);
+        // The overlay owns the cursor, so the frame's `mirror_cursor` returns early and
+        // the request is recorded without ever being emitted.
+        renderer.resize_active = true;
+        renderer.parser.process(b"\x1b[5 q");
+        let mut term = MockTerminal::new();
+
+        run_teardown(&renderer, &mut term, 0).expect("teardown succeeds");
+
+        assert!(
+            !term.calls.iter().any(|c| matches!(c, Call::SetCursorShape(_))),
+            "no shape was written, so none is reset: {:?}",
+            term.calls
+        );
+    }
+
     /// Absorbed-mode mirroring (ADR-022) through the real frame. `render_once` takes
     /// an injected terminal, so every one of these is a parser feed, a frame, and a
     /// read of what the outer terminal saw — no PTY, no threads, no clock.
@@ -3590,6 +3685,7 @@ line two\r\n\
                     Call::Relay(b"\x1b[>1u".to_vec()),
                     Call::Relay(b"\x1b[?1h\x1b[?2004h".to_vec()),
                     Call::LeaveAltScreen,
+                    Call::WriteRow(SGR_RESET.to_vec()),
                     Call::Relay(b"\x1b[?1l\x1b[?2004l".to_vec()),
                     Call::Relay(b"\x1b[<1u".to_vec()),
                     Call::DisableMouse,
@@ -3894,6 +3990,56 @@ line two\r\n\
             assert!(ctx.resize.active(), "mode persists after a swallowed key");
             ctx.send(b"l");
             assert_eq!(ctx.renderer.width, 81, "still in mode: l still steps");
+        }
+
+        /// Under a relayed keyboard mode every in-mode key arrives as a CSI report, not
+        /// as its bare byte — the step keys as much as the Escape. Matching only the
+        /// exit would leave the mode open with the steps silently swallowed, which is
+        /// worse than not widening it at all.
+        #[test]
+        fn step_keys_work_in_their_csi_report_forms() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            // kitty: `l` is codepoint 108, unmodified.
+            ctx.send(b"\x1b[108u");
+            assert_eq!(ctx.renderer.width, 81, "kitty's `l` steps one column");
+            // With Shift it is the same codepoint plus the shift bit — `L`, ten columns.
+            ctx.send(b"\x1b[108;2u");
+            assert_eq!(ctx.renderer.width, 91, "kitty's Shift-l is `L`, not `l`");
+            // modifyOtherKeys spells `h`.
+            ctx.send(b"\x1b[27;1;104~");
+            assert_eq!(ctx.renderer.width, 90, "modifyOtherKeys' `h` shrinks one column");
+            // Ctrl-l is a different key, so it is swallowed rather than stepping.
+            ctx.send(b"\x1b[108;5u");
+            assert_eq!(ctx.renderer.width, 90, "Ctrl-l is not `l`");
+            assert!(ctx.pty.is_empty(), "none of it reaches the child");
+        }
+
+        /// Exiting on a key report consumes its release too. The press turns the mode
+        /// off, so the release that follows would otherwise classify out-of-mode and be
+        /// forwarded — handing the child a key-up with no key-down, exactly the state it
+        /// asked for event types in order to track (ADR-021).
+        #[test]
+        fn the_release_of_a_consumed_exit_press_never_reaches_the_child() {
+            for press in [&b"\x1b[27;1:1u"[..], &b"\x1b[92;5:1u"[..]] {
+                let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+                ctx.enter();
+                ctx.send(press);
+                assert!(!ctx.resize.active(), "{press:?} exits the mode");
+                // The same report with its event sub-parameter turned into a release.
+                let mut release = press.to_vec();
+                let event = release.len() - 2;
+                release[event] = b'3';
+                ctx.send(&release);
+                assert!(
+                    ctx.pty.is_empty(),
+                    "the release of the consumed press must not reach the child, got {:?}",
+                    String::from_utf8_lossy(&ctx.pty)
+                );
+                // And the slot is one-shot: an ordinary key after it still passes.
+                ctx.send(b"x");
+                assert_eq!(ctx.pty, b"x", "the next key is forwarded as normal");
+            }
         }
 
         /// The chord's kitty release form must not read as a second chord press and
