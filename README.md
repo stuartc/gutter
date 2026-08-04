@@ -52,20 +52,40 @@ positioning, scrollback — simply works.
 
 ### Prebuilt binary
 
-Grab the archive for your platform from the
-[latest release](https://github.com/stuartc/gutter/releases/latest) — Linux
-x86_64 and a universal macOS binary (Apple Silicon + Intel) are published, each
-with a SHA-256 checksum. Unpack it and drop `gutter` somewhere on your `$PATH`.
-
-The binaries are unsigned, so on macOS Gatekeeper will refuse to run a freshly
-downloaded one. Clear the quarantine attribute first:
+Every [release](https://github.com/stuartc/gutter/releases/latest) publishes a
+Linux x86_64 binary and a universal macOS one (Apple Silicon + Intel), each with
+a SHA-256 checksum beside it. To fetch the latest and put it on your `$PATH`:
 
 ```sh
-xattr -c ./gutter
+# macOS (universal: Apple Silicon + Intel)
+curl -fsSL https://github.com/stuartc/gutter/releases/latest/download/gutter-universal-apple-darwin.tar.gz \
+  | tar xzf - gutter
+xattr -c gutter
+sudo mv gutter /usr/local/bin/
 ```
 
-Or run it once via right-click → Open in Finder and confirm the warning, which
-allows it from then on.
+```sh
+# Linux x86_64
+curl -fsSL https://github.com/stuartc/gutter/releases/latest/download/gutter-x86_64-unknown-linux-gnu.tar.gz \
+  | tar xzf - gutter
+sudo mv gutter /usr/local/bin/
+```
+
+The macOS binary is signed ad-hoc rather than with a Developer ID, so Gatekeeper
+gets mad if it arrives carrying a quarantine flag. So you need to clear the flag
+manually.
+
+Or more manually if you want to check it first:
+
+```sh
+base=https://github.com/stuartc/gutter/releases/latest/download
+target=universal-apple-darwin              # or x86_64-unknown-linux-gnu
+curl -fsSL -O $base/gutter-$target.tar.gz -O $base/gutter-$target.sha256
+shasum -a 256 -c gutter-$target.sha256     # sha256sum -c on Linux
+tar xzf gutter-$target.tar.gz gutter
+xattr -c gutter                            # macOS only
+sudo mv gutter /usr/local/bin/
+```
 
 ### From source
 
@@ -84,7 +104,7 @@ Alternatively, clone the repo and `cargo build --release` to run
 ## Usage
 
 ```
-gutter [--width <N|Npct|full>] [--center|--left] <cmd> [args...]
+gutter [--width <N|Npct|full>] [--center|--left] [--resize-key <chord>] <cmd> [args...]
 ```
 
 ```sh
@@ -100,10 +120,14 @@ Flags:
 - `--width N` — absolute band width in columns, fixed for the session.
 - `--width Npct` (or `N%`, or the `--width=N` form) — proportional width,
   recomputed every time you resize the terminal.
-- `--width full` — an alias for `--width 100%`: the band always matches the
-  real terminal width, i.e. a transparent passthrough.
+- `--width full` — an alias for `--width 100%`: the band always matches the real
+  terminal width, i.e. a transparent passthrough.
 - `--center` / `--centre` — centre the band. This is the default.
 - `--left` — pin the band to the left edge.
+- `--resize-key <chord>` — the key that toggles resize mode, `ctrl-\` by
+  default. Write it as `[<mod>-]...<key>`: modifiers are `ctrl`/`c`,
+  `alt`/`meta`/`m` and `shift`/`s`, and the key is a single character or one of
+  `esc`, `tab`, `enter`, `space`, `f1`–`f12`.
 
 A few things worth knowing:
 
@@ -116,16 +140,40 @@ A few things worth knowing:
   the real width on narrower terminals). Use `--width full` (or `--width 100%`)
   for a transparent passthrough at the real terminal width.
 
+## Changing the width while it's running
+
+Press `ctrl-\` (or whatever you set `--resize-key` to) and gutter enters resize
+mode: faint rails appear in the margins with the current width printed beside
+them. From there:
+
+- `h` / `l`, `-` / `+`, or the left and right arrows step the band by one.
+- `H` / `L` step by ten.
+- The chord again, or Escape, leaves. So does three seconds of not touching
+  anything.
+
+The step follows whatever unit you asked for on the command line — columns for
+`--width 80`, percentage points for `--width 50pct` — and it won't take the band
+below 20 columns or past the width of the real terminal. The width you land on
+lasts for the session; nothing is written to disk.
+
+While resize mode is up, gutter keeps every keystroke for itself. The child sees
+nothing at all until you leave.
+
 ## What passes through
 
 - **Keyboard**, byte for byte: whatever your terminal sends is what the child
-  receives, with only the reserved resize chord held back. The child's protocol
-  requests go back out to your terminal, so the two negotiate directly and
-  whatever your terminal supports is what the child gets.
+  receives. Only the resize chord is held back — and, while resize mode is up,
+  everything. The child's protocol requests go back out to your terminal, so the
+  two negotiate directly and whatever your terminal supports is what the child
+  gets: function keys, Home and End, PageUp and PageDown, Insert, Delete,
+  Shift+Tab, Alt+key and modified arrows all arrive as the child expects them.
 - **Mouse**, with coordinates translated into the band.
 - **Clipboard**, via OSC 52.
 - **Resizes** — the child is told its new size, and proportional widths
   re-resolve on the spot.
+- **Ctrl-Z and `fg`** — suspending gutter puts the terminal back the way it was
+  and stops the child along with it; `fg` restores raw mode, the band and the
+  keyboard modes the child had negotiated, then continues the child.
 
 ## The terminal gutter talks to
 
@@ -140,8 +188,8 @@ keyboard from. Like `tmux`, it needs one to run and it ignores where descriptor
 - Started without a controlling terminal but with one on its standard
   descriptors — `setsid gutter claude`, or a launcher that hands over a
   pseudo-terminal without making it the controlling one — gutter names that
-  terminal, reopens it, and paints there. Window resizes never reach a process in
-  that position, so the band and the child stay at the size they started at.
+  terminal, reopens it, and paints there. Window resizes never reach a process
+  in that position, so the band and the child stay at the size they started at.
 - With no terminal on any of those routes — cron, CI, a `systemd` unit — gutter
   prints `gutter: no controlling terminal: …` and exits 1 without starting the
   child. A pipe or a redirect on stdout is not that case: your terminal is still
@@ -172,14 +220,6 @@ cargo clippy --all-targets --features oracle
 
 CI runs all five gates: `build`, `test`, `test --features oracle`, and both
 clippy passes.
-
-For a deeper tour — the four-thread model, the render loop, the resize and
-teardown ordering — see [`CLAUDE.md`](./CLAUDE.md).
-
-## Status
-
-Early days (`0.2.0`). The core works and has been used to wrap Claude Code
-daily, but expect rough edges and a moving target.
 
 ## Licence
 
