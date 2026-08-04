@@ -14,6 +14,28 @@ cargo install git-cliff        # or: brew install git-cliff
 The changelog in this repo was generated with **git-cliff 2.13.1**. cargo-release reads
 its config from `[package.metadata.release]` in `Cargo.toml`; git-cliff reads `cliff.toml`.
 
+## What ends up in the changelog
+
+Slice subjects name the slice, not the change a user sees, so the release notes are not
+just the log. Three things shape them:
+
+- **`docs`, `test`, `refactor`, `chore`, `style`, `ci`, `build` and `perf` commits are
+  skipped**, along with merge commits and the release commit itself. Only `feat` and `fix`
+  reach the changelog at all.
+- **A `Changelog:` trailer overrides the subject** — one bullet per trailer, so a slice
+  that fixed three things says three things, in the user's terms rather than the codebase's.
+  `Changelog: skip` as the only trailer drops the commit. No trailer falls back to the
+  subject.
+- **An effort spanning many slices squash-merges** under one `feat`/`fix` subject, with the
+  trailers on the squash commit. Twelve slice commits are twelve changelog lines otherwise.
+
+Write the trailers while the work is fresh — at the end of the slice, or on the squash
+commit at merge time. Nothing downstream can recover wording that was never written.
+
+Released sections are **never regenerated**. `scripts/changelog.sh` prepends the new one,
+so a later change to `cliff.toml` cannot go back and reword what a published GitHub Release
+already says, and a section tidied by hand stays tidy.
+
 ## Versioning
 
 SemVer in `0.x`: while we're pre-1.0, **breaking changes ride the minor slot**. Tags are
@@ -33,12 +55,13 @@ The first release is **`v0.1.0`**, cut from current `main` as-is.
    cargo release minor
    ```
 
-   This resolves the new version, runs the pre-release hook (git-cliff regenerates and
-   stages `CHANGELOG.md`), and reports the planned commit, tag, and push **without changing
-   anything**. `publish = false` means it never attempts crates.io.
+   This resolves the new version, runs the pre-release hook (`scripts/changelog.sh` writes
+   and stages the new `CHANGELOG.md` section), and reports the planned commit, tag, and push
+   **without changing anything else**. `publish = false` means it never attempts crates.io.
 
-2. **Review** the planned bump, the regenerated `CHANGELOG.md`, and the tag name. Make sure
-   the new version section reads cleanly and the merge / non-conventional commits are present.
+2. **Review** the planned bump, the new `CHANGELOG.md` section, and the tag name. The section
+   is yours to edit — the real run sees it is already there and leaves it alone, so anything
+   you fix now is what ships.
 
 3. **Execute** once you're happy:
 
@@ -49,8 +72,9 @@ The first release is **`v0.1.0`**, cut from current `main` as-is.
 ### What `--execute` does, in order
 
 1. Bump the version in `Cargo.toml`.
-2. Run the pre-release hook — git-cliff regenerates `CHANGELOG.md` (full regeneration with
-   `--tag v${NEW_VERSION}`, not a prepend) and `git add`s it.
+2. Run the pre-release hook — `scripts/changelog.sh` prepends the `v${NEW_VERSION}` section
+   and its compare link, then `git add`s the file. If the dry run already wrote that section
+   (or you wrote it yourself), it is left as it stands.
 3. Make a **single commit** containing the version bump and the changelog.
 4. Tag that commit `v0.x.0`.
 5. Push the branch and the tag.
@@ -84,9 +108,9 @@ assert on observable artefacts (the generated changelog, the dry-run plan, a com
 
 - [ ] `cargo release patch` (dry-run, no `--execute`) reports a clean plan, runs the hook,
       and shows the regenerated changelog **without attempting a publish**.
-- [ ] `git cliff -o CHANGELOG.md` against real history produces valid Keep a Changelog output
-      — slice scopes (`feat(04): …`) stripped, merge / non-conventional commits retained — and
-      is **idempotent** (re-running yields no diff).
+- [ ] `NEW_VERSION=x.y.z scripts/changelog.sh` against real history produces valid Keep a
+      Changelog output — slice scopes (`feat(04): …`) stripped, `Changelog:` trailers used
+      where present — and is **idempotent** (re-running yields no diff).
 - [ ] `cargo build --release` is green and the resulting `target/release/gutter` runs.
 - [ ] `release.yml` passes `actionlint` (syntax + action-input check).
 

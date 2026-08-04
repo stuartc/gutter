@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-04
+
+### Added
+
+- Keys gutter used to swallow now reach the child: Delete, Home, End, PageUp, PageDown, Insert, Shift+Tab, F1–F12, `Alt+<key>` and modified arrows
+- The child negotiates the kitty and modifyOtherKeys keyboard protocols with your terminal directly, so a program that wants key-event reporting gets it
+- Application cursor keys, application keypad and bracketed paste follow the child's mode, and a paste reaches it whole — including while resize mode is up
+- Whatever the child asked your terminal for is put back when it exits, and re-asserted across Ctrl-Z and `fg`
+
+### Fixed
+
+- Gutter paints on your terminal when its output is redirected — `gutter cmd > log` now leaves the log empty instead of the screen blank
+- The terminal, its size and its line settings all come from one device, so a session whose stdin and stdout are different terminals no longer paints with the wrong geometry
+- Teardown attempts every restore step, so a failure part-way can no longer hand your shell back in raw mode
+- A clean exit resets colours and cursor shape, so your shell no longer comes back tinted or wearing the child's cursor
+- Every resize-mode key works on a terminal using the kitty keyboard protocol, not just Escape
+- A mouse report in a non-SGR encoding is dropped rather than panicking the render thread
+
 ## [0.2.2] - 2026-07-23
 
 ### Changed
@@ -116,6 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stop vim integration test leaking swap files
 - Fix loose ADR cites and width-default wording in comments
 
+[0.3.0]: https://github.com/stuartc/gutter/compare/v0.2.2..v0.3.0
 [0.2.2]: https://github.com/stuartc/gutter/compare/v0.2.1..v0.2.2
 [0.2.1]: https://github.com/stuartc/gutter/compare/v0.2.0..v0.2.1
 [0.2.0]: https://github.com/stuartc/gutter/compare/v0.1.0..v0.2.0

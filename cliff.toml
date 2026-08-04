@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 """
 # A Tera template to be rendered for each release in the changelog.
 # See https://keats.github.io/tera/docs/#introduction
+# A commit's entry is its `Changelog:` trailers if it has any — one bullet each,
+# so a slice that fixed three things says so — and its subject otherwise. Subjects
+# name the slice, not the change a user sees, so the ones worth reading get the
+# trailer written while the work is fresh. `default(value=[])` is load-bearing: a
+# non-conventional commit has no `footers` field at all and the render errors
+# without it.
 body = """
 {% if version -%}
     ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
@@ -21,9 +27,12 @@ body = """
 {% endif -%}
 {% for group, commits in commits | group_by(attribute="group") %}
     ### {{ group | upper_first }}
-    {% for commit in commits %}
+    {% for commit in commits %}{% set notes = commit.footers | default(value=[]) | filter(attribute="token", value="Changelog") -%}
+    {% if notes | length > 0 %}{% for note in notes %}
+        - {{ note.value | upper_first | trim }}\
+    {% endfor %}{% else %}
         - {{ commit.message | split(pat="\n") | first | upper_first | trim }}\
-    {% endfor %}
+    {% endif %}{% endfor %}
 {% endfor %}\n
 """
 # A Tera template to be rendered as the changelog's footer.
@@ -61,7 +70,22 @@ filter_unconventional = false
 # An array of regex based parsers for extracting data from the commit message.
 # Assigns commits to groups.
 # Optionally sets the commit's scope and can decide to exclude commits from further processing.
+#
+# Order matters twice over. The skips come first so nothing reaches the wording
+# parsers, and the conventional types sit above the keyword ones so `fix: remove
+# X` is filed as a fix rather than a removal. The keyword parsers below them only
+# exist for the pre-convention history.
 commit_parsers = [
+    { footer = "^Changelog:\\s*skip\\s*$", skip = true },
+    { message = "^Merge (pull request|branch|remote-tracking)", skip = true },
+    { message = "^chore\\(release\\)", skip = true },
+    { message = "^Release gutter version", skip = true },
+    # Work the repo does on itself. A slice's docs and tests are not a release note.
+    { message = "^(docs|test|refactor|chore|style|ci|build|perf)(\\(.*\\))?!?:", skip = true },
+
+    { message = "^feat", group = "Added" },
+    { message = "^fix", group = "Fixed" },
+
     { message = "^[a|A]dd", group = "Added" },
     { message = "^[s|S]upport", group = "Added" },
     { message = "^[r|R]emove", group = "Removed" },
@@ -69,9 +93,6 @@ commit_parsers = [
     { message = "^.*: support", group = "Added" },
     { message = "^.*: remove", group = "Removed" },
     { message = "^.*: delete", group = "Removed" },
-    { message = "^feat", group = "Added" },
-    { message = "^test", group = "Fixed" },
-    { message = "^fix", group = "Fixed" },
     { message = "^.*: fix", group = "Fixed" },
     { message = "^.*", group = "Changed" },
 ]

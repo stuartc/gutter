@@ -11,10 +11,10 @@ publish = false
 [package.metadata.release]
 publish = false
 allow-branch = ["main"]
-# Regenerate the changelog and stage it: cargo-release only auto-stages Cargo.toml
+# Write the changelog section and stage it: cargo-release only auto-stages Cargo.toml
 # and pre-release-replacements, so a hook-written file must be `git add`ed by the hook
-# itself. The `v` prefix matches the real tags; `&&` aborts the release if cliff fails.
-pre-release-hook = ["bash", "-c", "git cliff -o CHANGELOG.md --tag v${NEW_VERSION} && git add CHANGELOG.md"]
+# itself. The script prepends rather than regenerating — see its header for why.
+pre-release-hook = ["bash", "scripts/changelog.sh"]
 
 [dependencies]
 portable-pty = "0.9.0"

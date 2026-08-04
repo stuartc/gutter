@@ -118,6 +118,8 @@ The declared width a fixture is captured at **must** equal the `W` the gate repl
 
 Work proceeds in thin **vertical slices**, each cutting through every layer it touches and leaving the binary runnable and green. Commits carry an effort-scoped slice tag — `feat(kbd-1): …`, `test(kbd-3): …`, `docs(kbd-4): …` — where the word names the effort and the number the slice within it. (The first iteration used bare slice numbers, `feat(04): …`; those are still in the log.)
 
+**Changelog wording lives in a trailer.** `git cliff` builds `CHANGELOG.md` from the log, and a slice subject names the slice, not the change a user sees. So a `feat`/`fix` commit worth a release note carries one `Changelog:` trailer per bullet, written in the user's terms — several are fine when one slice fixed several things. `Changelog: skip` as the only trailer drops the commit; a commit with no trailer falls back to its subject. `docs`, `test`, `refactor` and `chore` are skipped wholesale, so they need nothing. Efforts spanning many slices squash-merge under one subject with the trailers on the squash commit.
+
 ## Agent skills
 
 ### Issue tracker
