@@ -33,7 +33,7 @@
 //! Headless: a real PTY, no display, `TERM=xterm-256color`.
 
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 mod common;
 use common::{drain_window, find, pty_guard, spawn_gutter, wait_exit};
@@ -190,26 +190,15 @@ fn input_reaches_child_after_resume() {
     // Drain until the resume has happened: mouse is re-enabled at unpark, so a
     // SECOND ?1000h (the first is startup capture) marks the child as resumed and
     // its `read` now waiting.
-    let start = Instant::now();
-    let mut seen = Vec::new();
-    let mut buf = [0u8; 8192];
-    while start.elapsed() < Duration::from_secs(3) {
-        match s.try_read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => seen.extend_from_slice(&buf[..n]),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(_) => break,
-        }
-        let resumed = seen.windows(MOUSE_ON.len()).filter(|w| *w == MOUSE_ON).count() >= 2;
-        if resumed {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(3));
-    }
+    let resumed = |b: &[u8]| b.windows(MOUSE_ON.len()).filter(|w| *w == MOUSE_ON).count() >= 2;
+    let (_, seen) = common::poll_until(
+        &mut s,
+        Duration::from_secs(3),
+        Duration::from_millis(3),
+        resumed,
+    );
     assert!(
-        seen.windows(MOUSE_ON.len()).filter(|w| *w == MOUSE_ON).count() >= 2,
+        resumed(&seen),
         "resume must have re-enabled mouse capture before we type"
     );
 

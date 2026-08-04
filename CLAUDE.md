@@ -32,7 +32,7 @@ There is no `--help`; an unknown leading token is treated as the command. There 
 cargo test passthrough_echo                       # by name, any target
 cargo test --test passthrough                      # one integration file
 cargo test --test equivalence_pty --features oracle   # the gate (needs the feature)
-cargo test --lib                                   # only the in-crate unit tests
+cargo test --bin gutter                            # only the in-crate unit tests (there is no lib target)
 ```
 
 Integration tests drive a **real PTY** via `expectrl` and assert on what the outer terminal actually sees, not on gutter internals. They need a valid `TERM` (CI sets `xterm-256color`). The `--features oracle` build is the only one that compiles `src/oracle/` and the equivalence gate; the default build never pulls the heavy wezterm dependency tree.
@@ -68,11 +68,11 @@ Most files map one-to-one onto a concern; the non-obvious split:
 
 | File | Responsibility |
 |------|----------------|
-| `src/main.rs` | Orchestration: spawn PTY, eager mouse capture, open `/dev/tty` clipboard sink, start threads, run Thread 2. |
-| `src/anchor.rs` | The input tty, and the startup CPR probe behind the inline anchor: hand-rolled so keystrokes typed during startup survive as leftover rather than vanishing into crossterm's event queue. |
+| `src/main.rs` | Orchestration: open the terminal (the open is the startup guard) and thread its path to the keyboard and clipboard opens, spawn PTY, eager mouse capture, start threads, run Thread 2. |
+| `src/anchor.rs` | The input tty, and the startup CPR probe behind the inline anchor: hand-rolled so keystrokes typed during startup survive as leftover rather than vanishing into crossterm's event queue. The query goes out through the band's own sink, so the terminal that is asked is the one that answers. |
 | `src/cli.rs` | Hand-rolled arg parse (no clap). `--width N\|Npct\|N%`, `--center`/`--left`. |
 | `src/geometry.rs` | Pure layout maths: `margin()`, `resolve_width()` (absolute vs proportional), `physical_col()`. No I/O; property-tested. |
-| `src/terminal.rs` | `OuterTerminal` trait abstracting every outer side effect; crossterm impl + a recording mock for restore-order / column assertions. |
+| `src/terminal.rs` | `OuterTerminal` trait abstracting every outer side effect; crossterm impl over a buffered tty handle (`open_tty_write` — `/dev/tty`, else the terminal gutter's own stdio names; also the startup guard), plus the size and raw-mode ioctls on that handle + a recording mock for restore-order / column assertions. |
 | `src/callbacks.rs` | `vt100::Callbacks` impl holding the DECSCUSR cursor-shape watcher, the device-query replies, the keyboard-mode relay hook and the OSC-52 hook. |
 | `src/input.rs` | Thread 3 — the dumb outer-tty read pump. Owns the read fd, interprets nothing. |
 | `src/scan.rs` | The input scanner, on the render thread: raw bytes → tokens (forwarded runs, whole escape sequences, SGR-1006 mouse reports, paste spans) plus the `ESC_HOLD` constant. Pure — no I/O, no clock, no terminal. Everything it does not extract is forwarded verbatim. |
@@ -81,7 +81,7 @@ Most files map one-to-one onto a concern; the non-obvious split:
 | `src/relay.rs` | The child's keyboard-mode relay and its undo log: a closed allowlist of sequences forwarded outward as canonical bytes. |
 | `src/modes.rs` | The three modes vt100 absorbs into screen state (DECCKM, application keypad, bracketed paste), mirrored onto the outer terminal by poll-diff. |
 | `src/mouse.rs` | Pure forwarding gate: live `(mode, encoding)` in, translated/down-filtered SGR-1006 out. Also owns the eager-capture wire bundle, which has to stay inside what the scanner can extract. |
-| `src/clipboard.rs` | OSC-52 wire reconstruction → separate `/dev/tty` (so clipboard write and frame repaint don't fight over fd state). |
+| `src/clipboard.rs` | OSC-52 wire reconstruction → its own open of the resolved terminal (so clipboard write and frame repaint don't fight over fd state). Also the read-write open the input tty is made from. |
 | `src/cursor.rs` | DECSCUSR cursor-shape mirroring to the outer terminal. |
 | `src/clock.rs` | Injectable clock + receiver, so the coalescing loop is unit-testable with a virtual clock and scripted messages — no real PTY, no threads. |
 | `src/oracle/` | **Feature-gated** equivalence gate (`gate.rs`, `cellview.rs`): replays bytes through both vt100 and wezterm-term at the same width and diffs cells. |
@@ -93,7 +93,8 @@ the one-liners below are the quick reference.
 
 - **Coalescing loop.** Fixed-deadline ~60fps coalescer; the explicit `now >= deadline` burst-exit check is mandatory. See [ADR-007](docs/adr/0007-coalescing-loop.md).
 - **Resize order (on the render thread).** Recompute `W` → `resizer.resize(W, rows)` (TIOCSWINSZ first) → `parser.set_size(rows, W)` (mind the `(rows, cols)` order) → recompute margin → baseline reset. See [ADR-008](docs/adr/0008-resize-ordering.md).
-- **Teardown is explicit and ordered.** No destructors after `process::exit`; restore by hand, each step conditional on what was set up. See [ADR-010](docs/adr/0010-ordered-teardown.md).
+- **One terminal, and opening it is the guard.** The band's sink, the keyboard, the clipboard, the size and the termios all come from one device: `/dev/tty`, or — with no controlling terminal — the terminal `ttyname` names on stdin, stdout or stderr, reopened by name and used for every handle. Nothing asks crossterm which terminal it is: the size is a `TIOCGWINSZ` on the sink's own fd and raw mode a `tcgetattr`/`tcsetattr` on it. stdout is never written, so `gutter cmd > log` paints on screen and leaves the log empty. Neither route opening means one line to stderr and exit 1, before the child is spawned; the read-write open for the keyboard is *not* the guard — a terminal that paints but will not open for reading runs watch-only. The read side is opened once — the startup probe and Thread 3 share it, or they race for the CPR reply. See [ADR-023](docs/adr/0023-controlling-terminal-fd-model.md).
+- **Teardown is explicit and ordered, and best-effort per step.** No destructors after `process::exit`; restore by hand, each step conditional on what was set up, and every step attempted even after an earlier one failed — `disable_raw_mode` has to run whatever else went wrong, exactly as it does in the suspend path's park, which runs the same step list — the attribute and cursor-shape resets included. The sink is a `BufWriter`, so `show_cursor`'s flush is what puts the restore on screen while the order still holds. See [ADR-010](docs/adr/0010-ordered-teardown.md) and [ADR-023](docs/adr/0023-controlling-terminal-fd-model.md).
 - **Keyboard is never interpreted.** Bytes from the outer tty go to the child untouched, except SGR mouse reports (translated), the reserved chord, the in-mode resize keys and the paste guards. The child's mode requests are relayed out so the child and the terminal negotiate directly. See [ADR-020](docs/adr/0020-raw-input-passthrough.md) and [ADR-021](docs/adr/0021-child-driven-mode-relay.md).
 - **The ESC-hold flushes whole, never split.** An ambiguous `ESC` prefix is withheld until the sequence completes or the timeout fires; on timeout the entire pending buffer is flushed verbatim and in order. Splitting it leaks escape-sequence fragments into the child's prompt. Nothing overtakes the hold buffer. See [ADR-020](docs/adr/0020-raw-input-passthrough.md).
 - **Relayed bytes are canonical, never re-serialised from parameters.** vte cannot tell an omitted CSI parameter from an explicit `0`, so joining parameters back together turns the kitty query `CSI ? u` into `CSI ? 0 u` and a bare pop into a zero-level pop. Each matched shape emits a fixed string. See [ADR-021](docs/adr/0021-child-driven-mode-relay.md).

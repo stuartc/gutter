@@ -1,4 +1,4 @@
-//! Slice 06 OSC-52 clipboard-write — the PTY-driven end-to-end leg (ADR-004).
+//! OSC-52 clipboard-write — the PTY-driven end-to-end leg (ADR-004).
 //!
 //! The unit suite in `src/callbacks.rs` drives `parser.process()` with a
 //! recording callback and pins exactly what vt100/vte dispatches (the
@@ -10,7 +10,7 @@
 //! own controlling terminal, so the reconstructed sequence surfaces in the bytes
 //! the outer terminal receives. We scan for it there.
 //!
-//! This proves the whole spine the slice exists for: child copy → Thread 1 pump
+//! This proves the whole spine: child copy → Thread 1 pump
 //! → Thread 2 `parser.process` → vt100 dispatch → reconstruct → `/dev/tty`. The
 //! `data` is asserted **byte-for-byte** the base64 the child emitted (no
 //! round-trip mangling). The byte-exact reconstruction and the

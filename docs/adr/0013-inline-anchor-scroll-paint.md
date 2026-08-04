@@ -33,11 +33,29 @@ exit. A TUI that went straight to alt and never painted inline leaves nothing be
   TUI leaves no stray status line.
 - The status line prints only on a non-zero exit.
 
+## Amendment — the CPR query travels over the terminal that answers it
+
+The probe used to write `ESC [ 6 n` to stdout and read the `ESC [ row ; col R` answer
+back off `/dev/tty`: a question posed on one handle and an answer expected on another.
+That worked only because the two usually happened to be the same terminal. With stdout
+redirected the question went into the file, nothing could ever answer, and the anchor
+fell back to `rows - 1` a full `CPR_TIMEOUT` later — 100 ms of dead startup on every
+run of `gutter cmd > log`.
+
+Since [ADR-023](0023-controlling-terminal-fd-model.md) the query goes out through the
+band's own sink, so query and reply are the same terminal by construction. The "no tty
+at all" arm of the capture is gone with it: startup has already refused a run with no
+terminal to paint on, so the only fallback left is the one that always mattered — the
+terminal did not answer in time, and the anchor takes `rows - 1`. Never row 0, which is
+the overpaint this record exists to prevent.
+
 ## Code anchors
 
 - `src/render.rs` — the anchor, make-room scroll, scroll emit, and hand-back; the
   scroll-tracker field
-- `src/main.rs` — the CPR anchor capture
+- `src/anchor.rs` — the hand-rolled probe and the input handle it reads the reply from
+- `src/main.rs` — the CPR anchor capture and the `GUTTER_FORCE_ANCHOR_ROW` override
 
 The teardown ordering is [ADR-010](0010-ordered-teardown.md); the screen-mode
-mirroring is [ADR-012](0012-screen-mode-mirroring.md).
+mirroring is [ADR-012](0012-screen-mode-mirroring.md). The terminal the probe asks,
+and the handle it asks on, are [ADR-023](0023-controlling-terminal-fd-model.md).

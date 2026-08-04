@@ -1,12 +1,8 @@
-//! PTY-driven integration tests for the modal resize-mode state machine (stream
-//! B of the band-width-resize feature: PRD 0001, Feature 2 minus the painting).
+//! PTY-driven integration tests for the modal resize-mode state machine.
 //!
 //! These drive the real `gutter` binary through a real PTY and assert on what
-//! the outer terminal actually shows — never on gutter internals. Reuses the
-//! harness helpers from `tests/resize.rs`.
-//!
-//! B's integration scope is the width change via the modal keys (the rails are
-//! stream C's integration test).
+//! the outer terminal actually shows — never on gutter internals. The scope here
+//! is the width change via the modal keys; the rails are `tests/rails_pty.rs`.
 //!
 //! `--resize-key ctrl-o` is the harness chord for most of the suite; the default
 //! `ctrl-\` (raw `0x1C`) gets one dedicated smoke test so that path is exercised
@@ -40,11 +36,6 @@ fn last_painted_col(screen: &vt100::Screen, cols: u16) -> Option<u16> {
 /// `stty size` on SIGWINCH (the resize path re-sizes the child's PTY, which the
 /// child observes exactly like a real terminal resize). Send the enter chord
 /// then several `l`s; the child's reported columns must grow.
-///
-/// Not asserted here: the outer band's painted span widening to match. Without
-/// stream C's rails, the only painted content is this short `rows cols` text
-/// line at the left margin, so a grow does not itself widen what's painted —
-/// the child-reported column count is the robust observable until C lands.
 #[test]
 fn resize_key_grows_band() {
     let child = "/bin/sh -c 'trap \"stty size\" WINCH; stty size; while true; do sleep 0.2; done'";
@@ -75,9 +66,8 @@ fn resize_key_grows_band() {
     drop(session);
 }
 
-/// **Shrink narrows the band.** Grow then shrink back down with `h`; the band
-/// must narrow (and, once stream C lands, the vacated strip is blank — for now
-/// this only asserts the width actually decreased).
+/// **Shrink narrows the band.** Grow then shrink back down with `h`; the child's
+/// reported columns must decrease.
 #[test]
 fn resize_key_shrinks_band() {
     let child = "/bin/sh -c 'trap \"stty size\" WINCH; stty size; while true; do sleep 0.2; done'";

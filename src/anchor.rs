@@ -8,8 +8,9 @@
 //! the probe hands them back instead.
 
 use std::fs::File;
-use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::clipboard;
@@ -18,24 +19,24 @@ use crate::clipboard;
 /// answers in a millisecond or two.
 pub const CPR_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// The tty gutter reads input from: `/dev/tty` (a separate open from the
-/// clipboard's, ADR-004), falling back to a `dup` of stdin.
-pub fn open_input_tty() -> Option<File> {
-    if let Ok(tty) = clipboard::open_tty_read_write() {
-        return Some(tty);
-    }
-    // SAFETY: `dup` returns a fresh descriptor this process owns outright, so
-    // handing it to `File` transfers a genuinely exclusive ownership.
-    let fd = unsafe { libc::dup(0) };
-    (fd >= 0).then(|| unsafe { File::from_raw_fd(fd) })
+/// The tty gutter reads input from: another open of the device the render sink came
+/// from, separate from the clipboard's (ADR-004) and from the sink's own.
+pub fn open_input_tty(tty: &Path) -> io::Result<File> {
+    clipboard::open_tty_read_write(tty)
 }
 
-/// Ask the terminal where the cursor is (DSR-CPR, `ESC [ 6 n`) and read the
+/// Ask the terminal where the cursor is (DSR-CPR, `ESC [ 6 n`) on `out` and read the
 /// `ESC [ row ; col R` answer back off the input tty. Returns the 0-based row and
 /// **everything else that was read** — bytes the user typed while gutter was
 /// starting, which the caller must not drop.
-pub fn probe_cursor_row(tty: &File, timeout: Duration) -> (Option<u16>, Vec<u8>) {
-    let mut out = std::io::stdout();
+///
+/// `out` is the band's sink: query and reply have to travel over the same terminal,
+/// or nothing ever answers.
+pub fn probe_cursor_row(
+    out: &mut impl Write,
+    tty: &File,
+    timeout: Duration,
+) -> (Option<u16>, Vec<u8>) {
     if out.write_all(b"\x1b[6n").is_err() || out.flush().is_err() {
         return (None, Vec::new());
     }
@@ -102,20 +103,13 @@ fn find_cpr(buf: &[u8]) -> Option<(usize, usize, u16)> {
             continue;
         }
         let digits_start = start + 2;
-        let mut i = digits_start;
-        while i < buf.len() && buf[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i == digits_start || i >= buf.len() || buf[i] != b';' {
+        let row_end = digits_end(buf, digits_start);
+        if row_end == digits_start || buf.get(row_end) != Some(&b';') {
             continue;
         }
-        let row_end = i;
-        i += 1;
-        let col_start = i;
-        while i < buf.len() && buf[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i == col_start || i >= buf.len() || buf[i] != b'R' {
+        let col_start = row_end + 1;
+        let col_end = digits_end(buf, col_start);
+        if col_end == col_start || buf.get(col_end) != Some(&b'R') {
             continue;
         }
         let Ok(text) = std::str::from_utf8(&buf[digits_start..row_end]) else {
@@ -126,21 +120,31 @@ fn find_cpr(buf: &[u8]) -> Option<(usize, usize, u16)> {
         };
         // The reply is 1-based; the grid is 0-based.
         let row0 = row.saturating_sub(1).min(u16::MAX as u32) as u16;
-        return Some((start, i + 1, row0));
+        return Some((start, col_end + 1, row0));
     }
     None
+}
+
+/// The index just past the run of ASCII digits starting at `from`.
+fn digits_end(buf: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < buf.len() && buf[i].is_ascii_digit() {
+        i += 1;
+    }
+    i
 }
 
 #[cfg(test)]
 mod tests {
     use super::{find_cpr, open_input_tty, wait_readable};
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     /// The macOS `/dev/tty` guard: `poll()` there returns `POLLNVAL` at once, so a
     /// probe built on it gives up before the terminal can answer.
     #[test]
     fn waiting_on_an_idle_tty_uses_the_whole_timeout() {
-        let Some(tty) = open_input_tty() else {
+        let Ok(tty) = open_input_tty(Path::new("/dev/tty")) else {
             return; // No tty at all (CI): nothing to wait on.
         };
         if wait_readable(&tty, Duration::from_millis(0)) {

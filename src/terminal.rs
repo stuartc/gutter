@@ -2,20 +2,34 @@
 //! output sink, behind one injectable trait so the render path can be tested
 //! against a recording mock.
 //!
+//! The sink is the process's terminal, not stdout: gutter paints the band on the
+//! screen the keyboard, the size and the clipboard already come from, and
+//! `gutter cmd > log` leaves the log empty.
+//!
 //! Lifecycle is raw mode, the mirrored alt screen, and an explicit ordered
 //! restore (ADR-010). Teardown runs before `process::exit`, which skips
 //! destructors — so it cannot be a `Drop` guard. Setup and teardown are
 //! symmetric: each restore step undoes only what was actually set up. The alt
 //! screen is not forced at setup; it mirrors the child's mode (ADR-012).
 
-use std::io::{self, Write};
+use std::ffi::{CStr, OsStr};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::queue;
+use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 
 use crate::geometry::Rails;
 use crate::mouse::{MOUSE_DISABLE, MOUSE_ENABLE};
 
 /// The outer-terminal side effects the setup, render and teardown paths perform.
 ///
-/// [`CrosstermTerminal`] wraps crossterm against stdout; [`mock::MockTerminal`]
+/// [`CrosstermTerminal`] wraps crossterm against `/dev/tty`; [`mock::MockTerminal`]
 /// records the ordered calls so the restore-order and offset-repaint tests can
 /// assert against them.
 pub trait OuterTerminal {
@@ -42,7 +56,7 @@ pub trait OuterTerminal {
     /// Move the cursor to physical `(col, row)`, emitted before each repainted
     /// row so the row's bytes land at the band's left margin.
     fn move_to(&mut self, col: u16, row: u16) -> io::Result<()>;
-    /// Write a row's `rows_diff` byte run verbatim — `prepare_row` has made it
+    /// Write a row's `rows_diff` byte run verbatim — `prepare_row_into` has made it
     /// self-contained, so it carries its own intra-row SGR and relative cursor
     /// moves, scoped to `[0, W)` (ADR-014).
     fn write_row(&mut self, bytes: &[u8]) -> io::Result<()>;
@@ -95,8 +109,8 @@ pub trait OuterTerminal {
 
     // --- Child-driven keyboard modes (ADR-021) ---
     /// Write child-originated keyboard-mode bytes to the real terminal verbatim, and
-    /// flush them: the child may be blocked waiting on the round trip, and crossterm's
-    /// stdout is buffered. The bytes are the relay's canonical forms, so this method
+    /// flush them: the child may be blocked waiting on the round trip, and the sink is
+    /// buffered. The bytes are the relay's canonical forms, so this method
     /// neither builds nor inspects them.
     ///
     /// Distinct from [`write_row`] so the recorded call log keeps relay bytes apart
@@ -123,32 +137,162 @@ pub trait OuterTerminal {
     fn disable_raw_mode(&mut self) -> io::Result<()>;
 }
 
-/// The real outer terminal, backed by crossterm against stdout.
-pub struct CrosstermTerminal {
-    out: io::Stdout,
-    /// Whether mouse capture was enabled at startup, so teardown disables only
-    /// what it set.
-    mouse_enabled: bool,
-}
-
-impl CrosstermTerminal {
-    pub fn new() -> Self {
-        Self {
-            out: io::stdout(),
-            mouse_enabled: false,
-        }
+/// Opens the terminal for writing — the band's sink — and names the device it came
+/// from, so every other handle gutter opens is opened from that same device.
+///
+/// `/dev/tty`, the controlling terminal, first. A process handed a terminal on its
+/// stdio without that terminal being made its controlling terminal has no `/dev/tty`
+/// to open — `setsid gutter bash`, or any launcher that attaches a PTY but omits
+/// `TIOCSCTTY` — so the terminal gutter's own stdio names is the second route, reopened
+/// **by name**: `dup`ing a descriptor would hand back the caller's file description,
+/// where the clipboard (ADR-004) and the probe/Thread-3 split both need independent ones.
+///
+/// The open doubles as gutter's terminal guard: both routes failing means there is no
+/// screen to render a band on. Which route failed is in the error — the fallback's
+/// names the device it could not open, so a refusal there does not read as `/dev/tty`'s.
+pub fn open_tty_write() -> io::Result<(File, PathBuf)> {
+    let dev_tty = PathBuf::from("/dev/tty");
+    let no_ctty = match open_write(&dev_tty) {
+        Ok(f) => return Ok((f, dev_tty)),
+        Err(e) => e,
+    };
+    let Some(path) = stdio_tty_path() else {
+        return Err(no_ctty);
+    };
+    match open_write(&path) {
+        Ok(f) => Ok((f, path)),
+        // Not `no_ctty`: gutter did find a screen and was refused when it reopened it,
+        // and reporting `/dev/tty`'s reason instead sends the reader at the wrong device.
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("{}: {e}", path.display()),
+        )),
     }
 }
 
-impl Default for CrosstermTerminal {
-    fn default() -> Self {
-        Self::new()
+/// The terminal's `(cols, rows)`, asked of the device gutter resolved.
+///
+/// Not crossterm's `terminal::size`, which runs its own resolution — its own `/dev/tty`
+/// open, then an ioctl on stdout, then `tput`, then 80×24. On the fallback route that
+/// answers for a different device than the band is painted on, or for no terminal at
+/// all with stdout redirected, and the size is the one number that positions the band
+/// and sizes the child's PTY (ADR-023).
+pub fn tty_size(tty: &File) -> io::Result<(u16, u16)> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: `TIOCGWINSZ` writes one `winsize` through the pointer it is given, and
+    // the descriptor is borrowed from a live `File` for the length of the call.
+    let rc = unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ as _, &mut ws) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // A terminal that reports a zero dimension has no usable geometry; treat it as a
+    // failed query so the caller takes its own fallback rather than laying out a
+    // zero-column band.
+    if ws.ws_col == 0 || ws.ws_row == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the terminal reports a zero dimension",
+        ));
+    }
+    Ok((ws.ws_col, ws.ws_row))
+}
+
+/// `O_NOCTTY`: naming a terminal must not make it gutter's controlling terminal.
+/// Where the fallback fires gutter is a session leader with none, and on Linux a
+/// plain `open` of a free terminal would silently adopt it — the fallback widens how
+/// gutter finds a screen, not what session it is in.
+fn open_write(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(path)
+}
+
+/// The path of the terminal on gutter's stdio, if any of the three descriptors names
+/// one.
+///
+/// All three, not stdin alone: a launcher that attaches a PTY usually puts it on 0, 1
+/// and 2, but a supervisor that pipes stdin — `setsid sh -c 'true | gutter bash'` — still
+/// leaves a usable screen on 1 or 2, and refusing to run there would be refusing a
+/// terminal gutter can see.
+fn stdio_tty_path() -> Option<PathBuf> {
+    [
+        libc::STDIN_FILENO,
+        libc::STDOUT_FILENO,
+        libc::STDERR_FILENO,
+    ]
+    .into_iter()
+    .find_map(tty_path)
+}
+
+/// The path of the terminal on `fd`, if it is one.
+fn tty_path(fd: i32) -> Option<PathBuf> {
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: `ttyname_r` writes at most `buf.len()` bytes into the buffer it is
+    // given, and the three standard descriptor numbers are always valid to ask about.
+    let rc = unsafe { libc::ttyname_r(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let name = CStr::from_bytes_until_nul(&buf).ok()?.to_bytes();
+    (!name.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(name)))
+}
+
+/// The real outer terminal, backed by crossterm against the terminal
+/// [`open_tty_write`] resolved.
+pub struct CrosstermTerminal {
+    /// Buffered: one `move_to` is several small writes, and unbuffered they would
+    /// be several syscalls. Every write here is landed by an explicit flush — no
+    /// destructor runs before `process::exit` (ADR-010).
+    out: BufWriter<File>,
+    /// Whether mouse capture was enabled at startup, so teardown disables only
+    /// what it set.
+    mouse_enabled: bool,
+    /// The terminal's line settings as gutter found them, saved on the first raw-mode
+    /// enable and never overwritten — the suspend cycle's park/unpark re-enables raw
+    /// mode over a state park itself restored, and saving again there would make
+    /// teardown hand the shell back what park left rather than what the user had.
+    /// `None` means raw mode was never taken, so there is nothing to put back.
+    saved_termios: Option<libc::termios>,
+}
+
+impl CrosstermTerminal {
+    pub fn new(tty: File) -> Self {
+        Self {
+            out: BufWriter::new(tty),
+            mouse_enabled: false,
+            saved_termios: None,
+        }
+    }
+
+    /// The band's sink, for the startup CPR probe: its query has to leave by the
+    /// same terminal the reply comes back from.
+    pub fn writer(&mut self) -> &mut impl Write {
+        &mut self.out
+    }
+
+    fn fd(&self) -> i32 {
+        self.out.get_ref().as_raw_fd()
     }
 }
 
 impl OuterTerminal for CrosstermTerminal {
+    /// Raw mode on the resolved device, by `termios` rather than through crossterm.
+    ///
+    /// crossterm sets it on stdin when stdin is a terminal and reopens `/dev/tty`
+    /// otherwise — a third answer to which terminal gutter is talking to, and one that
+    /// fails outright on the fallback route when stdin is a pipe. The line settings live
+    /// on the device, not on the descriptor, so setting them through the band's sink is
+    /// what the read side sees too (ADR-023).
     fn enable_raw_mode(&mut self) -> io::Result<()> {
-        crossterm::terminal::enable_raw_mode()
+        let fd = self.fd();
+        let mut termios = current_termios(fd)?;
+        if self.saved_termios.is_none() {
+            self.saved_termios = Some(termios);
+        }
+        // SAFETY: `cfmakeraw` only rewrites the flags of the struct it is handed.
+        unsafe { libc::cfmakeraw(&mut termios) };
+        set_termios(fd, &termios)
     }
 
     fn enable_mouse(&mut self) -> io::Result<()> {
@@ -159,17 +303,15 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn enter_alt_screen(&mut self) -> io::Result<()> {
-        use crossterm::{queue, terminal::EnterAlternateScreen};
         queue!(self.out, EnterAlternateScreen)?;
         self.out.flush()
     }
 
     fn terminal_size(&mut self) -> io::Result<(u16, u16)> {
-        crossterm::terminal::size()
+        tty_size(self.out.get_ref())
     }
 
     fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
-        use crossterm::{cursor::MoveTo, queue};
         queue!(self.out, MoveTo(col, row))
     }
 
@@ -191,8 +333,9 @@ impl OuterTerminal for CrosstermTerminal {
         row_start: u16,
         row_end: u16,
     ) -> io::Result<()> {
-        use crossterm::{cursor::MoveTo, queue};
         let band_end = margin.saturating_add(width).min(real_cols);
+        let left = b" ".repeat(margin as usize);
+        let right = b" ".repeat(real_cols.saturating_sub(band_end) as usize);
         // Reset SGR first so the blanks are painted with the default background
         // (a leftover colour run would tint the gutter).
         self.out.write_all(b"\x1b[0m")?;
@@ -200,24 +343,18 @@ impl OuterTerminal for CrosstermTerminal {
             // Left gutter: physical columns [0, margin).
             if margin > 0 {
                 queue!(self.out, MoveTo(0, row))?;
-                self.out.write_all(&b" ".repeat(margin as usize))?;
+                self.out.write_all(&left)?;
             }
             // Right gutter: physical columns [band_end, real_cols).
             if real_cols > band_end {
                 queue!(self.out, MoveTo(band_end, row))?;
-                self.out
-                    .write_all(&b" ".repeat((real_cols - band_end) as usize))?;
+                self.out.write_all(&right)?;
             }
         }
         Ok(())
     }
 
     fn clear_row_span(&mut self, row_start: u16, row_end: u16) -> io::Result<()> {
-        use crossterm::{
-            cursor::MoveTo,
-            queue,
-            terminal::{Clear, ClearType},
-        };
         // Reset SGR first so the cleared rows carry the default background (a leftover
         // colour run would tint them), matching clear_gutter.
         self.out.write_all(b"\x1b[0m")?;
@@ -228,7 +365,6 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn draw_rails(&mut self, rails: &Rails) -> io::Result<()> {
-        use crossterm::{cursor::MoveTo, queue};
         self.out.write_all(b"\x1b[0m")?; // drop any leftover attribute run
         for row in rails.row_start..rails.row_end {
             if let Some(c) = rails.left_col {
@@ -249,15 +385,10 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {
-        use crossterm::{cursor::MoveTo, queue};
-        queue!(self.out, MoveTo(col, row))
+        self.move_to(col, row)
     }
 
     fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
-        use crossterm::{
-            cursor::{Hide, Show},
-            queue,
-        };
         if visible {
             queue!(self.out, Show)
         } else {
@@ -280,7 +411,6 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn leave_alt_screen(&mut self) -> io::Result<()> {
-        use crossterm::{queue, terminal::LeaveAlternateScreen};
         queue!(self.out, LeaveAlternateScreen)?;
         self.out.flush()
     }
@@ -298,13 +428,136 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn show_cursor(&mut self) -> io::Result<()> {
-        use crossterm::{cursor::Show, queue};
         queue!(self.out, Show)?;
         self.out.flush()
     }
 
+    /// Put back the line settings gutter found, if it ever took raw mode. Undoes only
+    /// what was set up (ADR-010), and restores the user's own settings rather than a
+    /// canonical default.
     fn disable_raw_mode(&mut self) -> io::Result<()> {
-        crossterm::terminal::disable_raw_mode()
+        match self.saved_termios {
+            Some(saved) => set_termios(self.fd(), &saved),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The terminal's current line settings.
+fn current_termios(fd: i32) -> io::Result<libc::termios> {
+    // SAFETY: `tcgetattr` writes one `termios` through the pointer it is given.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(termios)
+}
+
+/// Apply line settings, at once rather than after the output queue drains: gutter's own
+/// frames are already in flight, and waiting on them would let the mode change lag the
+/// keystroke that caused it.
+fn set_termios(fd: i32, termios: &libc::termios) -> io::Result<()> {
+    // SAFETY: `tcsetattr` only reads the `termios` it is given.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, termios) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! [`CrosstermTerminal`] against a plain file: the sink is whatever `File` it
+    //! was handed, so its buffering is testable without a terminal.
+
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A temp path that removes itself, so a test can read back what the sink wrote.
+    struct SinkFile(PathBuf);
+
+    impl SinkFile {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("gutter-sink-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            Self(path)
+        }
+
+        fn terminal(&self) -> CrosstermTerminal {
+            CrosstermTerminal::new(File::create(&self.0).expect("create the sink file"))
+        }
+
+        fn contents(&self) -> Vec<u8> {
+            std::fs::read(&self.0).expect("read the sink file")
+        }
+    }
+
+    impl Drop for SinkFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// The sink is buffered, so a queued frame reaches the terminal only when
+    /// something flushes it. `process::exit` runs no destructor that would land it
+    /// (ADR-010).
+    #[test]
+    fn queued_output_lands_only_on_flush() {
+        let sink = SinkFile::new("flush");
+        let mut term = sink.terminal();
+
+        term.move_to(4, 2).expect("move to the band");
+        term.write_row(b"band").expect("write a row");
+        assert!(
+            sink.contents().is_empty(),
+            "queued output must not reach the terminal before the flush"
+        );
+
+        term.flush().expect("flush the sink");
+        let out = sink.contents();
+        assert!(
+            out.ends_with(b"band"),
+            "the flush must land the queued frame, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// `show_cursor` is the last byte-producing step of the ordered restore, and it
+    /// flushes — so everything the teardown queued ahead of it lands.
+    #[test]
+    fn show_cursor_lands_what_teardown_queued_before_it() {
+        let sink = SinkFile::new("teardown");
+        let mut term = sink.terminal();
+
+        term.move_to(0, 5).expect("move below the band");
+        term.write_row(b"\r\n\x1b[2mExited with: 3\x1b[0m")
+            .expect("write the hand-back status");
+        term.show_cursor().expect("show the cursor");
+
+        let out = String::from_utf8_lossy(&sink.contents()).into_owned();
+        assert!(
+            out.contains("Exited with: 3"),
+            "the restore's queued bytes must land, got {out:?}"
+        );
+    }
+
+    /// The probe writes through the band's own sink: its query and the frames that
+    /// follow it are the same buffered stream to the same terminal.
+    #[test]
+    fn the_probe_writes_through_the_band_sink() {
+        let sink = SinkFile::new("probe");
+        let mut term = sink.terminal();
+
+        term.writer().write_all(b"\x1b[6n").expect("write the query");
+        term.write_row(b"band").expect("write a row");
+        term.flush().expect("flush the sink");
+
+        let out = sink.contents();
+        assert_eq!(
+            out,
+            b"\x1b[6nband",
+            "query and band must share one sink, in order"
+        );
     }
 }
 
@@ -374,6 +627,9 @@ pub mod mock {
         /// shared cell so a test (or the mock suspender's on-suspend hook) can flip
         /// it mid-cycle to model a resize while gutter was suspended (ADR-0019).
         size: std::rc::Rc<std::cell::Cell<(u16, u16)>>,
+        /// Call variants that return an error, so a test can drive a restore step
+        /// that fails against a terminal that has gone away.
+        failing: Vec<std::mem::Discriminant<Call>>,
     }
 
     impl MockTerminal {
@@ -400,30 +656,50 @@ pub mod mock {
             self.size.clone()
         }
 
+        /// Make the given call fail, matched on its variant alone — any argument will
+        /// do, so `fail_on(Call::WriteRow(vec![]))` fails every row write. The call is
+        /// still recorded: it was invoked, it just did not succeed.
+        pub fn fail_on(&mut self, call: Call) {
+            self.failing.push(std::mem::discriminant(&call));
+        }
+
         /// Record one call: into `calls`, and into the shared order log if one is
         /// attached. The single choke point every `OuterTerminal` method funnels
-        /// through, so nothing bypasses the interleaved log.
-        fn record(&mut self, c: Call) {
+        /// through, so nothing bypasses the interleaved log — or the failure list.
+        fn record(&mut self, c: Call) -> io::Result<()> {
+            let fails = self.failing.contains(&std::mem::discriminant(&c));
+            let named = fails.then(|| format!("{c:?} failed"));
             if let Some(log) = &self.log {
                 log.borrow_mut().push(c.clone());
             }
             self.calls.push(c);
+            match named {
+                Some(msg) => Err(io::Error::other(msg)),
+                None => Ok(()),
+            }
         }
 
         /// The restore subsequence only, for the ADR-010 order assertion —
         /// filters out any render-output noise a frame emitted first.
+        ///
+        /// The attribute and cursor-shape resets are matched on their exact bytes, not
+        /// on their call variant: `write_row` and `set_cursor_shape` are how the render
+        /// path paints rows and mirrors the child's shape too, and a variant match would
+        /// pull every frame's output into the order assertion.
         pub fn restore_calls(&self) -> Vec<Call> {
             self.calls
                 .iter()
-                .filter(|c| {
-                    matches!(
-                        c,
-                        Call::LeaveAltScreen
-                            | Call::Relay(_)
-                            | Call::DisableMouse
-                            | Call::ShowCursor
-                            | Call::DisableRawMode
-                    )
+                .filter(|c| match c {
+                    Call::LeaveAltScreen
+                    | Call::Relay(_)
+                    | Call::DisableMouse
+                    | Call::ShowCursor
+                    | Call::DisableRawMode => true,
+                    Call::WriteRow(b) => b.as_slice() == crate::render::SGR_RESET,
+                    Call::SetCursorShape(b) => {
+                        b.as_slice() == crate::render::DEFAULT_CURSOR_SHAPE
+                    }
+                    _ => false,
                 })
                 .cloned()
                 .collect()
@@ -462,6 +738,12 @@ pub mod mock {
             Self {
                 parser: vt100::Parser::new(rows, phys_cols, scrollback),
             }
+        }
+
+        /// Feed a CUP to the physical parser. vt100 is 1-based, gutter's API 0-based.
+        fn goto(&mut self, col: u16, row: u16) {
+            self.parser
+                .process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
         }
 
         /// The trimmed contents of physical cell `(row, col)` — `""` when blank.
@@ -557,9 +839,7 @@ pub mod mock {
             Ok((cols, rows))
         }
         fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
-            // CSI row+1 ; col+1 H — vt100 is 1-based, gutter's API 0-based.
-            let seq = format!("\x1b[{};{}H", row + 1, col + 1);
-            self.parser.process(seq.as_bytes());
+            self.goto(col, row);
             Ok(())
         }
         fn write_row(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -586,13 +866,11 @@ pub mod mock {
             self.parser.process(b"\x1b[0m");
             for row in row_start..row_end {
                 if margin > 0 {
-                    let seq = format!("\x1b[{};1H", row + 1);
-                    self.parser.process(seq.as_bytes());
+                    self.goto(0, row);
                     self.parser.process(&b" ".repeat(margin as usize));
                 }
                 if real_cols > band_end {
-                    let seq = format!("\x1b[{};{}H", row + 1, band_end + 1);
-                    self.parser.process(seq.as_bytes());
+                    self.goto(band_end, row);
                     self.parser.process(&b" ".repeat((real_cols - band_end) as usize));
                 }
             }
@@ -603,8 +881,8 @@ pub mod mock {
             // readback sees the band interior cleared.
             self.parser.process(b"\x1b[0m");
             for row in row_start..row_end {
-                let seq = format!("\x1b[{};1H\x1b[2K", row + 1);
-                self.parser.process(seq.as_bytes());
+                self.goto(0, row);
+                self.parser.process(b"\x1b[2K");
             }
             Ok(())
         }
@@ -614,27 +892,23 @@ pub mod mock {
             self.parser.process(b"\x1b[0m");
             for row in rails.row_start..rails.row_end {
                 if let Some(c) = rails.left_col {
-                    let seq = format!("\x1b[{};{}H", row + 1, c + 1);
-                    self.parser.process(seq.as_bytes());
+                    self.goto(c, row);
                     self.parser.process("\x1b[2m\u{258f}\x1b[0m".as_bytes());
                 }
                 if let Some(c) = rails.right_col {
-                    let seq = format!("\x1b[{};{}H", row + 1, c + 1);
-                    self.parser.process(seq.as_bytes());
+                    self.goto(c, row);
                     self.parser.process("\x1b[2m\u{2595}\x1b[0m".as_bytes());
                 }
             }
             if let Some(r) = &rails.readout {
-                let seq = format!("\x1b[{};{}H", r.row + 1, r.col + 1);
-                self.parser.process(seq.as_bytes());
+                self.goto(r.col, r.row);
                 self.parser
                     .process(format!("\x1b[2m{}\x1b[0m", r.text).as_bytes());
             }
             Ok(())
         }
         fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {
-            let seq = format!("\x1b[{};{}H", row + 1, col + 1);
-            self.parser.process(seq.as_bytes());
+            self.goto(col, row);
             Ok(())
         }
         fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
@@ -673,32 +947,28 @@ pub mod mock {
 
     impl OuterTerminal for MockTerminal {
         fn enable_raw_mode(&mut self) -> io::Result<()> {
-            self.record(Call::EnableRawMode);
-            Ok(())
+            self.record(Call::EnableRawMode)
         }
         fn enable_mouse(&mut self) -> io::Result<()> {
-            self.record(Call::EnableMouse);
+            // Mirror the real impl: a failed enable leaves nothing to disable.
+            self.record(Call::EnableMouse)?;
             self.mouse_enabled = true;
             Ok(())
         }
         fn enter_alt_screen(&mut self) -> io::Result<()> {
-            self.record(Call::EnterAltScreen);
-            Ok(())
+            self.record(Call::EnterAltScreen)
         }
         fn terminal_size(&mut self) -> io::Result<(u16, u16)> {
             Ok(self.size.get())
         }
         fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
-            self.record(Call::MoveTo(col, row));
-            Ok(())
+            self.record(Call::MoveTo(col, row))
         }
         fn write_row(&mut self, bytes: &[u8]) -> io::Result<()> {
-            self.record(Call::WriteRow(bytes.to_vec()));
-            Ok(())
+            self.record(Call::WriteRow(bytes.to_vec()))
         }
         fn newline(&mut self) -> io::Result<()> {
-            self.record(Call::Newline);
-            Ok(())
+            self.record(Call::Newline)
         }
         fn clear_gutter(
             &mut self,
@@ -708,56 +978,49 @@ pub mod mock {
             row_start: u16,
             row_end: u16,
         ) -> io::Result<()> {
-            self.record(Call::ClearGutter(margin, width, real_cols, row_start, row_end));
-            Ok(())
+            self.record(Call::ClearGutter(margin, width, real_cols, row_start, row_end))
         }
         fn clear_row_span(&mut self, row_start: u16, row_end: u16) -> io::Result<()> {
-            self.record(Call::ClearRowSpan(row_start, row_end));
-            Ok(())
+            self.record(Call::ClearRowSpan(row_start, row_end))
         }
         fn draw_rails(&mut self, rails: &super::Rails) -> io::Result<()> {
-            self.record(Call::DrawRails(rails.clone()));
-            Ok(())
+            self.record(Call::DrawRails(rails.clone()))
         }
         fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {
-            self.record(Call::PlaceCursor(col, row));
-            Ok(())
+            self.record(Call::PlaceCursor(col, row))
         }
         fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
-            self.record(Call::SetCursorVisible(visible));
-            Ok(())
+            self.record(Call::SetCursorVisible(visible))
         }
         fn set_cursor_shape(&mut self, bytes: &[u8]) -> io::Result<()> {
-            self.record(Call::SetCursorShape(bytes.to_vec()));
-            Ok(())
+            self.record(Call::SetCursorShape(bytes.to_vec()))
         }
         fn flush(&mut self) -> io::Result<()> {
-            self.record(Call::Flush);
-            Ok(())
+            self.record(Call::Flush)
         }
         fn relay(&mut self, bytes: &[u8]) -> io::Result<()> {
-            self.record(Call::Relay(bytes.to_vec()));
-            Ok(())
+            self.record(Call::Relay(bytes.to_vec()))
         }
         fn leave_alt_screen(&mut self) -> io::Result<()> {
-            self.record(Call::LeaveAltScreen);
-            Ok(())
+            self.record(Call::LeaveAltScreen)
         }
         fn disable_mouse(&mut self) -> io::Result<()> {
-            // Mirror the real impl: only disable what was actually enabled.
-            if self.mouse_enabled {
-                self.record(Call::DisableMouse);
-                self.mouse_enabled = false;
+            // Mirror the real impl: only disable what was actually enabled, and a
+            // failed disable leaves the mouse still enabled — the real one's `?`
+            // returns before it clears the flag, so a later restore retries. Clearing
+            // it here regardless would let a regression that never re-disables pass.
+            if !self.mouse_enabled {
+                return Ok(());
             }
+            self.record(Call::DisableMouse)?;
+            self.mouse_enabled = false;
             Ok(())
         }
         fn show_cursor(&mut self) -> io::Result<()> {
-            self.record(Call::ShowCursor);
-            Ok(())
+            self.record(Call::ShowCursor)
         }
         fn disable_raw_mode(&mut self) -> io::Result<()> {
-            self.record(Call::DisableRawMode);
-            Ok(())
+            self.record(Call::DisableRawMode)
         }
     }
 }

@@ -1,4 +1,4 @@
-//! Slice 11 — gutter answers the child's device queries (the PTY-driven leg).
+//! gutter answers the child's device queries (the PTY-driven leg).
 //!
 //! The unit suite in `src/callbacks.rs` pins the exact reply bytes for each query
 //! against the pinned vt100, with no PTY. This file layers the end-to-end check:
@@ -51,7 +51,7 @@ sleep 1"#;
     drop(session);
 }
 
-/// **Prompt exit — no DA1 stall (the regression this slice removes).** The child
+/// **Prompt exit — no DA1 stall.** The child
 /// emits a Primary Device Attributes query (`CSI c`) and blocks reading the reply
 /// with a generous 6s timeout, then prints `DONE` and exits. With gutter
 /// answering DA1 the read returns at once; without it the child waits out its full
@@ -73,7 +73,7 @@ printf 'DONE'"#;
     assert!(
         elapsed < Duration::from_secs(3),
         "DA1 must be answered promptly — the child reached DONE in {elapsed:?}, \
-         which means it blocked on its query (the ~2s stall this slice removes)"
+         which means it blocked on its query (the ~2s stall)"
     );
 
     drop(session);

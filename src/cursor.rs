@@ -48,6 +48,18 @@ impl CursorShape {
         self.requested = Some(ps);
     }
 
+    /// Whether gutter ever wrote a shape to the outer terminal. A restore path resets
+    /// the cursor only when it did — a shape the user set for their own shell is not
+    /// gutter's to clear.
+    ///
+    /// The request is not the write: a shape the child asked for while the resize
+    /// overlay owned the cursor never reached the terminal, so gating on `requested`
+    /// would reset a cursor gutter had not touched.
+    #[must_use]
+    pub fn is_mirrored(&self) -> bool {
+        self.mirrored.is_some()
+    }
+
     /// Forget what was last mirrored, so the next [`take_pending`] re-emits the
     /// child's last requested shape even though it did not change. Used on resume
     /// (ADR-0019): park reset the outer terminal's cursor to the default, so the
@@ -122,6 +134,18 @@ mod tests {
         );
         // And it is one-shot again.
         assert_eq!(s.take_pending(), None);
+    }
+
+    #[test]
+    fn a_request_that_was_never_mirrored_is_not_a_shape_to_reset() {
+        let mut s = CursorShape::new();
+        s.apply_csi(&[&[5]]);
+        assert!(
+            !s.is_mirrored(),
+            "the child asked, but nothing has been written to the terminal yet"
+        );
+        assert_eq!(s.take_pending(), Some(b"\x1b[5 q".to_vec()));
+        assert!(s.is_mirrored(), "the shape has now reached the terminal");
     }
 
     #[test]

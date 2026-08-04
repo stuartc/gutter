@@ -15,28 +15,7 @@
 use std::time::Duration;
 
 mod common;
-use common::{drain_window, outer_grid, spawn_gutter};
-
-/// Assert the physical band-edge column `margin + W` and every gutter column to
-/// its right hold no painted glyph on any row.
-fn assert_band_edge_and_gutters_blank(
-    screen: &vt100::Screen,
-    band: u16,
-    outer_cols: u16,
-    rows: u16,
-) {
-    for r in 0..rows {
-        for c in band..outer_cols {
-            if let Some(cell) = screen.cell(r, c) {
-                let s = cell.contents();
-                assert!(
-                    s.is_empty() || s == " ",
-                    "physical cell ({r},{c}) past the band must be blank, found {s:?}"
-                );
-            }
-        }
-    }
-}
+use common::{assert_cols_blank, drain_window, outer_grid, spawn_gutter};
 
 /// **Wide glyph at the band edge over a real PTY.** A child positions the cursor
 /// at the band's last column (`CSI 1;W H`) and emits U+4E00 (一). gutter renders
@@ -66,7 +45,7 @@ fn wide_glyph_at_band_edge_does_not_bleed() {
             "wide glyph must not sit at the band's last column (would spill into the gutter)"
         );
     }
-    assert_band_edge_and_gutters_blank(screen, band, outer_cols, outer_rows);
+    assert_cols_blank(screen, band, outer_cols, outer_rows);
 
     drop(session);
 }
@@ -103,7 +82,7 @@ fn wide_char_line_renders_inside_band() {
         Some("\u{4e09}".to_string()),
         "third glyph at physical col 4 (no drift)"
     );
-    assert_band_edge_and_gutters_blank(screen, band, outer_cols, outer_rows);
+    assert_cols_blank(screen, band, outer_cols, outer_rows);
 
     drop(session);
 }

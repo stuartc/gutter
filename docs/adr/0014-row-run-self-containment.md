@@ -13,7 +13,7 @@ gutter.
 ## Decision
 
 Make every row self-contained within the `W`-wide rectangle before painting it, in
-`prepare_row()`. Prepend `ESC[m` to reset attributes so nothing bleeds down from the
+`prepare_row_into()`. Prepend `ESC[m` to reset attributes so nothing bleeds down from the
 row above. Rewrite the row-final `ESC[K` into a `W`-bounded fill: `(W - col)` spaces
 under the active SGR, then a `CUB` back to the cursor, so the erase stops at column
 `W` and any relative bytes after it still compute from the right position.
@@ -28,6 +28,6 @@ under the active SGR, then a `CUB` back to the cursor, so the erase stops at col
 ## Code anchors
 
 - `src/rowclip.rs` — the clip algorithm, cursor tracking, and its tests
-- `src/render.rs` — `prepare_row()` and the `ESC[m` prepend
+- `src/render.rs` — `prepare_row_into()` and the `ESC[m` prepend
 
 The edge-safety rule this rests on is [ADR-006](0006-band-fit-margin-rule.md).

@@ -29,8 +29,29 @@ write it to that separate fd. Errors are swallowed.
 - The read half is unused today; the fd is opened read-write as a hook for a later
   read-response relay.
 
+## Amendment — a distinct open, not a fd that differs from stdout
+
+This record was written while the band was painted on stdout, so "a separate file
+descriptor from the one we repaint on" was in practice "not stdout", and the code and
+its test said so in those words. Since [ADR-023](0023-controlling-terminal-fd-model.md)
+the band paints on `/dev/tty` as well, so the clipboard's handle is no longer told
+apart by *which device* it points at. The rule is unchanged, only stated properly: what
+matters is that it is its own `open`. Two independent opens of the same terminal are two
+independent file descriptions, each with its own offset and flags, so a clipboard write
+and a frame repaint still cannot fight over fd state.
+
+Two smaller corrections follow from the same change. `open_tty_read_write` is now shared:
+`anchor::open_input_tty` makes the keyboard handle through it and reads that one, so it is
+the *clipboard's* read half specifically that stays unused. And the degrade to `io::sink()`
+is now all but unreachable — startup has already refused the run if no terminal would
+open — but it is kept, because it costs a match arm and the alternative is a crash on a
+path nobody can rehearse.
+
 ## Code anchors
 
 - `src/clipboard.rs` — sequence reconstruction and the fd seam
 - `src/callbacks.rs` — the `copy_to_clipboard` callback and injection point
 - `src/main.rs` — opening `/dev/tty`, degrading to `io::sink()`
+
+The fd model this open is one of three in is
+[ADR-023](0023-controlling-terminal-fd-model.md).

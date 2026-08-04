@@ -1,12 +1,9 @@
-//! PTY-driven integration tests for the resize-mode rails + width readout (stream
-//! C of the band-width-resize feature: PRD 0001, Feature 2's "Visual indication").
+//! PTY-driven integration tests for the resize-mode rails + width readout.
 //!
-//! Written against stream B's landed `--resize-key` chord handling
-//! (`tests/resize_mode.rs`) — entering the mode needs a real chord dispatch, which
-//! these tests drive exactly as `resize_mode.rs` does. The paint itself (rails,
-//! readout, exit-clear) is independently covered by the mock/`RecordingGrid` unit
-//! tests in `src/render.rs`'s `margins` module; this file only proves the real
-//! escape bytes reach the real outer terminal in the right physical columns.
+//! The paint itself (rails, readout, exit-clear) is independently covered by the
+//! mock/`RecordingGrid` unit tests in `src/render.rs`'s `margins` module; this file
+//! only proves the real escape bytes reach the real outer terminal in the right
+//! physical columns.
 //!
 //! These drive the real `gutter` binary through a real PTY and assert on what the
 //! outer terminal actually shows — never on gutter internals.

@@ -17,7 +17,15 @@ alt-screen setup) and disable it once at teardown — no reactive toggling. Each
 frame, after `parser.process()`, read the child's live `(mode, encoding)` from the
 screen and run the mouse gate: translate coordinates (subtract the margin, drop
 anything outside the band), down-filter motion to the child's granularity, and
-re-encode as SGR-1006. Only SGR is emitted; a non-SGR encoding bails loudly.
+re-encode as SGR-1006. Only SGR is emitted; a report the child could only receive in
+another encoding is dropped rather than sent in a shape that would desync its parser.
+
+Dropped, not fatal. This used to panic, on the reading that a child negotiating a non-SGR
+encoding was a v1 gap worth failing loudly on. It is not a gap — `CSI ?1000h` with no
+`?1006h` is what plenty of older TUIs ask for, and the outer terminal reports in SGR
+regardless because the capture is eager, so one click in the band took the render thread
+down with raw mode and mouse reporting still on and the ordered restore (ADR-010) never
+run. A shell needing `reset` is a worse outcome than a child that gets no mouse.
 
 ## Consequences
 

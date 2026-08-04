@@ -1,18 +1,17 @@
-//! Slice 01 PTY-driven integration tests (expectrl, real PTY, headless).
+//! Spawn-and-teardown PTY integration tests (expectrl, real PTY, headless).
 //!
 //! These drive the built `gutter` binary through a real PTY and assert on what
 //! the child and the controlling terminal actually see — never on internal
-//! function returns. They cover the slice-01 acceptance criteria:
+//! function returns:
 //!
 //! - passthrough of a non-full-screen child's output,
 //! - `--width full` sizing the child's PTY to the real terminal's dimensions,
 //! - gutter's exit code equalling the child's exit code,
 //! - the child-exit-restore real-PTY smoke (mid-alt-screen child exits, the
 //!   terminal is restored with NO keystroke), which also proves there is no
-//!   hang on teardown (the detached input thread is reaped by `process::exit`).
-//!
-//! Iteration-02 slice 01 (E1) adds two more: the child spawns in the launcher's
-//! cwd (not `$HOME`), and the child inherits the launcher's environment.
+//!   hang on teardown (the detached input thread is reaped by `process::exit`),
+//! - the child spawning in the launcher's cwd (not `$HOME`) and inheriting the
+//!   launcher's environment.
 //!
 //! Headless: a real PTY with no display. Tests pin `TERM=xterm-256color`.
 
@@ -102,11 +101,11 @@ fn child_exit_restores_terminal_no_keystroke() {
     }
 }
 
-/// **E1 regression: the child spawns in the launcher's cwd, not `$HOME`.** Set
+/// **The child spawns in the launcher's cwd, not `$HOME`.** Set
 /// gutter's process `current_dir` to a known temp dir, wrap a `pwd -P`-reporting
-/// child, and assert it reports that temp dir — not `$HOME`. Before the
-/// `builder.cwd(...)` fix, portable-pty `current_dir($HOME)`'d the child and
-/// this reported the home directory (the `tig` "Not a git repository" symptom).
+/// child, and assert it reports that temp dir — not `$HOME`. Without
+/// `builder.cwd(...)`, portable-pty `current_dir($HOME)`s the child, which
+/// surfaces as `tig`'s "Not a git repository".
 #[test]
 fn child_spawns_in_launcher_cwd() {
     let launch_dir = fresh_temp_dir("cwd");
@@ -134,11 +133,10 @@ fn child_spawns_in_launcher_cwd() {
     let _ = std::fs::remove_dir_all(&launch_dir);
 }
 
-/// **Env inheritance (already correct; locked in).** Export a probe variable
+/// **The child inherits the launcher's environment.** Export a probe variable
 /// before launch and wrap a child that echoes it; the child must receive the
 /// launcher's value. `CommandBuilder::new` seeds `get_base_env()` from the full
-/// launcher env, so this passes today — the test guards a future portable-pty
-/// bump from silently dropping env inheritance while we touch the spawn path.
+/// launcher env — the guard is against a portable-pty bump silently dropping that.
 #[test]
 fn child_inherits_launcher_env() {
     const PROBE_VALUE: &str = "gutter-env-probe-value-9173";
