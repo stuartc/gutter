@@ -118,7 +118,17 @@ The declared width a fixture is captured at **must** equal the `W` the gate repl
 
 Work proceeds in thin **vertical slices**, each cutting through every layer it touches and leaving the binary runnable and green. Commits carry an effort-scoped slice tag — `feat(kbd-1): …`, `test(kbd-3): …`, `docs(kbd-4): …` — where the word names the effort and the number the slice within it. (The first iteration used bare slice numbers, `feat(04): …`; those are still in the log.)
 
-**Changelog wording lives in a trailer.** `git cliff` builds `CHANGELOG.md` from the log, and a slice subject names the slice, not the change a user sees. So a `feat`/`fix` commit worth a release note carries one `Changelog:` trailer per bullet, written in the user's terms — several are fine when one slice fixed several things. `Changelog: skip` as the only trailer drops the commit; a commit with no trailer falls back to its subject. `docs`, `test`, `refactor` and `chore` are skipped wholesale, so they need nothing. Efforts spanning many slices squash-merge under one subject with the trailers on the squash commit.
+**Changelog wording lives in a trailer.** `git cliff` builds `CHANGELOG.md` from the log, and a slice subject names the slice, not the change a user sees. So a `feat`/`fix` commit worth a release note carries one `Changelog:` trailer per bullet, written in the user's terms — several are fine when one slice fixed several things. `Changelog: skip` as the only trailer drops the commit; a commit with no trailer falls back to its subject. `docs`, `test`, `refactor` and `chore` are skipped wholesale, so they need nothing. Efforts spanning many slices squash-merge under one subject with the trailers on the squash commit. Write the trailers while the work is fresh — nothing downstream can recover wording that was never written.
+
+## Releasing
+
+[RELEASING.md](RELEASING.md) is the authority; this is the shape of it.
+
+Releases are local-drive — nothing happens that someone didn't trigger. `cargo release <patch|minor> --execute` bumps `Cargo.toml`, runs the pre-release hook, commits, tags `v0.x.y` and pushes; **the tag push is what fires `release.yml`**, which cross-builds the Linux x86_64 and universal macOS binaries and creates the GitHub Release with notes lifted from the matching `CHANGELOG.md` section. Dry-run is the default (leave off `--execute`). Pre-1.0, breaking changes ride the minor slot. Releases are refused from anywhere but `main`.
+
+The hook is `scripts/changelog.sh`, and it **prepends** the new section rather than regenerating the file. A released section is what a published GitHub Release says, so a later change to `cliff.toml`'s parsers must not go back and reword it, and a section edited by hand has to survive the next release. The script adds the compare link too, which git-cliff's footer only writes when it generates the whole file. It is idempotent — the dry run writes the section you review, and the real run then leaves it alone, which is also the seam for editing it by hand.
+
+`cliff.toml` decides what reaches the changelog at all: only `feat` and `fix`, everything else skipped, with `Changelog:` trailers preferred over subjects (see *Working conventions* above). Entries dated before v0.3.0 predate that and read like slice subjects; the v0.3.0 section was rewritten by hand for the same reason.
 
 ## Agent skills
 
