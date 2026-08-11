@@ -5,8 +5,30 @@
 //! rather than flooding the right gutter. To place the fill it tracks a virtual
 //! in-band column across the run, honouring absolute moves (`CUP`/`CHA`) as well
 //! as relative ones — a rightward-only tracker would desync at a backward jump.
+//!
+//! Those absolute moves are rewritten. A run is painted at the band's left margin
+//! and row offset, so an absolute coordinate in the run's own band-local terms
+//! would address the raw screen instead: the cursor would leave the band, and the
+//! caller's diff baseline never learns of the cells it stamped. The rewrite puts
+//! the same cell back in the band's physical coordinates ([`Placement`]).
 
 use unicode_width::UnicodeWidthChar;
+
+/// Where a run is painted on the real terminal, and which grid row it was built for.
+///
+/// A run carries no origin of its own — the caller establishes one with a single
+/// `move_to` before writing it — so the clipper needs those same coordinates to
+/// re-express the run's absolute moves in them.
+#[derive(Clone, Copy, Debug)]
+pub struct Placement {
+    /// Physical column the band starts at.
+    pub left_margin: u16,
+    /// Physical row the caller positioned to before writing the run.
+    pub phys_row: u16,
+    /// The 0-based grid row vt100 built the run for — the row every absolute move
+    /// inside the run names.
+    pub grid_row: u16,
+}
 
 /// CSI parameter bytes are `0x30..=0x3f`; the final byte is `0x40..=0x7e`.
 fn is_csi_final(b: u8) -> bool {
@@ -27,6 +49,39 @@ fn last_param(params: &[u8], default: u16) -> u16 {
     parse_param(field, default)
 }
 
+/// Move the cursor to in-band column `target`, or emit nothing when the tracker is
+/// already there, and return the new tracked column. `target` is clamped to `W - 1`,
+/// the last column of the band: the callers vt100 produces only ever aim inside the
+/// band, so the clamp guards a malformed run rather than a case that arises in
+/// practice, but a move to `W` would land on the first gutter column.
+fn move_to_col(out: &mut Vec<u8>, col: u16, target: u16, w: u16, at: Placement) -> u16 {
+    let target = target.min(w.saturating_sub(1));
+    if target != col {
+        emit_cup(out, target, at);
+    }
+    target
+}
+
+/// Position the cursor on the band's `target` column of the row this run is painted
+/// at, as an absolute physical `CUP`.
+///
+/// Absolute rather than a `CUF`/`CUB` from the tracked column because of deferred
+/// wrap. A glyph written into the *screen's* last column leaves the real cursor on
+/// that column with the wrap pending, while the tracker has already counted it as
+/// column `W`; so wherever the band's right edge is the screen's right edge — the
+/// default band on a terminal no wider than it, and every `--width full` run — a
+/// relative move would land one column short. An absolute one re-establishes the
+/// position whatever the cursor was doing.
+fn emit_cup(out: &mut Vec<u8>, target: u16, at: Placement) {
+    let row1 = at.phys_row.saturating_add(1);
+    let col1 = at.left_margin.saturating_add(target).saturating_add(1);
+    out.extend_from_slice(b"\x1b[");
+    out.extend_from_slice(row1.to_string().as_bytes());
+    out.push(b';');
+    out.extend_from_slice(col1.to_string().as_bytes());
+    out.push(b'H');
+}
+
 fn parse_param(field: &[u8], default: u16) -> u16 {
     if field.is_empty() {
         return default;
@@ -42,20 +97,21 @@ fn parse_param(field: &[u8], default: u16) -> u16 {
     n
 }
 
-/// Rewrites the row-final `ESC[K` in `run` into a `W`-bounded fill so the run stays
-/// within its `[0, W)` rectangle once painted at the band offset. Returns the run
-/// unchanged when it carries no `ESC[K`.
+/// Rewrites the row-final `ESC[K` in `run` into a `W`-bounded fill, and any absolute
+/// cursor move into one in `at`'s physical coordinates, so the run stays within its
+/// `[0, W)` rectangle once painted at the band offset. Returns the run unchanged when
+/// it carries neither.
 #[cfg(test)]
-pub fn clip_row_to_width(run: &[u8], w: u16) -> Vec<u8> {
+pub fn clip_row_to_width(run: &[u8], w: u16, at: Placement) -> Vec<u8> {
     let mut out = Vec::with_capacity(run.len());
-    clip_row_to_width_into(run, w, &mut out);
+    clip_row_to_width_into(run, w, at, &mut out);
     out
 }
 
 /// As [`clip_row_to_width`], but appends to a caller-owned buffer instead of
 /// allocating. The paint hot path seeds `out` with the per-row `ESC[m` reset and
 /// clips straight into it, building a painted row in one allocation, not two.
-pub fn clip_row_to_width_into(run: &[u8], w: u16, out: &mut Vec<u8>) {
+pub fn clip_row_to_width_into(run: &[u8], w: u16, at: Placement, out: &mut Vec<u8>) {
     let mut col: u16 = 0;
     let mut i = 0;
 
@@ -80,17 +136,24 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, out: &mut Vec<u8>) {
                 let params = &run[params_start..j];
                 match final_byte {
                     b'K' => {
-                        // Forward erase (`ESC[K`/`ESC[0K`) is the only sequence that
-                        // floods past `W`. Replace it with a bounded fill under the
-                        // active SGR, then a `CUB` so trailing bytes still align.
-                        // `ESC[1K`/`ESC[2K` are already bounded — copy them verbatim.
+                        // Forward erase (`ESC[K`/`ESC[0K`): replace it with a bounded
+                        // fill under the active SGR, then a reposition so trailing
+                        // bytes still align.
+                        //
+                        // `ESC[1K` and `ESC[2K` go through untouched, and that is a
+                        // known hole, not a safe case. Both are read against the
+                        // physical row — nothing re-bases the line after the caller's
+                        // `move_to` — so `2K` would erase the whole row and `1K`
+                        // everything from physical column 0 to the cursor, the entire
+                        // left gutter, where the diff baseline never repaints. They are
+                        // unhandled because vt100 cannot produce them: `ESC[K` is the
+                        // only row erase in vt100 0.16.2's writer. Anything else
+                        // feeding runs in here needs the arm written.
                         if first_param(params, 0) == 0 {
                             let rem = w.saturating_sub(col);
                             if rem > 0 {
                                 out.extend(std::iter::repeat_n(b' ', usize::from(rem)));
-                                out.extend_from_slice(b"\x1b[");
-                                out.extend_from_slice(rem.to_string().as_bytes());
-                                out.push(b'D');
+                                emit_cup(out, col, at);
                             }
                         } else {
                             out.extend_from_slice(&run[i..=j]);
@@ -108,18 +171,36 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, out: &mut Vec<u8>) {
                         // CUP `ESC[row;colH`: the column is the last param (1-based).
                         // A single param is the row only (`ESC[5H`); the column then
                         // defaults to 1, i.e. in-band column 0.
+                        //
+                        // The run's row replaces the named one: a run covers one row of
+                        // the band, already positioned to by the caller, and vt100 only
+                        // emits `CUP` within a run to revisit that same row. The assert
+                        // catches a vt100 that stopped doing so, but only in a debug
+                        // build — `debug_assert_eq!` is compiled out of a release one,
+                        // which discards the row parameter in silence. That silence is
+                        // still inside the band: the move below is absolute on the
+                        // run's own physical row with the column clamped to `[0, W)`,
+                        // so a mismatched row can at worst stamp a cell on the wrong
+                        // line of the band, never in the gutter. Dropping the move
+                        // instead would desync the tracker and misplace every glyph
+                        // after it.
                         let col1 = if params.contains(&b';') {
                             last_param(params, 1)
                         } else {
                             1
                         };
-                        col = col1.saturating_sub(1);
-                        out.extend_from_slice(&run[i..=j]);
+                        debug_assert_eq!(
+                            first_param(params, 1),
+                            at.grid_row.saturating_add(1),
+                            "CUP names a row other than the run's own ({:?})",
+                            String::from_utf8_lossy(&run[i..=j])
+                        );
+                        col = move_to_col(out, col, col1.saturating_sub(1), w, at);
                     }
                     b'G' => {
                         // CHA `ESC[colG`: absolute column, 1-based.
-                        col = first_param(params, 1).saturating_sub(1);
-                        out.extend_from_slice(&run[i..=j]);
+                        col =
+                            move_to_col(out, col, first_param(params, 1).saturating_sub(1), w, at);
                     }
                     // SGR (`m`), EraseChar (`X`) and anything else move no column.
                     _ => out.extend_from_slice(&run[i..=j]),
@@ -135,6 +216,10 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, out: &mut Vec<u8>) {
         }
 
         if b == 0x08 {
+            // Live on the scroll path, unlike the `CHA` and `D` arms: `rows_formatted`
+            // opens a run with `' ' 0x08 ESC[X` when the row above wrapped and this
+            // row's first cell is default. Without this the tracker sits a column right
+            // of the cursor for the rest of the run and the `ESC[K` fill comes up short.
             col = col.saturating_sub(1);
             out.push(b);
             i += 1;
@@ -178,9 +263,42 @@ fn utf8_len(lead: u8) -> usize {
 mod tests {
     use super::*;
 
-    /// CUB(n) the clip appends to restore the cursor after the bounded fill.
-    fn cub(n: u16) -> Vec<u8> {
-        format!("\x1b[{n}D").into_bytes()
+    /// The band at the screen's top-left corner, painting the grid's first row — the
+    /// placement most cases use, where an in-band column and a physical one coincide.
+    const HOME: Placement = Placement {
+        left_margin: 0,
+        phys_row: 0,
+        grid_row: 0,
+    };
+
+    /// The absolute move the clip emits to put the cursor on in-band column `col`.
+    fn cup_at(at: Placement, col: u16) -> Vec<u8> {
+        format!("\x1b[{};{}H", at.phys_row + 1, at.left_margin + col + 1).into_bytes()
+    }
+
+    /// [`cup_at`] for [`HOME`].
+    fn cup(col: u16) -> Vec<u8> {
+        cup_at(HOME, col)
+    }
+
+    /// Whether `bytes` holds a CSI terminated by `want`.
+    fn has_csi_final(bytes: &[u8], want: u8) -> bool {
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+                let mut j = i + 2;
+                while j < bytes.len() && !is_csi_final(bytes[j]) {
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&want) {
+                    return true;
+                }
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+        false
     }
 
     /// A run with no `ESC[K` is returned byte-identical; the clip only ever touches
@@ -188,23 +306,23 @@ mod tests {
     #[test]
     fn no_erase_is_identity() {
         let run = b"\x1b[1;31mhello\x1b[mworld";
-        assert_eq!(clip_row_to_width(run, 80), run.to_vec());
+        assert_eq!(clip_row_to_width(run, 80, HOME), run.to_vec());
     }
 
     /// Reverse-video full-width row: a leading `ESC[7m` then an immediate `ESC[K`
     /// (the attributed-but-empty statusline) at column 0 clips to exactly `W` spaces
-    /// under the reverse SGR plus a `CUB(W)`, so the highlight reaches the band edge
+    /// under the reverse SGR plus a reposition, so the highlight reaches the band edge
     /// and the cursor is restored.
     #[test]
-    fn reverse_video_full_width_clips_to_w_spaces_plus_cub() {
+    fn reverse_video_full_width_clips_to_w_spaces_plus_reposition() {
         let w = 10u16;
         let run = b"\x1b[7m\x1b[K";
-        let got = clip_row_to_width(run, w);
+        let got = clip_row_to_width(run, w, HOME);
 
         let mut want = Vec::new();
         want.extend_from_slice(b"\x1b[7m");
         want.extend(std::iter::repeat_n(b' ', usize::from(w)));
-        want.extend(cub(w));
+        want.extend(cup(0));
         assert_eq!(got, want);
         // The original unbounded ESC[K is gone.
         assert!(!got.windows(3).any(|s| s == b"\x1b[K"));
@@ -217,13 +335,35 @@ mod tests {
     fn fill_is_remaining_columns_from_cursor() {
         let w = 10u16;
         let run = b"\x1b[7mABC\x1b[K"; // cursor at col 3 after "ABC"
-        let got = clip_row_to_width(run, w);
+        let got = clip_row_to_width(run, w, HOME);
 
         let mut want = Vec::new();
         want.extend_from_slice(b"\x1b[7mABC");
         want.extend(std::iter::repeat_n(b' ', 7)); // W - 3
-        want.extend(cub(7));
+        want.extend(cup(3));
         assert_eq!(got, want);
+    }
+
+    /// The fill's reposition is the band's physical cell, not a `CUB` by the fill's
+    /// own length. A fill that runs to the screen's right edge leaves the real cursor
+    /// on that last column with a deferred wrap pending, one short of where the
+    /// tracker has it, so a relative walk back would undershoot by one.
+    #[test]
+    fn fill_reposition_is_absolute_and_physical() {
+        let at = Placement {
+            left_margin: 5,
+            phys_row: 3,
+            grid_row: 3,
+        };
+        let w = 10u16;
+        let got = clip_row_to_width(b"\x1b[7mAB\x1b[K", w, at);
+
+        let mut want = Vec::new();
+        want.extend_from_slice(b"\x1b[7mAB");
+        want.extend(std::iter::repeat_n(b' ', 8)); // W - 2
+        want.extend_from_slice(b"\x1b[4;8H"); // physical row 3, column 5 + 2
+        assert_eq!(got, want);
+        assert!(!has_csi_final(&got, b'D'));
     }
 
     /// A wide glyph at the band edge: the tracker must agree with vt100's width
@@ -237,13 +377,13 @@ mod tests {
         run.extend_from_slice(b"\x1b[7m");
         run.extend_from_slice("\u{4e00}".as_bytes()); // 一, width 2
         run.extend_from_slice(b"\x1b[K");
-        let got = clip_row_to_width(&run, w);
+        let got = clip_row_to_width(&run, w, HOME);
 
         let mut want = Vec::new();
         want.extend_from_slice(b"\x1b[7m");
         want.extend_from_slice("\u{4e00}".as_bytes());
         want.extend(std::iter::repeat_n(b' ', 2)); // 4 - 2
-        want.extend(cub(2));
+        want.extend(cup(2));
         assert_eq!(got, want);
     }
 
@@ -256,34 +396,122 @@ mod tests {
         let w = 20u16;
         // 8 glyphs → col 8, then CUP to row 1 col 3 (0-based col 2), then ESC[K.
         let run = b"\x1b[7mAAAAAAAA\x1b[1;3H\x1b[K";
-        let got = clip_row_to_width(run, w);
+        let got = clip_row_to_width(run, w, HOME);
 
         let fill = w - 2; // from the absolute column 2, NOT from 8
         let mut want = Vec::new();
-        want.extend_from_slice(b"\x1b[7mAAAAAAAA\x1b[1;3H");
+        want.extend_from_slice(b"\x1b[7mAAAAAAAA");
+        want.extend(cup(2)); // 8 → 2
         want.extend(std::iter::repeat_n(b' ', usize::from(fill)));
-        want.extend(cub(fill));
+        want.extend(cup(2));
         assert_eq!(got, want);
     }
 
     /// Row-only `CUP` defaults the column to 1: `ESC[5H` moves to row 5, column
     /// default (in-band column 0), not column 4. A run that prints to column 8, then
-    /// a row-only `CUP`, then erases must fill the full `W`.
+    /// a row-only `CUP`, then erases must retreat to column 0 and fill the full `W`.
     #[test]
     fn row_only_cup_defaults_column_to_zero() {
         let w = 20u16;
+        // `ESC[5H` names grid row 4, so this is the run for the band's fifth row.
+        let at = Placement {
+            left_margin: 0,
+            phys_row: 0,
+            grid_row: 4,
+        };
         let run = b"\x1b[7mAAAAAAAA\x1b[5H\x1b[K";
-        let got = clip_row_to_width(run, w);
+        let got = clip_row_to_width(run, w, at);
 
         let mut want = Vec::new();
-        want.extend_from_slice(b"\x1b[7mAAAAAAAA\x1b[5H");
+        want.extend_from_slice(b"\x1b[7mAAAAAAAA");
+        want.extend(cup_at(at, 0)); // 8 → 0
         want.extend(std::iter::repeat_n(b' ', usize::from(w)));
-        want.extend(cub(w));
+        want.extend(cup_at(at, 0));
         assert_eq!(got, want);
     }
 
+    /// A `CUP`'s band-local coordinates are replaced by the band's physical ones: the
+    /// run's own row becomes the row the caller positioned to, and the column is
+    /// offset by the left margin. Read raw, `ESC[1;10H` would have addressed the
+    /// screen's row 0, column 9 — outside the band on both axes.
+    #[test]
+    fn cup_is_re_expressed_in_physical_coordinates() {
+        let at = Placement {
+            left_margin: 5,
+            phys_row: 3,
+            grid_row: 0,
+        };
+        assert_eq!(
+            clip_row_to_width(b"AAA\x1b[1;10Hz", 20, at),
+            b"AAA\x1b[4;15Hz".to_vec()
+        );
+    }
+
+    /// The soft-wrap repair vt100 emits when a row's wrapped flag flips inside one
+    /// frame: a full `W = 10` row, then an absolute jump back to the last cell to
+    /// restamp it. The rewritten move must land that trailing `9` at the band's last
+    /// column of the row the run is painted at — here physical (row 4, column 15).
+    #[test]
+    fn wrap_repair_cup_stays_in_band() {
+        let at = Placement {
+            left_margin: 6,
+            phys_row: 4,
+            grid_row: 0,
+        };
+        let got = clip_row_to_width(b"0123456789\x1b[1;10H9", 10, at);
+        assert_eq!(got, b"0123456789\x1b[5;16H9".to_vec());
+    }
+
+    /// The same repair with the band at the screen's origin, where the run's own
+    /// coordinates already are the physical ones and the rewrite is byte-for-byte an
+    /// identity. This is the case a relative `CUB(1)` gets wrong: ten glyphs into a
+    /// ten-column screen leave the real cursor on column 9 with a deferred wrap, not
+    /// past the edge, so stepping back one would restamp column 8.
+    #[test]
+    fn wrap_repair_at_the_screen_origin_is_an_identity() {
+        let run = b"0123456789\x1b[1;10H9";
+        assert_eq!(clip_row_to_width(run, 10, HOME), run.to_vec());
+    }
+
+    /// The target is absolute, so the same column is addressed the same way whichever
+    /// side of it the cursor sits — and a move to where the tracker already is emits
+    /// nothing at all.
+    #[test]
+    fn move_targets_the_column_regardless_of_direction() {
+        let w = 20u16;
+        // col 2 → 8, col 8 → 2, col 8 → 8.
+        let forward = clip_row_to_width(b"AA\x1b[1;9Hz", w, HOME);
+        let backward = clip_row_to_width(b"AAAAAAAA\x1b[1;3Hz", w, HOME);
+        let stationary = clip_row_to_width(b"AAAAAAAA\x1b[1;9Hz", w, HOME);
+
+        let mut want_forward = b"AA".to_vec();
+        want_forward.extend(cup(8));
+        want_forward.push(b'z');
+        let mut want_backward = b"AAAAAAAA".to_vec();
+        want_backward.extend(cup(2));
+        want_backward.push(b'z');
+
+        assert_eq!(forward, want_forward);
+        assert_eq!(backward, want_backward);
+        assert_eq!(stationary, b"AAAAAAAAz".to_vec());
+    }
+
+    /// A column past the band edge clamps to the band's LAST column, `W - 1`, so no
+    /// emitted move can put the cursor — or the glyph that follows it — on the first
+    /// gutter column.
+    #[test]
+    fn out_of_band_column_is_clamped() {
+        let w = 10u16;
+        let mut want = cup(w - 1);
+        want.push(b'z');
+        assert_eq!(clip_row_to_width(b"\x1b[1;40Hz", w, HOME), want);
+        assert_eq!(clip_row_to_width(b"\x1b[40Gz", w, HOME), want);
+    }
+
     /// Only the forward erase is clipped. `ESC[1K` (erase-left) and `ESC[2K`
-    /// (erase-whole-line) are already bounded, so they pass through verbatim.
+    /// (erase-whole-line) pass through verbatim — unbounded on the physical line, but
+    /// not something vt100 can emit into a run. This pins the current behaviour, not a
+    /// guarantee that the bytes would be safe.
     #[test]
     fn non_forward_erase_is_copied_verbatim() {
         let w = 10u16;
@@ -291,23 +519,41 @@ mod tests {
             b"\x1b[7mAB\x1b[1K".as_slice(),
             b"\x1b[7mAB\x1b[2K".as_slice(),
         ] {
-            assert_eq!(clip_row_to_width(run, w), run.to_vec());
+            assert_eq!(clip_row_to_width(run, w, HOME), run.to_vec());
         }
     }
 
-    /// `CHA` (`ESC[…G`) is also absolute — the same desync guard, for the
-    /// column-only absolute move.
+    /// `CHA` (`ESC[…G`) is also absolute — the same desync guard, and the same
+    /// rewrite into the band's physical coordinates, for the column-only absolute
+    /// move.
     #[test]
     fn cha_is_absolute() {
         let w = 12u16;
         let run = b"\x1b[7mXXXXX\x1b[4G\x1b[K"; // jump to col 4 (0-based 3)
-        let got = clip_row_to_width(run, w);
+        let got = clip_row_to_width(run, w, HOME);
         let fill = w - 3;
         let mut want = Vec::new();
-        want.extend_from_slice(b"\x1b[7mXXXXX\x1b[4G");
+        want.extend_from_slice(b"\x1b[7mXXXXX");
+        want.extend(cup(3)); // 5 → 3
         want.extend(std::iter::repeat_n(b' ', usize::from(fill)));
-        want.extend(cub(fill));
+        want.extend(cup(3));
         assert_eq!(got, want);
+        assert!(!has_csi_final(&got, b'G'));
+    }
+
+    /// `CHA`'s column is the first param, 1-based, and it too is re-expressed:
+    /// `ESC[5G` targets in-band column 4, at the band's own margin.
+    #[test]
+    fn cha_column_is_first_param() {
+        let at = Placement {
+            left_margin: 7,
+            phys_row: 2,
+            grid_row: 2,
+        };
+        let mut want = b"A".to_vec();
+        want.extend(cup_at(at, 4));
+        want.push(b'z');
+        assert_eq!(clip_row_to_width(b"A\x1b[5Gz", 20, at), want);
     }
 
     /// `MoveRight` advances the column: `ESC[5C` skips five columns before the
@@ -316,12 +562,12 @@ mod tests {
     fn move_right_advances_column() {
         let w = 10u16;
         let run = b"\x1b[7m\x1b[5C\x1b[K";
-        let got = clip_row_to_width(run, w);
+        let got = clip_row_to_width(run, w, HOME);
         let fill = w - 5;
         let mut want = Vec::new();
         want.extend_from_slice(b"\x1b[7m\x1b[5C");
         want.extend(std::iter::repeat_n(b' ', usize::from(fill)));
-        want.extend(cub(fill));
+        want.extend(cup(5));
         assert_eq!(got, want);
     }
 
@@ -331,22 +577,23 @@ mod tests {
     fn backspace_retreats_column() {
         let w = 10u16;
         let run = b"\x1b[7mABC\x08\x1b[K";
-        let got = clip_row_to_width(run, w);
+        let got = clip_row_to_width(run, w, HOME);
         let fill = w - 2;
         let mut want = Vec::new();
         want.extend_from_slice(b"\x1b[7mABC\x08");
         want.extend(std::iter::repeat_n(b' ', usize::from(fill)));
-        want.extend(cub(fill));
+        want.extend(cup(2));
         assert_eq!(got, want);
     }
 
     /// The erase at the band edge clips to nothing: with the cursor already at
-    /// column `W` the fill is empty and no `CUB` is emitted, so the `ESC[K` vanishes.
+    /// column `W` the fill is empty and no reposition is emitted, so the `ESC[K`
+    /// vanishes.
     #[test]
     fn erase_at_edge_emits_no_fill() {
         let w = 3u16;
         let run = b"\x1b[7mABC\x1b[K"; // col 3 == W
-        let got = clip_row_to_width(run, w);
+        let got = clip_row_to_width(run, w, HOME);
         assert_eq!(got, b"\x1b[7mABC".to_vec());
     }
 
@@ -356,12 +603,12 @@ mod tests {
     fn erase_char_is_no_move() {
         let w = 10u16;
         let run = b"\x1b[7mAB\x1b[3X\x1b[K"; // col still 2 after the in-place erase
-        let got = clip_row_to_width(run, w);
+        let got = clip_row_to_width(run, w, HOME);
         let fill = w - 2;
         let mut want = Vec::new();
         want.extend_from_slice(b"\x1b[7mAB\x1b[3X");
         want.extend(std::iter::repeat_n(b' ', usize::from(fill)));
-        want.extend(cub(fill));
+        want.extend(cup(2));
         assert_eq!(got, want);
     }
 }

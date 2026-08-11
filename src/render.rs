@@ -22,7 +22,7 @@ use crate::mouse::{MouseDecision, MouseGate};
 use crate::msg::Msg;
 use crate::pty::PtyResizer;
 use crate::relay::KeyModeRelay;
-use crate::rowclip::clip_row_to_width_into;
+use crate::rowclip::{clip_row_to_width_into, Placement};
 use crate::scan::{Scanner, Token, ESC_HOLD};
 use crate::suspend::Suspender;
 use crate::terminal::OuterTerminal;
@@ -224,7 +224,11 @@ impl Renderer {
 
     /// Row where the band's span starts (ADR-0017): 0 on the alt screen, `base_row`
     /// on the primary screen so shell history above the inline band stays untouched.
-    fn span_offset(&self) -> u16 {
+    ///
+    /// The settled value, which a paint can lower: `scroll_to_make_room` scrolls the
+    /// real terminal and drops `base_row` during the very frame being measured, so a
+    /// caller reading the offset it asked for would be looking at the wrong rows.
+    pub(crate) fn span_offset(&self) -> u16 {
         if self.outer_alt_active {
             0
         } else {
@@ -965,8 +969,13 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
                 continue;
             }
             let row = row as u16;
-            term.move_to(renderer.left_margin, offset.saturating_add(row))?;
-            prepare_row_into(&line, renderer.width, &mut row_buf);
+            let at = Placement {
+                left_margin: renderer.left_margin,
+                phys_row: offset.saturating_add(row),
+                grid_row: row,
+            };
+            term.move_to(at.left_margin, at.phys_row)?;
+            prepare_row_into(&line, renderer.width, at, &mut row_buf);
             term.write_row(&row_buf)?;
             painted = true;
         }
@@ -1071,12 +1080,26 @@ fn mirror_cursor<T: OuterTerminal>(
 
 /// Make a vt100 row run self-contained within its `W`-wide, margin-offset rectangle
 /// before painting (ADR-014): prepend `ESC[m` so it doesn't inherit the previous row's
-/// trailing attribute across the bare `move_to`, and clip the row-final `ESC[K` to
-/// column `W` so its erase can't flood the gutter.
-fn prepare_row_into(line: &[u8], width: u16, out: &mut Vec<u8>) {
+/// trailing attribute across the bare `move_to`, clip the row-final `ESC[K` to column
+/// `W` so its erase can't flood the gutter, and re-express the run's absolute moves in
+/// `at`'s physical coordinates.
+fn prepare_row_into(line: &[u8], width: u16, at: Placement, out: &mut Vec<u8>) {
     out.clear();
     out.extend_from_slice(b"\x1b[m");
-    clip_row_to_width_into(line, width, out);
+    clip_row_to_width_into(line, width, at, out);
+}
+
+/// [`prepare_row_into`] for a row painted over cells the caller has no baseline for:
+/// blank the band's columns first, then paint.
+///
+/// A `rows_formatted` run describes only the cells that differ from a blank one —
+/// nothing at all for a row that is now empty — so painted straight onto a physical row
+/// still holding an older frame it leaves whatever it does not cover. The blank is the
+/// clipper's own `W`-bounded fill, which stops at the band's right edge and returns the
+/// cursor to its left one; an `ESC[K` would take the right gutter with it.
+fn prepare_row_over_into(line: &[u8], width: u16, at: Placement, out: &mut Vec<u8>) {
+    prepare_row_into(b"\x1b[K", width, at, out);
+    clip_row_to_width_into(line, width, at, out);
 }
 
 /// Paint a scrolling frame: stream the `departed` lines then the current band down the
@@ -1104,17 +1127,35 @@ fn emit_scroll_stream<T: OuterTerminal>(
         .collect();
 
     let mut row_buf = Vec::new();
-    for (i, line) in departed.iter().chain(band.iter()).enumerate() {
+    // Each departed line is the top row of a scrollback offset, so vt100 built it as
+    // grid row 0; the band's lines carry their own index.
+    let departed_rows = departed.iter().map(|line| (0u16, line));
+    let band_rows = band.iter().enumerate().map(|(row, line)| (row as u16, line));
+    for (i, (grid_row, line)) in departed_rows.chain(band_rows).enumerate() {
         let i = i as u16;
-        if i <= bottom {
+        let in_place = i <= bottom;
+        let phys_row = if in_place {
             // Still filling the screen top-down — overwrite row i in place, no scroll.
-            term.move_to(renderer.left_margin, i)?;
+            i
         } else {
             // Past the bottom: scroll one row into scrollback, then write at the bottom.
             term.newline()?;
-            term.move_to(renderer.left_margin, bottom)?;
+            bottom
+        };
+        let at = Placement {
+            left_margin: renderer.left_margin,
+            phys_row,
+            grid_row,
+        };
+        term.move_to(at.left_margin, at.phys_row)?;
+        if in_place {
+            // The last frame's paint is still on this row and no diff accounts for it:
+            // the run has to blank the band's columns itself. A row written after a
+            // `newline` scrolled in blank, so it needs none of that.
+            prepare_row_over_into(line, renderer.width, at, &mut row_buf);
+        } else {
+            prepare_row_into(line, renderer.width, at, &mut row_buf);
         }
-        prepare_row_into(line, renderer.width, &mut row_buf);
         term.write_row(&row_buf)?;
     }
     Ok(())
@@ -1931,7 +1972,9 @@ fn hand_back_inline<T: OuterTerminal>(
     if exit_code == 0 {
         term.newline()
     } else {
-        term.write_row(format!("\r\n\x1b[2mExited with: {exit_code}\x1b[0m").as_bytes())
+        // The leading reset is `newline`'s rule spelled out: this `\r\n` scrolls too
+        // when the band already reaches the bottom.
+        term.write_row(format!("\x1b[m\r\n\x1b[2mExited with: {exit_code}\x1b[0m").as_bytes())
     }
 }
 
@@ -2325,7 +2368,7 @@ mod tests {
             })
             .collect();
         assert!(
-            status_rows.contains(&b"\r\n\x1b[2mExited with: 42\x1b[0m".as_slice()),
+            status_rows.contains(&b"\x1b[m\r\n\x1b[2mExited with: 42\x1b[0m".as_slice()),
             "non-zero exit hands back the dim status line, got {status_rows:?}"
         );
 
@@ -2334,7 +2377,7 @@ mod tests {
         let status = term
             .calls
             .iter()
-            .position(|c| matches!(c, Call::WriteRow(b) if b.starts_with(b"\r\n\x1b[2m")))
+            .position(|c| matches!(c, Call::WriteRow(b) if b.windows(12).any(|s| s == b"Exited with:")))
             .unwrap();
         let disable_mouse = term
             .calls
@@ -2569,7 +2612,7 @@ mod tests {
 
         assert_eq!(
             content_rows(&term.calls),
-            vec![b"\r\n\x1b[2mExited with: 1\x1b[0m".as_slice()],
+            vec![b"\x1b[m\r\n\x1b[2mExited with: 1\x1b[0m".as_slice()],
             "exit_code = 1 hands back the dim status line via write_row"
         );
 
@@ -2711,7 +2754,7 @@ mod tests {
             "plain stream paints the band content inline, got {writes:?}"
         );
         assert!(
-            writes.contains(&b"\r\n\x1b[2mExited with: 5\x1b[0m".as_slice()),
+            writes.contains(&b"\x1b[m\r\n\x1b[2mExited with: 5\x1b[0m".as_slice()),
             "plain stream hands back the dim status line, got {writes:?}"
         );
 
@@ -2758,7 +2801,7 @@ mod tests {
             })
             .collect();
         assert!(
-            !teardown_writes.iter().any(|w| w.starts_with(b"\r\n\x1b[2mExited with:")),
+            !teardown_writes.iter().any(|w| w.windows(12).any(|s| s == b"Exited with:")),
             "alt-then-primary clean exit: no inline paint, so the hand-back is suppressed, got {teardown_writes:?}"
         );
 
@@ -2779,7 +2822,7 @@ mod tests {
             })
             .collect();
         assert!(
-            !teardown_writes.iter().any(|w| w.starts_with(b"\r\n\x1b[2mExited with:")),
+            !teardown_writes.iter().any(|w| w.windows(12).any(|s| s == b"Exited with:")),
             "no inline output: the hand-back is suppressed regardless of exit code, got {teardown_writes:?}"
         );
     }
@@ -2806,7 +2849,7 @@ mod tests {
             .filter_map(|c| if let Call::WriteRow(b) = c { Some(b.as_slice()) } else { None })
             .collect();
         assert!(
-            !writes.iter().any(|w| w.starts_with(b"\r\n\x1b[2mExited with:")),
+            !writes.iter().any(|w| w.windows(12).any(|s| s == b"Exited with:")),
             "alt→primary→exit 3 with no inline paint must not stamp a status line, got {writes:?}"
         );
     }
@@ -4760,6 +4803,35 @@ fn render_primary(
     (renderer, grid)
 }
 
+/// Paint one real frame per element of `frames` and hand back both sides the oracle's
+/// painted-band checks compare (`src/oracle/band.rs`): the settled renderer, holding the
+/// child's own `W`-column grid and the offset the band ended up at, and the exact bytes
+/// gutter wrote to the terminal, in order.
+///
+/// A frame boundary is where the interesting paths live — the `prev` baseline diff,
+/// `scroll_to_make_room` and `emit_scroll_stream` all describe what changed since the
+/// last frame, and what a frame leaves behind on the real terminal is only visible to
+/// the frame after it. One frame reaches none of them.
+///
+/// Lives here because it drives the production `render_once` through a private
+/// renderer; the wezterm replay and the comparison are the oracle's.
+#[cfg(all(test, feature = "oracle"))]
+pub(crate) fn paint_frames_to_tape(
+    frames: &[&[u8]],
+    geom: crate::oracle::band::BandGeometry,
+) -> (Renderer, Vec<u8>) {
+    let mut renderer = Renderer::at_margin(geom.width, geom.rows, geom.margin);
+    renderer.real_cols = geom.phys_cols;
+    renderer.base_row = geom.base_row.min(geom.rows.saturating_sub(1));
+    let mut tape = crate::oracle::band::Tape::new(geom.phys_cols, geom.phys_rows);
+    for piece in frames {
+        renderer.parser.process(piece);
+        renderer.scroll_tracker.process(piece);
+        render_once(&mut renderer, &mut tape).unwrap();
+    }
+    (renderer, tape.into_bytes())
+}
+
 #[cfg(test)]
 mod cjk {
     use super::*;
@@ -5057,6 +5129,7 @@ mod cjk {
 #[cfg(test)]
 mod rowclip_paint {
     use super::*;
+    use crate::terminal::mock::{Call, MockTerminal, RecordingGrid};
 
     /// Band-edge blank (the Bug B gate). A full-width reverse-video row (the nvim
     /// statusline: `ESC[7m` then a row-final `ESC[K`, attributed-but-empty) painted at a
@@ -5116,6 +5189,218 @@ mod rowclip_paint {
         assert!(
             !grid.cell_inverse(1, margin + 1),
             "the bleed must not reach the second cell of row 1 either"
+        );
+    }
+
+    /// A stream that fills a `W`-wide row and wraps one glyph past it, all inside a
+    /// single `process` call — the shape that makes vt100 flip the row's wrapped flag
+    /// and repair it with an absolute jump back to the row's last cell. Split across
+    /// two calls the same content diffs to a harmless relative move, so the single
+    /// call is load-bearing.
+    const WRAP_FLIP: &[u8] = b"0123456789X";
+    const WRAP_FLIP_WIDTH: u16 = 10;
+
+    /// The wide-edge fixture, recorded at 80x24 — a real stream that drives the same
+    /// repair through the frame path.
+    const WIDE_EDGE: &[u8] = include_bytes!("../tests/fixtures/wide-edge.cast");
+
+    /// Every CSI in `run` that addresses an absolute screen position, as
+    /// `(byte offset, row, column)` in the terminal's 1-based coordinates. `CUP`
+    /// (`H`/`f`) carries both; `CHA` (`G`) names a column only, so its row reads
+    /// `None`. Only CSI final bytes count, so an `H` in the row's own text is not a
+    /// match.
+    fn absolute_moves(run: &[u8]) -> Vec<(usize, Option<u16>, u16)> {
+        let mut found = Vec::new();
+        let mut i = 0;
+        while i < run.len() {
+            if run[i] != 0x1b {
+                i += 1;
+                continue;
+            }
+            if run.get(i + 1) != Some(&b'[') {
+                i += 2;
+                continue;
+            }
+            let mut j = i + 2;
+            while j < run.len() && !(0x40..=0x7e).contains(&run[j]) {
+                j += 1;
+            }
+            let Some(&final_byte) = run.get(j) else {
+                break;
+            };
+            let params: Vec<u16> = run[i + 2..j]
+                .split(|&b| b == b';')
+                .map(|field| {
+                    std::str::from_utf8(field)
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1)
+                })
+                .collect();
+            match final_byte {
+                b'H' | b'f' => {
+                    found.push((i, Some(params[0]), params.get(1).copied().unwrap_or(1)));
+                }
+                b'G' => found.push((i, None, params[0])),
+                _ => {}
+            }
+            i = j + 1;
+        }
+        found
+    }
+
+    /// Every row run a paint produced, paired with the physical row it was painted
+    /// at — the `WriteRow` payloads a real frame emitted, read back off the preceding
+    /// `MoveTo`. Feeds `bytes` in `chunk`-sized pieces, rendering a frame per piece,
+    /// so the diff sees the same boundaries a throttled PTY read would hand it.
+    fn painted_runs(
+        bytes: &[u8],
+        width: u16,
+        rows: u16,
+        margin: u16,
+        base_row: u16,
+        chunk: usize,
+    ) -> Vec<(u16, Vec<u8>)> {
+        let mut renderer = Renderer::at_margin(width, rows, margin);
+        renderer.base_row = base_row;
+        let mut term = MockTerminal::new();
+        for piece in bytes.chunks(chunk) {
+            renderer.parser.process(piece);
+            renderer.scroll_tracker.process(piece);
+            render_once(&mut renderer, &mut term).unwrap();
+        }
+        let mut row = 0;
+        let mut runs = Vec::new();
+        for call in &term.calls {
+            match call {
+                Call::MoveTo(_, r) => row = *r,
+                Call::WriteRow(bytes) => runs.push((row, bytes.clone())),
+                _ => {}
+            }
+        }
+        runs
+    }
+
+    /// The trigger is still live. vt100's soft-wrap repair is what puts an absolute
+    /// `CUP` in a row run at all; if a vt100 upgrade stopped emitting it, the two
+    /// tests below would keep passing while covering nothing. This asserts the raw
+    /// diff — the clipper's input, before any rewrite — still carries one.
+    #[test]
+    fn wrap_flip_diff_still_carries_an_absolute_move() {
+        let mut renderer = Renderer::at_margin(WRAP_FLIP_WIDTH, 8, 0);
+        renderer.parser.process(WRAP_FLIP);
+        let screen = renderer.parser.screen();
+        let found = screen
+            .rows_diff(renderer.prev.screen(), 0, WRAP_FLIP_WIDTH)
+            .any(|run| !absolute_moves(&run).is_empty());
+        assert!(
+            found,
+            "vt100 no longer emits an absolute move for the wrap-flip repair — the \
+             physical rewrite is untested until this stream is replaced"
+        );
+    }
+
+    /// Every absolute move a painted run carries addresses the band's own rectangle
+    /// (ADR-014). A run is painted after a bare `move_to(left_margin, offset + row)`
+    /// and nothing inside it re-establishes that origin, so a position left in the
+    /// run's band-local coordinates would be read as a raw screen one — outside the
+    /// band, and on cells the diff baseline believes are untouched, so nothing ever
+    /// repaints them. What must come out is the run's own physical row and a column
+    /// inside `[margin, margin + W)`, `CUP` only: a `CHA` names no row, so it could
+    /// only survive from the run's own coordinates. Both the synthetic wrap-flip and
+    /// the wide-edge fixture drive the repair; the chunk sizes vary where the diff
+    /// boundaries fall.
+    ///
+    /// Both bounds have to be able to fail. The margin is wider than the band, so the
+    /// allowed physical columns `[margin + 1, margin + W]` sit clear of the band-local
+    /// `[1, W]` a raw move would name — at a narrower margin the two ranges overlap and
+    /// a raw column slips through. The wrap-flip band is anchored below the top of the
+    /// screen for the same reason: at `base_row == 0` the physical row and the grid row
+    /// are the same number and the row check asserts nothing. The fixture drives the
+    /// child onto the alt screen, where the band always anchors at row 0 (ADR-012), so
+    /// there the column bound is the one carrying the case.
+    #[test]
+    fn painted_runs_address_only_the_band() {
+        for (bytes, width, rows, base_row) in [
+            (WRAP_FLIP, WRAP_FLIP_WIDTH, 8u16, 3u16),
+            (WIDE_EDGE, 80u16, 24u16, 0u16),
+        ] {
+            let margin = width + 2;
+            for chunk in [1usize, 7, 64, bytes.len()] {
+                for (phys_row, run) in painted_runs(bytes, width, rows, margin, base_row, chunk) {
+                    for (at, row1, col1) in absolute_moves(&run) {
+                        let shown = String::from_utf8_lossy(&run[at..]).to_string();
+                        assert_eq!(
+                            row1,
+                            Some(phys_row + 1),
+                            "the move at byte {at} of the run painted at physical row \
+                             {phys_row} (W={width}, chunk={chunk}) names another row: \
+                             {shown}"
+                        );
+                        assert!(
+                            (margin + 1..=margin + width).contains(&col1),
+                            "the move at byte {at} of the run painted at physical row \
+                             {phys_row} (W={width}, chunk={chunk}) leaves the band's \
+                             columns [{}, {}]: {shown}",
+                            margin + 1,
+                            margin + width
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Nothing paints outside the band rectangle, at a non-zero margin AND a non-zero
+    /// `base_row` (ADR-006/013). The wrap-flip repair's absolute column and row are
+    /// both chosen to fall clear of the band — column 9 sits left of `margin`, row 0
+    /// sits above `base_row` — so a run that addressed them raw would stamp a glyph
+    /// the readback can see and the diff baseline would never clean up.
+    ///
+    /// The readback is a `vt100` grid, which has no deferred wrap, and the band ends
+    /// well short of the screen's right edge here: this pins down where the rewrite
+    /// puts a cell, not how a real terminal behaves at its last column.
+    ///
+    /// The row is painted under reverse video so the readback can see a
+    /// background-only stamp. A cell erased or filled under an attribute holds no
+    /// glyph — `contents()` stays `""` while the highlight is on screen — so reading
+    /// the character alone would miss a stray cell that carries only colour, which is
+    /// exactly what a mis-columned move leaves behind on an attributed row.
+    #[test]
+    fn wrap_repair_paints_inside_the_band_at_an_offset() {
+        let (w, rows, margin, phys, base_row) = (WRAP_FLIP_WIDTH, 8u16, 12u16, 30u16, 3u16);
+        let mut renderer = Renderer::at_margin(w, rows, margin);
+        renderer.base_row = base_row;
+        renderer
+            .parser
+            .process(&[b"\x1b[7m".as_slice(), WRAP_FLIP].concat());
+        let mut grid = RecordingGrid::new(phys, rows);
+        render_once(&mut renderer, &mut grid).unwrap();
+
+        for row in 0..rows {
+            for col in 0..phys {
+                let c = grid.cell_contents(row, col);
+                let inverse = grid.cell_inverse(row, col);
+                if (c.is_empty() || c == " ") && !inverse {
+                    continue;
+                }
+                assert!(
+                    row >= base_row && (margin..margin + w).contains(&col),
+                    "painted {c:?} (inverse {inverse}) at physical (row {row}, col \
+                     {col}), outside the band rectangle rows [{base_row}, {rows}) x \
+                     cols [{margin}, {})",
+                    margin + w
+                );
+            }
+        }
+
+        // The repair's restamped glyph belongs at the band's last column on the
+        // band's own first row — proof the rewrite landed it, not just that the
+        // stray cell is absent.
+        assert_eq!(
+            grid.cell_contents(base_row, margin + w - 1),
+            "9",
+            "the wrap-flip repair must restamp the row's last cell in-band"
         );
     }
 }
@@ -5605,7 +5890,7 @@ mod inline_anchor {
         assert!(t1.calls.contains(&Call::MoveTo(0, 11)));
         assert_eq!(
             content_rows(&t1.calls),
-            vec![b"\r\n\x1b[2mExited with: 7\x1b[0m".as_slice()],
+            vec![b"\x1b[m\r\n\x1b[2mExited with: 7\x1b[0m".as_slice()],
             "a non-zero exit hands back the dim status line below the band"
         );
     }

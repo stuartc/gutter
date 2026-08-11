@@ -56,15 +56,29 @@ pub trait OuterTerminal {
     /// Move the cursor to physical `(col, row)`, emitted before each repainted
     /// row so the row's bytes land at the band's left margin.
     fn move_to(&mut self, col: u16, row: u16) -> io::Result<()>;
-    /// Write a row's `rows_diff` byte run verbatim — `prepare_row_into` has made it
-    /// self-contained, so it carries its own intra-row SGR and relative cursor
-    /// moves, scoped to `[0, W)` (ADR-014).
+    /// Write a row's byte run verbatim. `prepare_row_into` has already clipped it for
+    /// one [`Placement`] (ADR-014): it carries its own intra-row SGR, its erases stop at
+    /// the band's right edge, and every position inside it is an absolute `CUP` naming a
+    /// physical cell on that one row at that one margin.
+    ///
+    /// So the payload is good at the placement it was built for and nowhere else.
+    /// Buffering one and replaying it at another row or margin paints outside the band,
+    /// onto cells the diff baseline never repaints.
+    ///
+    /// [`Placement`]: crate::rowclip::Placement
     fn write_row(&mut self, bytes: &[u8]) -> io::Result<()>;
     /// Advance the real terminal one line (`\r\n`), scrolling when on the bottom
     /// row. The scroll-aware primary paint emits a departed top line then this
     /// newline so the line enters the real terminal's own scrollback — gutter
     /// keeps vt100 at `scrollback=0` and lets the real terminal be the store
     /// (ADR-013).
+    ///
+    /// An implementation MUST reset the SGR state before it scrolls. A terminal fills
+    /// the line that scrolls in with the active background, across the full physical
+    /// width — so a newline under a painted row's trailing attribute colours both
+    /// gutters on a row the diff baseline never repaints, the same escape from the band
+    /// ADR-014's `ESC[K` bounding exists to prevent. Callers scroll from wherever the
+    /// last row left the cursor's attributes, so the reset belongs here.
     fn newline(&mut self) -> io::Result<()>;
     /// Clear the gutter columns outside the band `[margin, margin + width)` across rows
     /// `[row_start, row_end)`. The row span is what makes this safe on the primary
@@ -321,8 +335,10 @@ impl OuterTerminal for CrosstermTerminal {
 
     fn newline(&mut self) -> io::Result<()> {
         // `\r\n` returns to column 0 then advances a line; on the bottom row the
-        // terminal scrolls and the line just written enters its scrollback.
-        self.out.write_all(b"\r\n")
+        // terminal scrolls and the line just written enters its scrollback. The
+        // leading `ESC[m` is the trait's reset — the line that scrolls in is filled
+        // with the active background across the whole screen, gutters included.
+        self.out.write_all(b"\x1b[m\r\n")
     }
 
     fn clear_gutter(
@@ -848,8 +864,10 @@ pub mod mock {
         }
         fn newline(&mut self) -> io::Result<()> {
             // Feed `\r\n` through the physical parser, so a departed line scrolls
-            // into the recording grid.
-            self.parser.process(b"\r\n");
+            // into the recording grid. vt100 fills the scrolled-in line with blanks
+            // whatever the SGR, so the trait's reset is invisible here — see the
+            // painted-band check for the emulator that shows it.
+            self.parser.process(b"\x1b[m\r\n");
             Ok(())
         }
         fn clear_gutter(

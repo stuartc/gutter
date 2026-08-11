@@ -13,7 +13,7 @@ Toolchain is pinned to **Rust 1.96.0** (`.tool-versions`).
 ```bash
 cargo build                         # debug build → target/debug/gutter
 cargo test                          # unit + integration tests (no oracle)
-cargo test --features oracle        # also builds & runs the equivalence gate
+cargo test --features oracle        # also builds & runs the equivalence gate and the painted-band check
 cargo clippy --all-targets
 cargo clippy --all-targets --features oracle
 
@@ -32,10 +32,13 @@ There is no `--help`; an unknown leading token is treated as the command. There 
 cargo test passthrough_echo                       # by name, any target
 cargo test --test passthrough                      # one integration file
 cargo test --test equivalence_pty --features oracle   # the gate (needs the feature)
+cargo test --bin gutter --features oracle          # in-crate tests incl. the painted-band check
 cargo test --bin gutter                            # only the in-crate unit tests (there is no lib target)
 ```
 
-Integration tests drive a **real PTY** via `expectrl` and assert on what the outer terminal actually sees, not on gutter internals. They need a valid `TERM` (CI sets `xterm-256color`). The `--features oracle` build is the only one that compiles `src/oracle/` and the equivalence gate; the default build never pulls the heavy wezterm dependency tree.
+Integration tests drive a **real PTY** via `expectrl` and assert on what the outer terminal actually sees, not on gutter internals. They need a valid `TERM` (CI sets `xterm-256color`). The `--features oracle` build is the only one that compiles `src/oracle/` — the equivalence gate and the painted-band check both; the default build never pulls the heavy wezterm dependency tree.
+
+**Know what a green suite does not prove.** The render-thread unit tests read gutter's output back through `RecordingGrid` (`src/terminal.rs`), a mock that is itself a `vt100::Parser` — the same emulator gutter reasons with. It checks the band arithmetic and cannot, by construction, catch gutter's model disagreeing with a real terminal: vt100 has no deferred wrap, real terminals do. The equivalence gate does not cover this either — it diffs two grids built from the child's bytes and never sees what gutter writes. Anything about *where* bytes land on the real screen has to be proved against wezterm or a real PTY — in this repo that means the painted-band check in `src/oracle/band.rs`, which replays gutter's own bytes (`paint_to_tape` in `src/render.rs` → a `Tape`) through wezterm-term at the physical screen size. See [ADR-001](docs/adr/0001-two-emulator-equivalence-gate.md).
 
 ## Architecture
 
@@ -49,7 +52,7 @@ Integration tests drive a **real PTY** via `expectrl` and assert on what the out
 
 **Channel topology:** four sources feed the one channel — the PTY reader, the input reader, the waiter and the SIGWINCH thread. The PTY path is throttled upstream (bounded `sync_channel`) but the merged channel is unbounded, so a keystroke `send()` never blocks under a multi-MB PTY flood. Because Thread 2 alone owns the parser, there is no shared mutable state and no parser mutex.
 
-**Data flow (output):** child PTY → Thread 1 bounded staging → merged channel → Thread 2 `parser.process()` → `W`-column vt100 grid → `rows_diff` per-row byte runs → Thread 2 emits `MoveTo(left_margin, row)` + row bytes → outer terminal.
+**Data flow (output):** child PTY → Thread 1 bounded staging → merged channel → Thread 2 `parser.process()` → `W`-column vt100 grid → `rows_diff` per-row byte runs → clipped for the row's placement (`src/rowclip.rs`) → Thread 2 emits `MoveTo(left_margin, offset + row)` + the row's bytes → outer terminal.
 
 **Data flow (input):** outer tty → Thread 3 `read()` → merged channel → Thread 2 `Scanner::feed` → tokens → `write_all` to the PTY master, except mouse reports (translated by the gate) and the reserved chord / in-mode resize keys (consumed). Between bracketed-paste guards nothing is extracted at all.
 
@@ -72,6 +75,7 @@ Most files map one-to-one onto a concern; the non-obvious split:
 | `src/anchor.rs` | The input tty, and the startup CPR probe behind the inline anchor: hand-rolled so keystrokes typed during startup survive as leftover rather than vanishing into crossterm's event queue. The query goes out through the band's own sink, so the terminal that is asked is the one that answers. |
 | `src/cli.rs` | Hand-rolled arg parse (no clap). `--width N\|Npct\|N%`, `--center`/`--left`. |
 | `src/geometry.rs` | Pure layout maths: `margin()`, `resolve_width()` (absolute vs proportional), `physical_col()`. No I/O; property-tested. |
+| `src/rowclip.rs` | Makes a `rows_diff` row run safe to paint at one `Placement { left_margin, phys_row, grid_row }`: bounds the row-final `ESC[K` to `W` and re-expresses the run's absolute `CUP`/`CHA` moves as absolute moves in the band's physical coordinates, tracking a virtual in-band column across the run. Correct at that placement only. Pure — bytes in, bytes out. |
 | `src/terminal.rs` | `OuterTerminal` trait abstracting every outer side effect; crossterm impl over a buffered tty handle (`open_tty_write` — `/dev/tty`, else the terminal gutter's own stdio names; also the startup guard), plus the size and raw-mode ioctls on that handle + a recording mock for restore-order / column assertions. |
 | `src/callbacks.rs` | `vt100::Callbacks` impl holding the DECSCUSR cursor-shape watcher, the device-query replies, the keyboard-mode relay hook and the OSC-52 hook. |
 | `src/input.rs` | Thread 3 — the dumb outer-tty read pump. Owns the read fd, interprets nothing. |
@@ -84,7 +88,7 @@ Most files map one-to-one onto a concern; the non-obvious split:
 | `src/clipboard.rs` | OSC-52 wire reconstruction → its own open of the resolved terminal (so clipboard write and frame repaint don't fight over fd state). Also the read-write open the input tty is made from. |
 | `src/cursor.rs` | DECSCUSR cursor-shape mirroring to the outer terminal. |
 | `src/clock.rs` | Injectable clock + receiver, so the coalescing loop is unit-testable with a virtual clock and scripted messages — no real PTY, no threads. |
-| `src/oracle/` | **Feature-gated** equivalence gate (`gate.rs`, `cellview.rs`): replays bytes through both vt100 and wezterm-term at the same width and diffs cells. |
+| `src/oracle/` | **Feature-gated**, two checks over wezterm-term. `gate.rs` + `cellview.rs` — the equivalence gate: replays the *child's* bytes through both vt100 and wezterm-term at the same width and diffs cells. `band.rs` — the painted-band check: replays the bytes *gutter writes* (a `Tape`, fed by `paint_to_tape` in `src/render.rs`) through wezterm-term at the physical screen size, then diffs the band's rectangle (`BandRect`) against the child's own grid, and asserts nothing landed outside it. The only place a misplaced cursor move is visible. |
 
 ### Invariants to respect
 
@@ -92,6 +96,7 @@ These are load-bearing and easy to break. Each has a full record under `docs/adr
 the one-liners below are the quick reference.
 
 - **Coalescing loop.** Fixed-deadline ~60fps coalescer; the explicit `now >= deadline` burst-exit check is mandatory. See [ADR-007](docs/adr/0007-coalescing-loop.md).
+- **A painted row stays inside the band.** A changed row is written after one `move_to(left_margin, phys_row)`, so anything absolute inside the run — the `CUP` vt100 emits when a row's wrap state flips backwards, the only backward positioning it ever puts in a run — would move the cursor onto the raw screen and stamp a cell the diff baseline never repaints. The clipper re-expresses those in the band's physical coordinates and bounds the row-final `ESC[K` to `W`, whose reposition is the same move. It stays an *absolute* `CUP`, never a relative hop: deferred wrap leaves the real cursor a column behind the clipper's tracker after a glyph lands in the screen's last column, so a `CUB` would undershoot — and the band's right edge is the screen's on a default `gutter claude` and on every `--width full` run. A clipped run is therefore correct at one placement only. Scrolling the screen answers to the same rule: `newline` resets the SGR before it scrolls, or the line arriving at the bottom is filled with the last row's background across both gutters, and the rows a scrolling frame paints in place blank the band's columns first, because a `rows_formatted` run describes only the cells that differ from a blank one. See [ADR-014](docs/adr/0014-row-run-self-containment.md).
 - **Resize order (on the render thread).** Recompute `W` → `resizer.resize(W, rows)` (TIOCSWINSZ first) → `parser.set_size(rows, W)` (mind the `(rows, cols)` order) → recompute margin → baseline reset. See [ADR-008](docs/adr/0008-resize-ordering.md).
 - **One terminal, and opening it is the guard.** The band's sink, the keyboard, the clipboard, the size and the termios all come from one device: `/dev/tty`, or — with no controlling terminal — the terminal `ttyname` names on stdin, stdout or stderr, reopened by name and used for every handle. Nothing asks crossterm which terminal it is: the size is a `TIOCGWINSZ` on the sink's own fd and raw mode a `tcgetattr`/`tcsetattr` on it. stdout is never written, so `gutter cmd > log` paints on screen and leaves the log empty. Neither route opening means one line to stderr and exit 1, before the child is spawned; the read-write open for the keyboard is *not* the guard — a terminal that paints but will not open for reading runs watch-only. The read side is opened once — the startup probe and Thread 3 share it, or they race for the CPR reply. See [ADR-023](docs/adr/0023-controlling-terminal-fd-model.md).
 - **Teardown is explicit and ordered, and best-effort per step.** No destructors after `process::exit`; restore by hand, each step conditional on what was set up, and every step attempted even after an earlier one failed — `disable_raw_mode` has to run whatever else went wrong, exactly as it does in the suspend path's park, which runs the same step list — the attribute and cursor-shape resets included. The sink is a `BufWriter`, so `show_cursor`'s flush is what puts the restore on screen while the order still holds. See [ADR-010](docs/adr/0010-ordered-teardown.md) and [ADR-023](docs/adr/0023-controlling-terminal-fd-model.md).
@@ -105,14 +110,20 @@ the one-liners below are the quick reference.
 - **Child stop is detected via `waitpid(WUNTRACED)`, never a signal handler.** Raw mode strips `ISIG` on the outer tty and the child's SIGTSTP is scoped to its own session — gutter's process can never receive it directly. See [ADR-018](docs/adr/0018-stop-aware-waiter.md).
 - **Suspend/resume is straight-line code on the render thread.** Park the outer terminal (ADR-010 order) → `kill(0, SIGTSTP)` → the process freezes until `fg` → unpark (raw mode first) → continue the child's group. No SIGCONT handler. See [ADR-019](docs/adr/0019-suspend-resume-cycle-ordering.md).
 
-The full set (including the equivalence gate, clipboard fd, margin rule, channel
-topology, and row clipping) is indexed in [docs/adr/README.md](docs/adr/README.md).
+The full set (including the equivalence gate, clipboard fd, margin rule and channel
+topology) is indexed in [docs/adr/README.md](docs/adr/README.md).
 
-## Equivalence gate & fixtures
+## The two oracle checks & the fixtures
+
+The `oracle` feature carries two separate checks, both diffing against wezterm-term but asking different questions.
+
+**The equivalence gate** (`src/oracle/gate.rs`, run by `tests/equivalence_pty.rs`) asks whether vt100 made the same grid of the child's bytes that an independent emulator did. It replays one byte stream through both at the same width and diffs cells.
+
+**The painted-band check** (`src/oracle/band.rs`, an in-crate `#[cfg(test)]` module) asks whether gutter's own output lands where gutter thinks it does. It paints one real frame through the production render path into a `Tape` — an `OuterTerminal` that keeps the bytes instead of a screen — replays that tape through wezterm-term at the *physical* screen size, and diffs the band's rectangle against the child's `W`-column vt100 grid, plus a second pass asserting nothing at all reached the gutter. It covers the case the rest of the suite cannot: a band whose right edge is the screen's, where deferred wrap is live and vt100 and a real terminal disagree about where the cursor is.
 
 The fixtures under `tests/fixtures/*.cast` are **not asciinema recordings** — they are raw, timing-less, *settled* VT byte streams recorded at a declared width and consumed via `include_bytes!`. Current corpus: `claude-code-flow.cast` (the Claude Code baseline), `plain-scroll.cast` (primary-screen scrolling past a screenful), `wide-edge.cast` (CJK/emoji at the band edge). `*.allowlist` files record benign vt100↔wezterm divergences that have been reviewed and blessed; the gate passes when there are **zero corrupting** cells.
 
-The declared width a fixture is captured at **must** equal the `W` the gate replays it at, or the cell-by-cell diff silently misaligns. `scripts/capture-fixture.sh <cols> <rows> <out.cast> -- <cmd>` is the helper to record a new one at an exact PTY size (review the bytes before checking in).
+The declared width a fixture is captured at **must** equal the `W` it is replayed at, by either check, or the cell-by-cell diff silently misaligns. `scripts/capture-fixture.sh <cols> <rows> <out.cast> -- <cmd>` is the helper to record a new one at an exact PTY size (review the bytes before checking in).
 
 ## Working conventions
 

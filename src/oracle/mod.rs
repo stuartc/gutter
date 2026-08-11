@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tattoy_wezterm_term::color::ColorPalette;
 use tattoy_wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 
+pub mod band;
 pub mod cellview;
 pub mod gate;
 
