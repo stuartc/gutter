@@ -4781,6 +4781,19 @@ line two\r\n\
     }
 }
 
+/// Feed one byte stream to the live parser and the scroll tracker in the `pieces` it is
+/// split into, exactly as the render loop's `Msg::Pty` dispatch hands over each chunk a
+/// throttled PTY read delivered. The split points are the point: a chunk boundary can
+/// fall mid escape sequence, and the two parsers only agree about that if both carry
+/// their own vte state across the boundary. Feeding the whole stream is `&[bytes]`.
+#[cfg(test)]
+fn feed_split(renderer: &mut Renderer, pieces: &[&[u8]]) {
+    for piece in pieces {
+        renderer.parser.process(piece);
+        renderer.scroll_tracker.process(piece);
+    }
+}
+
 /// Shared test helper for wide-char (CJK / emoji) edge-of-band correctness (ADR-006).
 /// Build a renderer at `width × rows` with margin `margin`, feed `bytes` straight into
 /// the parser, and paint one frame through the primary `rows_diff` path into a fresh
@@ -4825,8 +4838,7 @@ pub(crate) fn paint_frames_to_tape(
     renderer.base_row = geom.base_row.min(geom.rows.saturating_sub(1));
     let mut tape = crate::oracle::band::Tape::new(geom.phys_cols, geom.phys_rows);
     for piece in frames {
-        renderer.parser.process(piece);
-        renderer.scroll_tracker.process(piece);
+        feed_split(&mut renderer, &[piece]);
         render_once(&mut renderer, &mut tape).unwrap();
     }
     (renderer, tape.into_bytes())
@@ -5265,8 +5277,7 @@ mod rowclip_paint {
         renderer.base_row = base_row;
         let mut term = MockTerminal::new();
         for piece in bytes.chunks(chunk) {
-            renderer.parser.process(piece);
-            renderer.scroll_tracker.process(piece);
+            feed_split(&mut renderer, &[piece]);
             render_once(&mut renderer, &mut term).unwrap();
         }
         let mut row = 0;
@@ -5418,10 +5429,10 @@ mod primary_scroll {
 
     /// Feed bytes to the renderer exactly as the render loop's `Msg::Pty` dispatch does —
     /// the live parser and the scroll tracker — so the tests exercise the real per-frame
-    /// scroll detection rather than a parser the tracker never saw.
+    /// scroll detection rather than a parser the tracker never saw. [`feed_split`] is the
+    /// same thing over a stream arriving in several chunks.
     fn feed(renderer: &mut Renderer, bytes: &[u8]) {
-        renderer.parser.process(bytes);
-        renderer.scroll_tracker.process(bytes);
+        feed_split(renderer, &[bytes]);
     }
 
     /// A renderer whose grid holds `lines` (one per row, no trailing newline so
@@ -5698,8 +5709,7 @@ mod inline_anchor {
     /// Feed bytes to the live parser and the scroll tracker, exactly as the loop's
     /// `Msg::Pty` dispatch does, so the per-frame scroll detection is exercised.
     fn feed(renderer: &mut Renderer, bytes: &[u8]) {
-        renderer.parser.process(bytes);
-        renderer.scroll_tracker.process(bytes);
+        feed_split(renderer, &[bytes]);
     }
 
     /// A margin-0 renderer anchored at `base_row` — the band launched `base_row`
