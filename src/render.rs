@@ -997,8 +997,8 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
 
     term.flush()?;
 
-    // The current screen becomes the next frame's diff baseline. vt100 has no clone,
-    // so re-process the formatted state into prev — a cheap in-memory replay.
+    // The current screen becomes the next frame's diff baseline. `vt100::Parser` has no
+    // `clone`, so re-process the formatted state into prev — a cheap in-memory replay.
     renderer.sync_prev();
     Ok(())
 }
@@ -1273,9 +1273,11 @@ impl Renderer {
     }
 
     /// Advance the `prev` baseline to match the current screen, so the next
-    /// frame's `rows_diff` is against what was just painted. vt100 exposes no
+    /// frame's `rows_diff` is against what was just painted. `vt100::Parser` exposes no
     /// `clone`, so feed `prev` the current screen's `contents_formatted()` —
-    /// a full state replay that leaves `prev` cell-identical to `parser`.
+    /// a full state replay that leaves `prev` cell-identical to `parser`. `prev` is
+    /// never fed the child's bytes, so it carries no vte state worth keeping and a
+    /// whole-parser replacement is fine here.
     fn sync_prev(&mut self) {
         self.prev = self.live_mirror(0);
     }
@@ -1286,8 +1288,8 @@ impl Renderer {
         vt100::Parser::new_with_callbacks(rows, cols, scrollback, GutterCallbacks::baseline())
     }
 
-    /// A blank mirror replayed up to the live grid's current content. vt100 exposes no
-    /// `clone`, so `contents_formatted()` is the replay.
+    /// A blank mirror replayed up to the live grid's current content. `vt100::Parser`
+    /// exposes no `clone` (its `Screen` does), so `contents_formatted()` is the replay.
     fn live_mirror(&self, scrollback: usize) -> vt100::Parser<GutterCallbacks> {
         let mut p = self.blank_mirror(scrollback);
         p.process(&self.parser.screen().contents_formatted());
@@ -1336,8 +1338,16 @@ impl Renderer {
     /// Re-seed the scroll tracker from the live grid, leaving its scrollback
     /// empty. Used after a drain and after a resize/baseline reset so the tracker
     /// always mirrors the live grid's content at the band's current size.
+    ///
+    /// Only the screen is replaced: `vt100::Parser` owns the vte state machine, and a
+    /// chunk boundary falls mid escape sequence often enough that dropping the parser
+    /// leaves the tracker parsing the tail of, say, a 2KB OSC 52 clipboard write as
+    /// printable text — a screenful of phantom scrolls the child never made. The source
+    /// mirror is built at the tracker's own scrollback size because the cloned `Screen`
+    /// carries the cap with it; cloning a scrollback-0 screen in would kill it for good.
     fn reset_scroll_tracker(&mut self) {
-        self.scroll_tracker = self.live_mirror(SCROLL_TRACKER_SCROLLBACK);
+        let fresh = self.live_mirror(SCROLL_TRACKER_SCROLLBACK);
+        *self.scroll_tracker.screen_mut() = fresh.screen().clone();
     }
 
     /// The deepest grid row holding live content this frame — whichever reaches further
@@ -5669,6 +5679,52 @@ mod primary_scroll {
         );
     }
 
+    /// A long OSC 52 clipboard write split across a frame boundary must not invent
+    /// scrolls. The tracker is re-seeded every frame, and if that re-seed drops the
+    /// vte state machine mid-sequence the tail of the payload is parsed as printable
+    /// text: ~2100 characters typed onto the bottom row of an 80-column screen scroll
+    /// the tracker's mirror by dozens of lines that the child never scrolled. Those
+    /// phantom departures reach the real terminal as a scrolling stream (one `Newline`
+    /// per line), so the same bytes must produce the same emit whole or split.
+    #[test]
+    fn split_osc52_does_not_invent_scrolls() {
+        // A real clipboard write: `ESC ] 52 ; c ; <base64> BEL`, 2168 bytes all in.
+        let payload = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=".repeat(60);
+        let osc = format!("\x1b]52;c;{payload}\x07");
+        let osc = osc.as_bytes();
+
+        // Cursor parked on the bottom row of a settled 24x80 primary screen.
+        let (w, rows) = (80u16, 24u16);
+        let lines: Vec<String> = (0..rows).map(|i| format!("line{i}")).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+
+        let newlines = |pieces: &[&[u8]]| {
+            let mut renderer = renderer_primed(w, rows, &lines);
+            let mut count = 0usize;
+            for piece in pieces {
+                feed_split(&mut renderer, &[piece]);
+                let mut term = MockTerminal::new();
+                render_once(&mut renderer, &mut term).unwrap();
+                count += term.calls.iter().filter(|c| **c == Call::Newline).count();
+            }
+            count
+        };
+
+        // Split near the start, mid-sequence: the introducer in one chunk, the rest
+        // in the next, with a frame in between.
+        let (head, tail) = osc.split_at(5);
+        assert_eq!(
+            newlines(&[osc]),
+            0,
+            "an OSC 52 write delivered whole scrolls nothing"
+        );
+        assert_eq!(
+            newlines(&[head, tail]),
+            0,
+            "the same write split across a frame boundary must scroll nothing either"
+        );
+    }
+
     /// The tracker's bounded scrollback does not accumulate across frames. The tracker is
     /// reset to the live grid every `render_once`, so after many scrolling frames its
     /// scrollback length is back to zero between frames (ADR-013). Probes the tracker
@@ -5693,6 +5749,40 @@ mod primary_scroll {
         }
     }
 
+    /// The re-seed keeps the tracker's scrollback cap. The tracker's screen is replaced
+    /// every frame from a mirror built at [`SCROLL_TRACKER_SCROLLBACK`], and the cap
+    /// travels with the screen — re-seeding from a scrollback-0 mirror would leave the
+    /// tracker unable to hold a single departed line, so a single-frame burst bigger than
+    /// the screen would vanish instead of reaching the terminal's scrollback.
+    #[test]
+    fn tracker_scrollback_cap_survives_the_reseed() {
+        let (w, rows) = (20u16, 4u16);
+        let burst = 300usize;
+        let mut renderer = renderer_primed(w, rows, &["a", "b", "c", "d"]);
+
+        // Several ordinary frames first, so the tracker has been re-seeded repeatedly.
+        for i in 0..10 {
+            feed(&mut renderer, format!("\r\nwarm{i}").as_bytes());
+            render_once(&mut renderer, &mut MockTerminal::new()).unwrap();
+        }
+
+        // One frame carrying far more lines than the screen holds: every line that left
+        // the top has to sit in the tracker's scrollback to be emitted at all.
+        let mut bytes = Vec::new();
+        for i in 0..burst {
+            bytes.extend_from_slice(format!("\r\nB{i}").as_bytes());
+        }
+        feed(&mut renderer, &bytes);
+        let mut term = MockTerminal::new();
+        render_once(&mut renderer, &mut term).unwrap();
+
+        let newlines = term.calls.iter().filter(|c| **c == Call::Newline).count();
+        assert!(
+            newlines >= burst,
+            "every departed line of a {burst}-line burst must be emitted (the cap held \
+             through the re-seed), got {newlines} Newlines"
+        );
+    }
 }
 
 /// Inline primary-screen anchor (ADR-013): the `base_row` offset paint, the per-frame
