@@ -269,13 +269,8 @@ impl Renderer {
     /// [`SCROLL_TRACKER_SCROLLBACK`] of them.
     #[cfg(test)]
     fn set_tracker_cap(&mut self, cap: usize) {
-        let (rows, cols) = self.parser.screen().size();
         self.tracker_cap = cap;
-        self.scroll_tracker =
-            vt100::Parser::new_with_callbacks(rows, cols, cap, GutterCallbacks::baseline());
-        let seed = self.parser.screen().contents_formatted();
-        self.scroll_tracker.process(&seed);
-        self.tracker_scrollback = 0;
+        self.reseed_scroll_tracker();
     }
 }
 
@@ -448,8 +443,8 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
 
     // Step 2 — resize the parser screen IMMEDIATELY, same turn. (rows, cols).
     renderer.parser.screen_mut().set_size(rows, w);
-    // The tracker mirrors the band's geometry and keeps its screen across the resize
-    // (ADR-013), so it is resized rather than rebuilt.
+    // The tracker carries the child's screen state, region and alt flag included
+    // (ADR-013), so it is resized alongside the live parser and never rebuilt.
     renderer.scroll_tracker.screen_mut().set_size(rows, w);
 
     // Update the live geometry.
@@ -5850,9 +5845,8 @@ mod primary_scroll {
             let newlines = term.calls.iter().filter(|c| **c == Call::Newline).count();
             assert_eq!(
                 newlines, 1,
-                "line {i} scrolled after {} lines had already departed, and still has to \
-                 reach the terminal's scrollback",
-                i
+                "line {i} scrolled after the tracker filled, and still has to reach \
+                 the terminal's scrollback"
             );
         }
     }
