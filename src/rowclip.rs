@@ -246,8 +246,8 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, at: Placement, out: &mut Vec<u
         }
 
         if b == b'\r' {
-            // The first half of the `\r\n` vt100's `MoveFromTo` writer emits for the
-            // start of the next row. Copied through it would put the cursor on
+            // The first half of the `\r\n` that vt100's `MoveFromTo` writer emits for
+            // the start of the next row. Copied through it would put the cursor on
             // *physical* column 0, in the left gutter, and every glyph after it with
             // it; the absolute move puts it on the band's own column 0 instead.
             col = move_to_col(out, col, 0, w, at);
@@ -260,8 +260,8 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, at: Placement, out: &mut Vec<u
             // physical row, so there is no in-band translation of a line feed: written
             // out it would paint the rest of the run a row below the placement, and on
             // the screen's bottom row scroll the whole screen with no baseline change
-            // to repair it. Dropping it leaves the tracker where the `\r` put it,
-            // which is the row the run belongs on.
+            // to repair it. Dropping it leaves the tracker's column alone and the
+            // rest of the run on the placement's own row.
             debug_assert!(
                 false,
                 "line feed inside a row run ({:?})",

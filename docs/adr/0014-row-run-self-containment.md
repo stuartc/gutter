@@ -125,10 +125,10 @@ would go.
 
 ### The `\r` and `\n` arms
 
-vt100's `MoveFromTo` writer has one branch that emits either byte: a bare `\r\n` when
-the target is the start of the next row. Neither byte can reach a clipped run today — a `rows_diff` run keeps
-`from.row == to.row` structurally, and all three `rows_formatted` sites are blocked by
-the wrapping seed — but the branch is live elsewhere in vt100 (`contents_diff`), and
+vt100 writes either byte in one place only: the `\r\n` its `MoveFromTo` writer emits
+when the target is the start of the next row. Neither byte can reach a clipped run
+today — a `rows_diff` run keeps `from.row == to.row` structurally, and all three
+`rows_formatted` sites are blocked by the wrapping seed — but the branch is live elsewhere in vt100 (`contents_diff`), and
 both bytes are invisible to the `RecordingGrid` mock the render tests read back
 through: only the painted-band check could see the misplacement. So they get arms of
 their own rather than falling into the C0 catch-all, on the same footing as the `CHA`
