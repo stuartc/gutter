@@ -35,8 +35,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust 1.96.0
-        uses: dtolnay/rust-toolchain@1.96.0
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Build and upload binary
         uses: taiki-e/upload-rust-binary-action@v1

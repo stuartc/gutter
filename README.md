@@ -89,7 +89,7 @@ sudo mv gutter /usr/local/bin/
 
 ### From source
 
-You'll need Rust 1.96.0. It's pinned in `.tool-versions`, so
+You'll need Rust 1.97.1. It's pinned in `.tool-versions`, so
 [asdf](https://asdf-vm.com/) / [mise](https://mise.jdx.dev/) will pick the right
 version up automatically. With a toolchain in place:
 

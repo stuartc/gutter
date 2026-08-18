@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build, test, run
 
-Toolchain is pinned to **Rust 1.96.0** (`.tool-versions`).
+Toolchain is pinned to **Rust 1.97.1** (`.tool-versions`).
 
 ```bash
 cargo build                         # debug build → target/debug/gutter
