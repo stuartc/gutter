@@ -86,6 +86,14 @@ impl GutterCallbacks {
         std::mem::take(&mut self.replies)
     }
 
+    /// Throws away the buffered device-query replies. A mirror parser fed the child's
+    /// bytes buffers a reply per query like any other, but only the live parser's
+    /// replies reach the PTY — a long-lived mirror empties its own here instead of
+    /// growing one for the life of the process.
+    pub fn discard_replies(&mut self) {
+        self.replies.clear();
+    }
+
     /// Takes the mode requests matched for relaying since the last drain. Drained in
     /// the same arm as [`Self::drain_replies`] and written to the outer terminal
     /// first, so a proxied query gets the longest possible head start on its round

@@ -1275,9 +1275,9 @@ impl Renderer {
     /// Advance the `prev` baseline to match the current screen, so the next
     /// frame's `rows_diff` is against what was just painted. `vt100::Parser` exposes no
     /// `clone`, so feed `prev` the current screen's `contents_formatted()` —
-    /// a full state replay that leaves `prev` cell-identical to `parser`. `prev` is
-    /// never fed the child's bytes, so it carries no vte state worth keeping and a
-    /// whole-parser replacement is fine here.
+    /// a full state replay that leaves `prev` cell-identical to `parser`. Unlike the
+    /// scroll tracker, `prev` never sees the child's bytes, so it holds no vte state a
+    /// whole-parser replacement could lose.
     fn sync_prev(&mut self) {
         self.prev = self.live_mirror(0);
     }
@@ -1339,15 +1339,19 @@ impl Renderer {
     /// empty. Used after a drain and after a resize/baseline reset so the tracker
     /// always mirrors the live grid's content at the band's current size.
     ///
-    /// Only the screen is replaced: `vt100::Parser` owns the vte state machine, and a
-    /// chunk boundary falls mid escape sequence often enough that dropping the parser
-    /// leaves the tracker parsing the tail of, say, a 2KB OSC 52 clipboard write as
-    /// printable text — a screenful of phantom scrolls the child never made. The source
-    /// mirror is built at the tracker's own scrollback size because the cloned `Screen`
-    /// carries the cap with it; cloning a scrollback-0 screen in would kill it for good.
+    /// Only the screen is replaced. The `Parser` owns the vte state machine, and the
+    /// tracker is fed the child's raw bytes, so a chunk boundary landing mid escape
+    /// sequence — a 2KB OSC 52 clipboard write is easily split — would leave a fresh
+    /// parser reading the tail of that sequence as printable text and scrolling its
+    /// mirror by lines the child never scrolled. The source mirror is built at the
+    /// tracker's own scrollback size because the cap travels with the cloned `Screen`;
+    /// cloning a scrollback-0 screen in would kill it for good.
     fn reset_scroll_tracker(&mut self) {
         let fresh = self.live_mirror(SCROLL_TRACKER_SCROLLBACK);
         *self.scroll_tracker.screen_mut() = fresh.screen().clone();
+        // The tracker's device-query replies reach no PTY, and its parser outlives the
+        // frame, so the buffer is emptied here.
+        self.scroll_tracker.callbacks_mut().discard_replies();
     }
 
     /// The deepest grid row holding live content this frame — whichever reaches further
@@ -4791,17 +4795,15 @@ line two\r\n\
     }
 }
 
-/// Feed one byte stream to the live parser and the scroll tracker in the `pieces` it is
-/// split into, exactly as the render loop's `Msg::Pty` dispatch hands over each chunk a
-/// throttled PTY read delivered. The split points are the point: a chunk boundary can
-/// fall mid escape sequence, and the two parsers only agree about that if both carry
-/// their own vte state across the boundary. Feeding the whole stream is `&[bytes]`.
+/// Hand one chunk of child bytes to the live parser and the scroll tracker, exactly as
+/// the render loop's `Msg::Pty` dispatch does, so the tests exercise the real per-frame
+/// scroll detection. Called once per chunk, it also splits a stream wherever a test
+/// wants — including mid escape sequence, which only parses the same as the whole
+/// stream if both parsers carry their vte state across the boundary.
 #[cfg(test)]
-fn feed_split(renderer: &mut Renderer, pieces: &[&[u8]]) {
-    for piece in pieces {
-        renderer.parser.process(piece);
-        renderer.scroll_tracker.process(piece);
-    }
+fn feed(renderer: &mut Renderer, bytes: &[u8]) {
+    renderer.parser.process(bytes);
+    renderer.scroll_tracker.process(bytes);
 }
 
 /// Shared test helper for wide-char (CJK / emoji) edge-of-band correctness (ADR-006).
@@ -4848,7 +4850,7 @@ pub(crate) fn paint_frames_to_tape(
     renderer.base_row = geom.base_row.min(geom.rows.saturating_sub(1));
     let mut tape = crate::oracle::band::Tape::new(geom.phys_cols, geom.phys_rows);
     for piece in frames {
-        feed_split(&mut renderer, &[piece]);
+        feed(&mut renderer, piece);
         render_once(&mut renderer, &mut tape).unwrap();
     }
     (renderer, tape.into_bytes())
@@ -5287,7 +5289,7 @@ mod rowclip_paint {
         renderer.base_row = base_row;
         let mut term = MockTerminal::new();
         for piece in bytes.chunks(chunk) {
-            feed_split(&mut renderer, &[piece]);
+            feed(&mut renderer, piece);
             render_once(&mut renderer, &mut term).unwrap();
         }
         let mut row = 0;
@@ -5436,14 +5438,6 @@ mod rowclip_paint {
 mod primary_scroll {
     use super::*;
     use crate::terminal::mock::{Call, MockTerminal, RecordingGrid};
-
-    /// Feed bytes to the renderer exactly as the render loop's `Msg::Pty` dispatch does —
-    /// the live parser and the scroll tracker — so the tests exercise the real per-frame
-    /// scroll detection rather than a parser the tracker never saw. [`feed_split`] is the
-    /// same thing over a stream arriving in several chunks.
-    fn feed(renderer: &mut Renderer, bytes: &[u8]) {
-        feed_split(renderer, &[bytes]);
-    }
 
     /// A renderer whose grid holds `lines` (one per row, no trailing newline so
     /// nothing scrolled yet) with `prev` and the tracker synced to that settled
@@ -5688,7 +5682,8 @@ mod primary_scroll {
     /// per line), so the same bytes must produce the same emit whole or split.
     #[test]
     fn split_osc52_does_not_invent_scrolls() {
-        // A real clipboard write: `ESC ] 52 ; c ; <base64> BEL`, 2168 bytes all in.
+        // A clipboard write the size of a real one: `ESC ] 52 ; c ; <base64> BEL`,
+        // a little over 2KB.
         let payload = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=".repeat(60);
         let osc = format!("\x1b]52;c;{payload}\x07");
         let osc = osc.as_bytes();
@@ -5702,7 +5697,7 @@ mod primary_scroll {
             let mut renderer = renderer_primed(w, rows, &lines);
             let mut count = 0usize;
             for piece in pieces {
-                feed_split(&mut renderer, &[piece]);
+                feed(&mut renderer, piece);
                 let mut term = MockTerminal::new();
                 render_once(&mut renderer, &mut term).unwrap();
                 count += term.calls.iter().filter(|c| **c == Call::Newline).count();
@@ -5783,6 +5778,28 @@ mod primary_scroll {
              through the re-seed), got {newlines} Newlines"
         );
     }
+
+    /// The tracker's parser lives for the whole session, so nothing it buffers may grow
+    /// without bound. It sees the child's device queries and answers them into a reply
+    /// buffer nobody writes to the PTY, so that buffer has to be emptied every frame.
+    #[test]
+    fn tracker_replies_do_not_accumulate() {
+        let mut renderer = renderer_primed(20, 4, &["a", "b", "c", "d"]);
+
+        for _ in 0..100 {
+            feed(&mut renderer, b"\x1b[6n");
+            render_once(&mut renderer, &mut MockTerminal::new()).unwrap();
+        }
+
+        assert!(
+            renderer
+                .scroll_tracker
+                .callbacks_mut()
+                .drain_replies()
+                .is_empty(),
+            "the tracker must buffer no device-query replies between frames"
+        );
+    }
 }
 
 /// Inline primary-screen anchor (ADR-013): the `base_row` offset paint, the per-frame
@@ -5795,12 +5812,6 @@ mod primary_scroll {
 mod inline_anchor {
     use super::*;
     use crate::terminal::mock::{Call, MockTerminal, RecordingGrid};
-
-    /// Feed bytes to the live parser and the scroll tracker, exactly as the loop's
-    /// `Msg::Pty` dispatch does, so the per-frame scroll detection is exercised.
-    fn feed(renderer: &mut Renderer, bytes: &[u8]) {
-        feed_split(renderer, &[bytes]);
-    }
 
     /// A margin-0 renderer anchored at `base_row` — the band launched `base_row`
     /// rows down the physical screen.
