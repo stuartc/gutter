@@ -245,6 +245,32 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, at: Placement, out: &mut Vec<u
             continue;
         }
 
+        if b == b'\r' {
+            // vt100's `MoveFromTo` writer emits a bare `\r` when the target is the
+            // start of a row. Copied through it would put the cursor on *physical*
+            // column 0, in the left gutter, and every glyph after it with it; the
+            // absolute move puts it on the band's own column 0 instead.
+            col = move_to_col(out, col, 0, w, at);
+            i += 1;
+            continue;
+        }
+
+        if b == b'\n' {
+            // The other half of that writer's `\r\n`. A run is defined for one
+            // physical row, so there is no in-band translation of a line feed: written
+            // out it would paint the rest of the run a row below the placement, and on
+            // the screen's bottom row scroll the whole screen with no baseline change
+            // to repair it. Dropping it leaves the tracker where the `\r` put it,
+            // which is the row the run belongs on.
+            debug_assert!(
+                false,
+                "line feed inside a row run ({:?})",
+                String::from_utf8_lossy(run)
+            );
+            i += 1;
+            continue;
+        }
+
         if b < 0x20 {
             // Other C0 controls advance no column.
             out.push(b);
@@ -703,6 +729,49 @@ mod tests {
         let run = b"\x1b[7mABC\x1b[K"; // col 3 == W
         let got = clip_row_to_width(run, w, HOME);
         assert_eq!(got, b"\x1b[7mABC".to_vec());
+    }
+
+    /// A bare `\r` is a move to the start of the row, which read against the physical
+    /// row is the left gutter. It becomes an absolute move to the band's own column 0,
+    /// and the tracker follows it, so the erase after it fills the whole band.
+    #[test]
+    fn carriage_return_returns_to_the_bands_column_zero() {
+        let w = 40u16;
+        let got = clip_row_to_width(b"\x1b[7mAB\rz\x1b[K", w, OFFSET);
+
+        let mut want = Vec::new();
+        want.extend_from_slice(b"\x1b[7mAB");
+        want.extend(cup_at(OFFSET, 0));
+        want.push(b'z');
+        want.extend(std::iter::repeat_n(b' ', usize::from(w - 1)));
+        want.extend(cup_at(OFFSET, 1));
+        assert_eq!(got, want);
+        assert!(!got.contains(&b'\r'));
+    }
+
+    /// A line feed names a row a run cannot address, so it is loud in a debug build.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "line feed inside a row run")]
+    fn line_feed_is_loud_in_a_debug_build() {
+        clip_row_to_width(b"\x1b[7mAB\nz", 40, OFFSET);
+    }
+
+    /// With the assert compiled out the line feed is dropped rather than written: it
+    /// would paint the rest of the run a row below the placement. Nothing else in the
+    /// run shifts — the tracker still reads 2, so the erase fills `W - 2`.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn line_feed_is_dropped() {
+        let w = 40u16;
+        let got = clip_row_to_width(b"\x1b[7mAB\n\x1b[K", w, OFFSET);
+
+        let mut want = Vec::new();
+        want.extend_from_slice(b"\x1b[7mAB");
+        want.extend(std::iter::repeat_n(b' ', usize::from(w - 2)));
+        want.extend(cup_at(OFFSET, 2));
+        assert_eq!(got, want);
+        assert!(!got.contains(&b'\n'));
     }
 
     /// `EraseChar` moves no column: an interior `ESC[3X` between glyphs and the

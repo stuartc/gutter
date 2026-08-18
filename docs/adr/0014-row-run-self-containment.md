@@ -123,6 +123,30 @@ write — so neither can appear today. They stay because if vt100 ever did emit 
 relative move it would need the same rewrite as the `CUP`, and the arm is where that
 would go.
 
+### The `\r` and `\n` arms
+
+vt100's `MoveFromTo` writer has a branch that emits a bare `\r\n` when the target is
+the start of the next row, and one that emits a bare `\r` for the start of the current
+one. Neither byte can reach a clipped run today — a `rows_diff` run keeps
+`from.row == to.row` structurally, and all three `rows_formatted` sites are blocked by
+the wrapping seed — but the branch is live elsewhere in vt100 (`contents_diff`), and
+both bytes are invisible to the `RecordingGrid` mock the render tests read back
+through: only the painted-band check could see the misplacement. So they get arms of
+their own rather than falling into the C0 catch-all, on the same footing as the `CHA`
+and `CUB` arms above.
+
+A `\r` copied through would put the cursor on *physical* column 0 — the left gutter
+whenever the margin is non-zero — and every glyph after it with it. It is rewritten
+into the absolute move to the band's own column 0, the same shape as the `CHA` arm,
+with the tracker set to 0.
+
+A `\n` has no in-band translation at all: a run is defined for one physical row, so
+written out it would paint the rest of the run a row below the placement, and on the
+screen's bottom row scroll the whole physical screen with nothing in the baseline to
+repair it. It is dropped, with a `debug_assert!` beside it, exactly as the `CUP` arm
+handles a row parameter it cannot honour: loud in a debug build, silent and inside the
+band in a shipped one. The tracker is left where the preceding `\r` put it.
+
 ### The backspace arm is not defensive — the scroll path needs it
 
 The measurement above scanned `rows_diff` runs. It says nothing about the other producer:
