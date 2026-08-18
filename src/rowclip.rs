@@ -246,10 +246,10 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, at: Placement, out: &mut Vec<u
         }
 
         if b == b'\r' {
-            // vt100's `MoveFromTo` writer emits a bare `\r` when the target is the
-            // start of a row. Copied through it would put the cursor on *physical*
-            // column 0, in the left gutter, and every glyph after it with it; the
-            // absolute move puts it on the band's own column 0 instead.
+            // The first half of the `\r\n` vt100's `MoveFromTo` writer emits for the
+            // start of the next row. Copied through it would put the cursor on
+            // *physical* column 0, in the left gutter, and every glyph after it with
+            // it; the absolute move puts it on the band's own column 0 instead.
             col = move_to_col(out, col, 0, w, at);
             i += 1;
             continue;

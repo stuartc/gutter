@@ -125,9 +125,8 @@ would go.
 
 ### The `\r` and `\n` arms
 
-vt100's `MoveFromTo` writer has a branch that emits a bare `\r\n` when the target is
-the start of the next row, and one that emits a bare `\r` for the start of the current
-one. Neither byte can reach a clipped run today — a `rows_diff` run keeps
+vt100's `MoveFromTo` writer has one branch that emits either byte: a bare `\r\n` when
+the target is the start of the next row. Neither byte can reach a clipped run today — a `rows_diff` run keeps
 `from.row == to.row` structurally, and all three `rows_formatted` sites are blocked by
 the wrapping seed — but the branch is live elsewhere in vt100 (`contents_diff`), and
 both bytes are invisible to the `RecordingGrid` mock the render tests read back
