@@ -61,7 +61,7 @@ Integration tests drive a **real PTY** via `expectrl` and assert on what the out
 **Render model.** Thread 2 holds three parsers (`src/render.rs`):
 - `parser` — live, carries callbacks (cursor-shape watcher, OSC-52 clipboard sink, device-query replies, keyboard-mode relay).
 - `prev` — diff baseline, no callbacks; `rows_diff(prev, 0, W)` yields the per-row byte runs to repaint.
-- `scroll_tracker` — a band-sized mirror with bounded scrollback (4096), fed the same bytes, used to count lines that scrolled off the top so they reach the real terminal's scrollback.
+- `scroll_tracker` — a band-sized mirror with bounded scrollback (4096), fed the same bytes and kept for the whole session (region and alt-screen flag included), used to count lines that scrolled off the top — the growth of its scrollback each frame — so they reach the real terminal's scrollback.
 
 `render_cell_walk()` is **tested-but-dormant** (the "A1 rows_diff-only assumption"): gutter renders via `rows_diff` only, and right-edge safety rests on vt100's margin rule (a wide glyph never has its lead cell at column `W-1`; it wraps). The cell-walk is insurance against a corrupting cell the design believes cannot occur — there is no runtime chooser. It only goes live if a corrupting cell is actually observed on the `rows_diff` path.
 

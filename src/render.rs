@@ -41,11 +41,11 @@ pub const RESIZE_IDLE: Duration = Duration::from_secs(3);
 /// hang waiting for a sentinel that never comes.
 pub const TEARDOWN_DRAIN_GRACE: Duration = Duration::from_millis(100);
 
-/// The scroll-tracker's bounded scrollback (ADR-013). The tracker is reset to the
-/// live grid each `render_once`, so this only caps a single coalesced frame's
-/// advance — sized well above any realistic per-frame line count.
-/// If an extreme frame exceeds it, the oldest lines fall off the tracker's bound,
-/// never the live parser's memory.
+/// The scroll-tracker's bounded scrollback (ADR-013). The tracker keeps its screen for
+/// the whole session and counts departures as the growth of that scrollback, so the cap
+/// bounds a session's worth of departed lines rather than a single frame's. Reaching it
+/// costs one re-seed, which is the only time the tracker forgets the child's scroll
+/// region — hence a cap far above what a frame, or a run of them, will ever depart.
 const SCROLL_TRACKER_SCROLLBACK: usize = 4096;
 
 /// What the two restore paths hand the shell back: no leftover attribute run from the
@@ -70,10 +70,17 @@ pub struct Renderer {
     /// PTY bytes as `parser` but with bounded scrollback, so vt100's scroll machinery
     /// records which lines left the top of the W-window each frame — the count the
     /// live `parser` (scrollback 0) can't reconstruct once a burst scrolls past a
-    /// screenful in one frame. Reset to the live grid every `render_once`
-    /// ([`Renderer::drain_scrolled_off`]), so it never holds more than one frame's
-    /// advance.
+    /// screenful in one frame. Never re-seeded while it has room: it is the child's
+    /// own screen state, scroll region and alt-screen flag included, and a frame's
+    /// departures are the growth of its scrollback ([`Renderer::drain_scrolled_off`]).
     scroll_tracker: vt100::Parser<GutterCallbacks>,
+    /// The tracker's scrollback cap. Carried here rather than read from
+    /// [`SCROLL_TRACKER_SCROLLBACK`] at each use so a test can drive the saturation
+    /// path without departing thousands of lines.
+    tracker_cap: usize,
+    /// How long the tracker's scrollback was when the last frame finished counting.
+    /// This frame's departures are the lines beyond it.
+    tracker_scrollback: usize,
     /// The current band width `W`. Constant for an absolute `--width`; recomputed
     /// on each resize for a proportional `--width Npct` (ADR-011).
     width: u16,
@@ -169,6 +176,8 @@ impl Renderer {
                 SCROLL_TRACKER_SCROLLBACK,
                 GutterCallbacks::baseline(),
             ),
+            tracker_cap: SCROLL_TRACKER_SCROLLBACK,
+            tracker_scrollback: 0,
             width,
             width_config,
             layout,
@@ -253,6 +262,20 @@ impl Renderer {
         r.left_margin = left_margin;
         r.real_cols = left_margin.saturating_add(width);
         r
+    }
+
+    /// Test-only: rebuild the scroll tracker at a small scrollback cap, so the
+    /// saturation path can be reached in a handful of scrolled lines instead of
+    /// [`SCROLL_TRACKER_SCROLLBACK`] of them.
+    #[cfg(test)]
+    fn set_tracker_cap(&mut self, cap: usize) {
+        let (rows, cols) = self.parser.screen().size();
+        self.tracker_cap = cap;
+        self.scroll_tracker =
+            vt100::Parser::new_with_callbacks(rows, cols, cap, GutterCallbacks::baseline());
+        let seed = self.parser.screen().contents_formatted();
+        self.scroll_tracker.process(&seed);
+        self.tracker_scrollback = 0;
     }
 }
 
@@ -425,6 +448,9 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
 
     // Step 2 — resize the parser screen IMMEDIATELY, same turn. (rows, cols).
     renderer.parser.screen_mut().set_size(rows, w);
+    // The tracker mirrors the band's geometry and keeps its screen across the resize
+    // (ADR-013), so it is resized rather than rebuilt.
+    renderer.scroll_tracker.screen_mut().set_size(rows, w);
 
     // Update the live geometry.
     renderer.width = w;
@@ -592,6 +618,7 @@ fn apply_resize_step<R: PtyResizer, T: OuterTerminal>(
         let _ = resizer.resize(w, rows);
         // Step 2 — parser, same turn. (rows, cols).
         renderer.parser.screen_mut().set_size(rows, w);
+        renderer.scroll_tracker.screen_mut().set_size(rows, w);
         // Step 3 — live geometry (real_cols unchanged).
         renderer.width = w;
         renderer.left_margin = geometry::margin(renderer.layout, real, w);
@@ -946,12 +973,10 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
 
     // Scroll emit (ADR-013): on the primary screen, advance each line that left the
     // top of the W-window this frame into the terminal's own scrollback. The tracker
-    // is drained every frame either way; an alt frame discards the result rather than
-    // advancing the outer terminal, which never scrolls under the alt screen.
-    let mut departed = renderer.drain_scrolled_off();
-    if renderer.outer_alt_active {
-        departed.clear();
-    }
+    // follows the child into the alternate screen, where vt100 keeps no scrollback and
+    // nothing ever departs, so an alt frame drains empty on its own — the outer screen
+    // never scrolls under the alt screen.
+    let departed = renderer.drain_scrolled_off();
 
     scroll_to_make_room(renderer, term, departed.is_empty())?;
 
@@ -1298,27 +1323,56 @@ impl Renderer {
 
     /// Drop the diff baseline to a blank grid of the live size, so the next rows_diff
     /// differs on every non-empty row and forces a full repaint (resize, ADR-008 step 5;
-    /// the alt→primary edge). Re-seeds the scroll tracker to the live grid too, so its
-    /// scroll detection stays sound across the change.
+    /// the alt→primary edge). The tracker's screen is left alone — only the mark it
+    /// counts departures from moves up to the present, so lines that departed before
+    /// the change are not re-emitted after it.
     fn reset_prev_baseline(&mut self) {
         self.prev = self.blank_mirror(0);
-        self.reset_scroll_tracker();
+        self.mark_tracker_counted();
     }
 
-    /// Drain the lines that left the top of the W-window this frame from the scroll
-    /// tracker (ADR-013), then reset the tracker to the live grid so it starts the next
-    /// frame with empty scrollback. Returns them formatted, oldest first.
-    ///
-    /// vt100 exposes no scrollback-length accessor, so probe it by clamping the offset
-    /// to its max. At offset `k` the row `k` lines above the current top sits at grid
-    /// row 0, so reading the top row at offsets `n..=1` yields the `n` departed lines in
-    /// order.
-    fn drain_scrolled_off(&mut self) -> Vec<Vec<u8>> {
-        let width = self.width;
-        // The tracker started this frame with empty scrollback, so its current length is
-        // exactly the lines that departed. No length accessor — clamp to probe it.
+    /// The tracker's current scrollback length. vt100 exposes no accessor, so probe it
+    /// by clamping the offset to its max and reading back what it clamped to. On the
+    /// alternate screen this reads the alt grid, which vt100 builds with no scrollback
+    /// at all, so it is always 0 there.
+    fn tracker_scrollback_len(&mut self) -> usize {
         self.scroll_tracker.screen_mut().set_scrollback(usize::MAX);
         let n = self.scroll_tracker.screen().scrollback();
+        self.scroll_tracker.screen_mut().set_scrollback(0);
+        n
+    }
+
+    /// Treat everything now in the tracker's scrollback as already counted, so the next
+    /// drain reports only what departs from here on.
+    fn mark_tracker_counted(&mut self) {
+        self.tracker_scrollback = self.tracker_scrollback_len();
+    }
+
+    /// The lines that left the top of the W-window this frame, formatted, oldest first
+    /// (ADR-013).
+    ///
+    /// The tracker keeps its screen across frames, so its scrollback holds every line
+    /// that has ever departed, and this frame's are the ones beyond `tracker_scrollback`.
+    /// At offset `k` the row `k` lines above the current top sits at grid row 0, so
+    /// reading the top row at offsets `n..=1` yields the `n` newest in order.
+    ///
+    /// Nothing is drained while the child is in the alternate screen: vt100 gives the
+    /// alt grid no scrollback, so no line ever departs one, and the primary count has to
+    /// survive the excursion untouched. The alt→primary edge marks it counted again
+    /// through the baseline reset in `render_once`.
+    fn drain_scrolled_off(&mut self) -> Vec<Vec<u8>> {
+        // The tracker's device-query replies reach no PTY, and its parser outlives the
+        // session, so the buffer is emptied every frame — including the alt-screen
+        // frames that leave with nothing to drain.
+        self.scroll_tracker.callbacks_mut().discard_replies();
+
+        if self.scroll_tracker.screen().alternate_screen() {
+            return Vec::new();
+        }
+
+        let width = self.width;
+        let len = self.tracker_scrollback_len();
+        let n = len.saturating_sub(self.tracker_scrollback);
 
         let mut departed = Vec::with_capacity(n);
         for offset in (1..=n).rev() {
@@ -1330,14 +1384,23 @@ impl Renderer {
         }
         self.scroll_tracker.screen_mut().set_scrollback(0);
 
-        // Reset the tracker to the live grid: empty scrollback again for the next frame.
-        self.reset_scroll_tracker();
+        if len == self.tracker_cap {
+            // Full: vt100 drops the oldest line for each new one, so the length stops
+            // growing and every later departure would count as zero. Re-seed once, and
+            // count from an empty scrollback again.
+            self.reseed_scroll_tracker();
+        } else {
+            self.tracker_scrollback = len;
+        }
         departed
     }
 
-    /// Re-seed the scroll tracker from the live grid, leaving its scrollback
-    /// empty. Used after a drain and after a resize/baseline reset so the tracker
-    /// always mirrors the live grid's content at the band's current size.
+    /// Replace the tracker's screen with the live grid's content and an empty
+    /// scrollback. The only way to empty it — vt100 has no scrollback-clearing API —
+    /// and the only thing that costs: `contents_formatted` carries no scroll region and
+    /// no alt-screen flag, so a re-seeded tracker counts scrolls inside a region the
+    /// child set earlier as departures until the child sets one again. Reserved for a
+    /// full scrollback, where the alternative is counting nothing at all ever again.
     ///
     /// Only the screen is replaced. The `Parser` owns the vte state machine, and the
     /// tracker is fed the child's raw bytes, so a chunk boundary landing mid escape
@@ -1346,12 +1409,10 @@ impl Renderer {
     /// mirror by lines the child never scrolled. The source mirror is built at the
     /// tracker's own scrollback size because the cap travels with the cloned `Screen`;
     /// cloning a scrollback-0 screen in would kill it for good.
-    fn reset_scroll_tracker(&mut self) {
-        let fresh = self.live_mirror(SCROLL_TRACKER_SCROLLBACK);
+    fn reseed_scroll_tracker(&mut self) {
+        let fresh = self.live_mirror(self.tracker_cap);
         *self.scroll_tracker.screen_mut() = fresh.screen().clone();
-        // The tracker's device-query replies reach no PTY, and its parser outlives the
-        // frame, so the buffer is emptied here.
-        self.scroll_tracker.callbacks_mut().discard_replies();
+        self.tracker_scrollback = 0;
     }
 
     /// The deepest grid row holding live content this frame — whichever reaches further
@@ -5720,12 +5781,13 @@ mod primary_scroll {
         );
     }
 
-    /// The tracker's bounded scrollback does not accumulate across frames. The tracker is
-    /// reset to the live grid every `render_once`, so after many scrolling frames its
-    /// scrollback length is back to zero between frames (ADR-013). Probes the tracker
-    /// length directly after a render.
+    /// Every frame reports its own departures and no others. The tracker keeps its
+    /// screen for the whole session, so its scrollback holds every line that has ever
+    /// departed; counting is the growth since the last frame (ADR-013). One line
+    /// scrolled per frame must emit exactly one newline per frame, however many frames
+    /// have gone before.
     #[test]
-    fn tracker_scrollback_is_reset_each_frame() {
+    fn each_frame_counts_only_its_own_departures() {
         let (w, rows) = (20u16, 4u16);
         let mut renderer = renderer_primed(w, rows, &["a", "b", "c", "d"]);
 
@@ -5733,24 +5795,150 @@ mod primary_scroll {
             feed(&mut renderer, format!("\r\nfill{i}").as_bytes());
             let mut term = MockTerminal::new();
             render_once(&mut renderer, &mut term).unwrap();
-            // After the drain+reset the tracker holds no scrollback.
-            renderer.scroll_tracker.screen_mut().set_scrollback(usize::MAX);
-            let len = renderer.scroll_tracker.screen().scrollback();
-            renderer.scroll_tracker.screen_mut().set_scrollback(0);
+            let newlines = term.calls.iter().filter(|c| **c == Call::Newline).count();
             assert_eq!(
-                len, 0,
-                "the tracker scrollback must reset to 0 after each frame (frame {i})"
+                newlines, 1,
+                "frame {i} scrolled one line and must advance the terminal by one"
             );
         }
     }
 
-    /// The re-seed keeps the tracker's scrollback cap. The tracker's screen is replaced
-    /// every frame from a mirror built at [`SCROLL_TRACKER_SCROLLBACK`], and the cap
-    /// travels with the screen — re-seeding from a scrollback-0 mirror would leave the
-    /// tracker unable to hold a single departed line, so a single-frame burst bigger than
-    /// the screen would vanish instead of reaching the terminal's scrollback.
+    /// A child scrolling inside a scroll region departs nothing. vt100 pushes a departed
+    /// row into scrollback only while no region is active, so a tracker that had
+    /// forgotten the child's `DECSTBM` would report a phantom departure for every scroll
+    /// inside it — and one phantom departure collapses `base_row` and pins the band to
+    /// the top of the screen for the rest of the session. The region is set in the first
+    /// frame and never repeated, so only a tracker that kept it across frames stays
+    /// silent.
     #[test]
-    fn tracker_scrollback_cap_survives_the_reseed() {
+    fn scroll_region_departs_nothing() {
+        let (w, rows) = (20u16, 4u16);
+        let mut renderer = renderer_primed(w, rows, &["a", "b", "c", "d"]);
+
+        // Region = rows 2..4 (1-based), cursor on its bottom row.
+        feed(&mut renderer, b"\x1b[2;4r\x1b[4;1H");
+        render_once(&mut renderer, &mut MockTerminal::new()).unwrap();
+
+        for i in 0..20 {
+            feed(&mut renderer, format!("\nin-region {i}").as_bytes());
+            let mut term = MockTerminal::new();
+            render_once(&mut renderer, &mut term).unwrap();
+            let newlines = term.calls.iter().filter(|c| **c == Call::Newline).count();
+            assert_eq!(
+                newlines, 0,
+                "a scroll inside the child's region leaves the outer terminal alone \
+                 (frame {i})"
+            );
+        }
+    }
+
+    /// Counting survives a full tracker. vt100 drops the oldest line once the scrollback
+    /// deque is at its cap, so the length stops growing and a naive delta would read zero
+    /// for every departure after that — the band would stop scrolling the real terminal
+    /// altogether. Driven at a tiny cap: the frames either side of saturation each
+    /// advance the terminal by the line they scrolled.
+    #[test]
+    fn counting_survives_a_full_tracker() {
+        let (w, rows, cap) = (20u16, 4u16, 8usize);
+        let mut renderer = renderer_primed(w, rows, &["a", "b", "c", "d"]);
+        renderer.set_tracker_cap(cap);
+
+        for i in 0..(cap * 3) {
+            feed(&mut renderer, format!("\r\npast-cap {i}").as_bytes());
+            let mut term = MockTerminal::new();
+            render_once(&mut renderer, &mut term).unwrap();
+            let newlines = term.calls.iter().filter(|c| **c == Call::Newline).count();
+            assert_eq!(
+                newlines, 1,
+                "line {i} scrolled after {} lines had already departed, and still has to \
+                 reach the terminal's scrollback",
+                i
+            );
+        }
+    }
+
+    /// A single frame carrying more lines than the tracker can hold empties it, and the
+    /// frames after it count from scratch rather than reading zero forever.
+    #[test]
+    fn a_burst_past_the_cap_leaves_the_tracker_counting() {
+        let (w, rows, cap) = (20u16, 4u16, 8usize);
+        let mut renderer = renderer_primed(w, rows, &["a", "b", "c", "d"]);
+        renderer.set_tracker_cap(cap);
+
+        let mut burst = Vec::new();
+        for i in 0..(cap * 4) {
+            burst.extend_from_slice(format!("\r\nB{i}").as_bytes());
+        }
+        feed(&mut renderer, &burst);
+        let mut term = MockTerminal::new();
+        render_once(&mut renderer, &mut term).unwrap();
+        let newlines = term.calls.iter().filter(|c| **c == Call::Newline).count();
+        assert!(
+            newlines > 0,
+            "a burst past the cap still advances the terminal, got {newlines} newlines"
+        );
+
+        feed(&mut renderer, b"\r\nafter");
+        let mut term = MockTerminal::new();
+        render_once(&mut renderer, &mut term).unwrap();
+        assert_eq!(
+            term.calls.iter().filter(|c| **c == Call::Newline).count(),
+            1,
+            "the frame after the burst counts its own single departure"
+        );
+    }
+
+    /// The tracker is on the same screen as the live parser, so the alternate screen
+    /// needs no masking: vt100 gives the alt grid no scrollback, nothing departs one, and
+    /// the primary count waits untouched for the child to come back. A tracker rebuilt
+    /// from `contents_formatted` would sit on the primary grid throughout and count every
+    /// alt-screen scroll as a departure.
+    #[test]
+    fn alt_screen_scrolls_depart_nothing() {
+        let (w, rows) = (20u16, 4u16);
+        let mut renderer = renderer_primed(w, rows, &["a", "b", "c", "d"]);
+
+        feed(&mut renderer, b"\x1b[?1049h");
+        render_once(&mut renderer, &mut MockTerminal::new()).unwrap();
+
+        for i in 0..20 {
+            feed(&mut renderer, format!("\r\nalt {i}").as_bytes());
+            let mut term = MockTerminal::new();
+            render_once(&mut renderer, &mut term).unwrap();
+            assert_eq!(
+                renderer.scroll_tracker.screen().alternate_screen(),
+                renderer.parser.screen().alternate_screen(),
+                "the tracker and the live parser must agree on the active screen \
+                 (frame {i})"
+            );
+            assert_eq!(
+                term.calls.iter().filter(|c| **c == Call::Newline).count(),
+                0,
+                "the outer terminal never scrolls under the alt screen (frame {i})"
+            );
+        }
+
+        feed(&mut renderer, b"\x1b[?1049l");
+        render_once(&mut renderer, &mut MockTerminal::new()).unwrap();
+
+        feed(&mut renderer, b"\r\nback on the primary");
+        let mut term = MockTerminal::new();
+        render_once(&mut renderer, &mut term).unwrap();
+        assert_eq!(
+            term.calls.iter().filter(|c| **c == Call::Newline).count(),
+            1,
+            "the first primary scroll after the alt excursion counts one line, not the \
+             excursion's own"
+        );
+    }
+
+    /// A burst bigger than the screen reaches the terminal's scrollback whole. Every line
+    /// that left the top in one frame has to sit in the tracker's scrollback to be
+    /// emitted at all, so the cap has to survive the frames before it — including the
+    /// re-seed the saturation path performs, which builds its mirror at the tracker's own
+    /// cap because the cap travels with the cloned `Screen`.
+    #[test]
+    fn a_burst_bigger_than_the_screen_is_emitted_whole() {
         let (w, rows) = (20u16, 4u16);
         let burst = 300usize;
         let mut renderer = renderer_primed(w, rows, &["a", "b", "c", "d"]);
@@ -5786,6 +5974,14 @@ mod primary_scroll {
     fn tracker_replies_do_not_accumulate() {
         let mut renderer = renderer_primed(20, 4, &["a", "b", "c", "d"]);
 
+        for _ in 0..100 {
+            feed(&mut renderer, b"\x1b[6n");
+            render_once(&mut renderer, &mut MockTerminal::new()).unwrap();
+        }
+
+        // The alternate screen leaves nothing to drain, and must not leave the replies
+        // behind either.
+        feed(&mut renderer, b"\x1b[?1049h");
         for _ in 0..100 {
             feed(&mut renderer, b"\x1b[6n");
             render_once(&mut renderer, &mut MockTerminal::new()).unwrap();
