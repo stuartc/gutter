@@ -1,10 +1,10 @@
 //! Clip a vt100 row run to the band width. See ADR-014.
 //!
-//! [`clip_row_to_width_into`] rewrites the row-final `ESC[K` (erase to right edge)
-//! into a `W`-bounded fill so a painted row stays inside its `[0, W)` rectangle
-//! rather than flooding the right gutter. To place the fill it tracks a virtual
-//! in-band column across the run, honouring absolute moves (`CUP`/`CHA`) as well
-//! as relative ones — a rightward-only tracker would desync at a backward jump.
+//! [`clip_row_to_width_into`] rewrites a row's erases (`ESC[K` and friends) into
+//! `W`-bounded fills so a painted row stays inside its `[0, W)` rectangle rather
+//! than flooding a gutter. To place a fill it tracks a virtual in-band column
+//! across the run, honouring absolute moves (`CUP`/`CHA`) as well as relative ones
+//! — a rightward-only tracker would desync at a backward jump.
 //!
 //! Those absolute moves are rewritten. A run is painted at the band's left margin
 //! and row offset, so an absolute coordinate in the run's own band-local terms
@@ -82,6 +82,29 @@ fn emit_cup(out: &mut Vec<u8>, target: u16, at: Placement) {
     out.push(b'H');
 }
 
+/// Erase the band's `[start, end)` columns under the active SGR, then put the cursor
+/// back where the erase found it so the rest of the run still aligns. Both ends are
+/// clamped to the band, so a caller may name a span an erase's own semantics would put
+/// past the right edge.
+///
+/// The return is skipped at the pending-wrap column: the tracker's `W` names the first
+/// gutter column, and the fill has already left the cursor in the state the erase found
+/// it — past the band's last cell, with the wrap deferred where the band's right edge is
+/// the screen's.
+fn fill_span(out: &mut Vec<u8>, start: u16, end: u16, col: u16, w: u16, at: Placement) {
+    let (start, end) = (start.min(w), end.min(w));
+    if start >= end {
+        return;
+    }
+    if start != col {
+        emit_cup(out, start, at);
+    }
+    out.extend(std::iter::repeat_n(b' ', usize::from(end - start)));
+    if col < w {
+        emit_cup(out, col, at);
+    }
+}
+
 fn parse_param(field: &[u8], default: u16) -> u16 {
     if field.is_empty() {
         return default;
@@ -97,8 +120,8 @@ fn parse_param(field: &[u8], default: u16) -> u16 {
     n
 }
 
-/// Rewrites the row-final `ESC[K` in `run` into a `W`-bounded fill, and any absolute
-/// cursor move into one in `at`'s physical coordinates, so the run stays within its
+/// Rewrites the erases in `run` into `W`-bounded fills, and any absolute cursor move
+/// into one in `at`'s physical coordinates, so the run stays within its
 /// `[0, W)` rectangle once painted at the band offset. Returns the run unchanged when
 /// it carries neither.
 #[cfg(test)]
@@ -136,27 +159,23 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, at: Placement, out: &mut Vec<u
                 let params = &run[params_start..j];
                 match final_byte {
                     b'K' => {
-                        // Forward erase (`ESC[K`/`ESC[0K`): replace it with a bounded
-                        // fill under the active SGR, then a reposition so trailing
-                        // bytes still align.
-                        //
-                        // `ESC[1K` and `ESC[2K` go through untouched, and that is a
-                        // known hole, not a safe case. Both are read against the
-                        // physical row — nothing re-bases the line after the caller's
-                        // `move_to` — so `2K` would erase the whole row and `1K`
-                        // everything from physical column 0 to the cursor, the entire
-                        // left gutter, where the diff baseline never repaints. They are
-                        // unhandled because vt100 cannot produce them: `ESC[K` is the
-                        // only row erase in vt100 0.16.2's writer. Anything else
-                        // feeding runs in here needs the arm written.
-                        if first_param(params, 0) == 0 {
-                            let rem = w.saturating_sub(col);
-                            if rem > 0 {
-                                out.extend(std::iter::repeat_n(b' ', usize::from(rem)));
-                                emit_cup(out, col, at);
-                            }
-                        } else {
-                            out.extend_from_slice(&run[i..=j]);
+                        // Every erase becomes a bounded fill under the active SGR, then
+                        // a reposition so trailing bytes still align. Erases are read
+                        // against the physical row — nothing re-bases the line after the
+                        // caller's `move_to` — so passing one through would erase across
+                        // the gutters, where the diff baseline never repaints.
+                        match first_param(params, 0) {
+                            0 => fill_span(out, col, w, col, w, at),
+                            // `ESC[1K` reaches up to and including the cursor's own
+                            // cell (ECMA-48 EL 1).
+                            1 => fill_span(out, 0, col.saturating_add(1), col, w, at),
+                            2 => fill_span(out, 0, w, col, w, at),
+                            // `ESC[3K` erases the scrollback's saved copy of the line
+                            // and a parameter of 4 or more is undefined, so a terminal
+                            // ignores it: neither paints a cell. Both are dropped rather
+                            // than forwarded — the scrollback `3K` would clear is the
+                            // outer terminal's, holding lines the band never owned.
+                            _ => {}
                         }
                     }
                     b'C' => {
@@ -508,19 +527,108 @@ mod tests {
         assert_eq!(clip_row_to_width(b"\x1b[40Gz", w, HOME), want);
     }
 
-    /// Only the forward erase is clipped. `ESC[1K` (erase-left) and `ESC[2K`
-    /// (erase-whole-line) pass through verbatim — unbounded on the physical line, but
-    /// not something vt100 can emit into a run. This pins the current behaviour, not a
-    /// guarantee that the bytes would be safe.
+    /// The band away from the screen's origin, where an in-band column and a physical
+    /// one differ on both axes.
+    const OFFSET: Placement = Placement {
+        left_margin: 10,
+        phys_row: 4,
+        grid_row: 4,
+    };
+
+    /// `ESC[2K` erases the whole line, which read against the physical row is both
+    /// gutters as well as the band. It becomes a fill of the band's own `W` columns
+    /// from its column 0, and the cursor goes back to where the erase found it, so the
+    /// `z` after it still lands on in-band column 2.
     #[test]
-    fn non_forward_erase_is_copied_verbatim() {
-        let w = 10u16;
-        for run in [
-            b"\x1b[7mAB\x1b[1K".as_slice(),
-            b"\x1b[7mAB\x1b[2K".as_slice(),
-        ] {
-            assert_eq!(clip_row_to_width(run, w, HOME), run.to_vec());
+    fn erase_whole_line_fills_the_band_only() {
+        let w = 40u16;
+        let got = clip_row_to_width(b"\x1b[7mAB\x1b[2Kz", w, OFFSET);
+
+        let mut want = Vec::new();
+        want.extend_from_slice(b"\x1b[7mAB");
+        want.extend(cup_at(OFFSET, 0));
+        want.extend(std::iter::repeat_n(b' ', 40));
+        want.extend(cup_at(OFFSET, 2));
+        want.push(b'z');
+        assert_eq!(got, want);
+    }
+
+    /// `ESC[1K` erases from the line's start to the cursor **inclusive** (ECMA-48 EL 1),
+    /// so at in-band column 2 the fill is three cells from the band's column 0 — not the
+    /// whole physical line up to it. The cursor comes back to column 2, where the `z`
+    /// overwrites the last erased cell.
+    #[test]
+    fn erase_to_cursor_fills_the_cursor_cell_too() {
+        let w = 40u16;
+        let got = clip_row_to_width(b"\x1b[7mAB\x1b[1Kz", w, OFFSET);
+
+        let mut want = Vec::new();
+        want.extend_from_slice(b"\x1b[7mAB");
+        want.extend(cup_at(OFFSET, 0));
+        want.extend(std::iter::repeat_n(b' ', 3)); // columns 0, 1 and the cursor's own
+        want.extend(cup_at(OFFSET, 2));
+        want.push(b'z');
+        assert_eq!(got, want);
+    }
+
+    /// The inclusive cell cannot push the fill past the band: with the cursor on the
+    /// last column the fill is exactly `W`, never `W + 1`.
+    #[test]
+    fn erase_to_cursor_stops_at_the_band_edge() {
+        let w = 4u16;
+        let got = clip_row_to_width(b"ABC\x1b[1K", w, OFFSET);
+
+        let mut want = b"ABC".to_vec();
+        want.extend(cup_at(OFFSET, 0));
+        want.extend(std::iter::repeat_n(b' ', usize::from(w)));
+        want.extend(cup_at(OFFSET, 3));
+        assert_eq!(got, want);
+    }
+
+    /// At the pending-wrap column no reposition is emitted at all. The tracker holds
+    /// `W`, which as a physical cell is the first gutter column, and the fill has left
+    /// the cursor in exactly the state the erase found it — past the band's last cell,
+    /// with the wrap deferred where the band's edge is the screen's.
+    #[test]
+    fn erase_at_the_pending_wrap_column_emits_no_reposition() {
+        let w = 4u16;
+        for run in [b"ABCD\x1b[1K".as_slice(), b"ABCD\x1b[2K".as_slice()] {
+            let got = clip_row_to_width(run, w, OFFSET);
+            let mut want = b"ABCD".to_vec();
+            want.extend(cup_at(OFFSET, 0));
+            want.extend(std::iter::repeat_n(b' ', usize::from(w)));
+            assert_eq!(got, want, "{}", String::from_utf8_lossy(run));
         }
+    }
+
+    /// An erase takes the run's live background, as a real `EL` would: the `ESC[41m`
+    /// set before it is still in force across the fill, and nothing resets it, so the
+    /// erased cells come out red and the glyph after them still does too.
+    #[test]
+    fn the_fill_inherits_the_runs_active_sgr() {
+        let got = clip_row_to_width(b"\x1b[41mAB\x1b[2Kz", 40, OFFSET);
+
+        let mut want = Vec::new();
+        want.extend_from_slice(b"\x1b[41mAB");
+        want.extend(cup_at(OFFSET, 0));
+        want.extend(std::iter::repeat_n(b' ', 40));
+        want.extend(cup_at(OFFSET, 2));
+        want.push(b'z');
+        assert_eq!(got, want);
+    }
+
+    /// `ESC[3K` erases the scrollback's saved copy of the line and paints nothing, so
+    /// there is no band to bound it to — it is dropped, and the run either side of it is
+    /// untouched, the tracked column included.
+    #[test]
+    fn erase_saved_line_is_dropped() {
+        let got = clip_row_to_width(b"\x1b[7mAB\x1b[3Kz\x1b[K", 40, OFFSET);
+
+        let mut want = Vec::new();
+        want.extend_from_slice(b"\x1b[7mABz");
+        want.extend(std::iter::repeat_n(b' ', 37)); // W - 3, so the drop moved no column
+        want.extend(cup_at(OFFSET, 3));
+        assert_eq!(got, want);
     }
 
     /// `CHA` (`ESC[…G`) is also absolute — the same desync guard, and the same

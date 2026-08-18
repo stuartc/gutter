@@ -12,9 +12,9 @@ gutter.
 
 ## Decision
 
-**Amended below — read the amendment before acting on this section.** Two things it
-describes have changed: the `CUB` back to the cursor is gone, and a prepared run is
-now correct at exactly one placement rather than at any offset.
+**Amended below — read the amendment before acting on this section.** The `CUB` back to
+the cursor is gone, a prepared run is correct at exactly one placement rather than at any
+offset, and the row-final `ESC[K` is not the only erase rewritten.
 
 Make every row self-contained within the `W`-wide rectangle before painting it, in
 `prepare_row_into()`. Prepend `ESC[m` to reset attributes so nothing bleeds down from the
@@ -25,9 +25,8 @@ under the active SGR, then a `CUB` back to the cursor, so the erase stops at col
 ## Consequences
 
 - Every painted row starts with `ESC[m`.
-- Only the row-final `ESC[K` is rewritten; `ESC[1K` and `ESC[2K` are copied verbatim.
-  Not because they are bounded — they are not — but because vt100 cannot emit them.
-  See *The two erases nothing rewrites* below.
+- Every erase is rewritten into a fill of the band's own columns; `ESC[3K` is dropped.
+  See *The other erases* below.
 - The column tracker in `clip_row_to_width_into()` has to follow every cursor move —
   absolute `CUP`/`CHA`, relative `C`/`D`, backspace — to get the fill length right.
 
@@ -144,19 +143,29 @@ reads column 1 where the cursor is really at column 0 for the whole of that run:
 row-final `ESC[K` fill then comes out one space short and the band's last column is left
 unpainted every time a row scrolls in under a wrapped one.
 
-### The two erases nothing rewrites
+### The other erases
 
-`ESC[1K` and `ESC[2K` are copied through untouched. The Decision above called them
-bounded; they are not. A run is painted after a bare `move_to(left_margin, phys_row)` and
-nothing re-bases the line, so both are read against the physical row: `ESC[2K` would erase
-the whole row, `ESC[1K` everything from physical column 0 to the cursor — the entire left
-gutter. Either would take out whatever the user's shell left there, and since the diff
-baseline only models the band nothing repaints over the hole.
+A run is painted after a bare `move_to(left_margin, phys_row)` and nothing re-bases the
+line, so every erase in it is read against the *physical* row: passed through, `ESC[2K`
+would erase the whole row and `ESC[1K` everything from physical column 0 to the cursor —
+the entire left gutter. Either would take out whatever the user's shell left there, and
+since the diff baseline only models the band nothing repaints over the hole.
 
-What actually keeps them safe is that vt100 never produces one. `ClearRowForward`
-(`ESC[K`) is the only row erase in vt100 0.16.2's writer; there is no backward or
-whole-line erase in it to emit. This is a known hole in the clipper, not a handled case:
-anything other than vt100 feeding runs into it would need the arm written.
+Both are rewritten the same way `ESC[K` is: an absolute move to the band's own column 0,
+the fill under the active SGR, and an absolute move back to the tracked column so the
+rest of the run still aligns. `ESC[1K`'s fill includes the cursor's own cell, which is
+what ECMA-48 EL 1 erases. At the pending-wrap column the move back is skipped — the
+tracker's `W` names the first gutter column, and the fill has already left the cursor
+where the erase found it.
+
+`ESC[3K` erases the scrollback's saved copy of the line and paints nothing, so there is
+no band to bound it to, and a parameter of 4 or more is undefined, so a terminal ignores
+it. Both are dropped rather than forwarded — the saved lines `ESC[3K` would clear are the
+outer terminal's, holding history the band never owned — which leaves no erase that
+reaches the physical line.
+
+None of them can arrive today. `ClearRowForward` (`ESC[K`) is the only row erase in
+vt100 0.16.2's writer, so the other arms are unreachable from a child stream.
 
 ### Two more leaks, both on the scroll path
 
@@ -229,6 +238,6 @@ physical screen size; a new claim about where a rewritten move lands belongs the
   is painted at the placement it was clipped for and nowhere else, and
   `OuterTerminal::newline`, which resets the SGR before it scrolls
 - `src/oracle/band.rs` — the painted-band check, the only test in the repo that can see
-  a rewritten move land on the wrong cell
+  a rewritten move, or an erase, land outside the band
 
 The edge-safety rule this rests on is [ADR-006](0006-band-fit-margin-rule.md).

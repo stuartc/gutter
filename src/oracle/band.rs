@@ -737,7 +737,7 @@ mod painted_band {
             tape.write_row(&clip_row_to_width(run, width, at)).unwrap();
             let screen = WeztermGrid::replay(&tape.into_bytes(), phys_cols, phys_rows);
 
-            let shown = String::from_utf8_lossy(run).to_string();
+            let shown = String::from_utf8_lossy(run);
             assert_eq!(
                 screen.cell(at.phys_row, margin + width - 1).contents,
                 "z",
@@ -752,6 +752,58 @@ mod painted_band {
                 vec![(at.phys_row, margin + width - 1)],
                 "{shown}: the glyph landed somewhere else as well"
             );
+        }
+    }
+
+    /// A backward and a whole-line erase stop at the band's edges, read back off a real
+    /// emulator with the gutters seeded.
+    ///
+    /// Handed to the clipper directly, like
+    /// `a_clipped_runs_absolute_moves_land_on_the_bands_own_cells` above: vt100 0.16.2's
+    /// writer emits `ClearRowForward` and no other row erase, so no child stream can put
+    /// an `ESC[1K` or an `ESC[2K` in a run.
+    #[test]
+    fn a_backward_erase_stops_at_the_bands_edges() {
+        let (width, margin, phys_cols, phys_rows) = (10u16, 3u16, 16u16, 4u16);
+        let at = Placement {
+            left_margin: margin,
+            phys_row: 1,
+            grid_row: 1,
+        };
+        // Under a blue background, so an erased cell is a tinted one and a flood past the
+        // band shows up as colour where the sentinel stood.
+        for (run, erased) in [
+            (b"\x1b[44mAB\x1b[2K".as_slice(), 0..width),
+            (b"\x1b[44mAB\x1b[1K".as_slice(), 0..3),
+        ] {
+            let mut tape = Tape::new(phys_cols, phys_rows);
+            tape.move_to(at.left_margin, at.phys_row).unwrap();
+            tape.write_row(&clip_row_to_width(run, width, at)).unwrap();
+
+            let mut bytes = sentinel_fill(phys_cols, phys_rows);
+            bytes.extend(tape.into_bytes());
+            let screen = WeztermGrid::replay(&bytes, phys_cols, phys_rows);
+            let shown = String::from_utf8_lossy(run).to_string();
+
+            for row in 0..phys_rows {
+                for col in 0..phys_cols {
+                    let in_band = row == at.phys_row
+                        && col.checked_sub(margin).is_some_and(|c| erased.contains(&c));
+                    let cell = screen.cell(row, col);
+                    if in_band {
+                        assert_eq!(
+                            cell.bgcolor, BLUE,
+                            "{shown}: band cell (row {row}, col {col}) was not erased"
+                        );
+                    } else {
+                        assert_eq!(
+                            (cell.contents.as_str(), cell.bgcolor),
+                            (SENTINEL, Color::Default),
+                            "{shown}: the erase reached (row {row}, col {col})"
+                        );
+                    }
+                }
+            }
         }
     }
 
