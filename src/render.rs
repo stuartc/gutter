@@ -1340,7 +1340,16 @@ impl Renderer {
 
     /// Treat everything now in the tracker's scrollback as already counted, so the next
     /// drain reports only what departs from here on.
+    ///
+    /// Skipped on the alternate screen, where the probe reads the alt grid's absent
+    /// scrollback and would answer 0: a baseline reset during an alt excursion (a
+    /// resize, a resume, a `ChildContinued`) would otherwise drop the primary count to
+    /// zero and re-offer every line the session had ever scrolled. Nothing departs a
+    /// primary grid the child is not on, so there is never anything new to absorb there.
     fn mark_tracker_counted(&mut self) {
+        if self.scroll_tracker.screen().alternate_screen() {
+            return;
+        }
         self.tracker_scrollback = self.tracker_scrollback_len();
     }
 
