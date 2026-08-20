@@ -5411,16 +5411,19 @@ mod rowclip_paint {
             let runs = screen
                 .rows_diff(renderer.prev.screen(), 0, width)
                 .chain(screen.rows_formatted(0, width));
+            // Count only the runs that carry something: `rows_formatted` yields one
+            // (often empty) run per grid row whatever the stream did, so counting every
+            // run would satisfy the vacuity guard without inspecting a single byte.
             let mut seen = 0usize;
             for run in runs {
-                seen += 1;
+                seen += usize::from(!run.is_empty());
                 assert!(
                     !run.contains(&b'\r') && !run.contains(&b'\n'),
                     "vt100 now writes a bare \\r or \\n into a row run: {:?}",
                     String::from_utf8_lossy(&run)
                 );
             }
-            assert!(seen > 0, "no runs inspected — the pin is vacuous");
+            assert!(seen > 0, "no non-empty runs inspected — the pin is vacuous");
         }
     }
 
