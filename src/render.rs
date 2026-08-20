@@ -5379,6 +5379,36 @@ mod rowclip_paint {
         );
     }
 
+    /// No row run carries a bare `\r` or `\n`. vt100's `MoveFromTo` writes the pair
+    /// when the target is the start of the next row, and both bytes are meaningless in
+    /// a run defined for one physical row — the clipper's arms rewrite the `\r` to the
+    /// band's column 0 and drop the `\n`, but they are unreachable while the row
+    /// writers keep every move inside the row they seeded. `rows_diff` seeds each row
+    /// with its own number; `rows_formatted` seeds the wrapping state but guards the
+    /// cross-row move out. This pins both, so a vt100 upgrade that relaxes either
+    /// fails here rather than painting into the gutter or a row below the band.
+    #[test]
+    fn no_row_run_carries_a_bare_carriage_return_or_line_feed() {
+        for (stream, width) in [(WRAP_FLIP, WRAP_FLIP_WIDTH), (WIDE_EDGE, 80)] {
+            let mut renderer = Renderer::at_margin(width, 24, 0);
+            renderer.parser.process(stream);
+            let screen = renderer.parser.screen();
+            let runs = screen
+                .rows_diff(renderer.prev.screen(), 0, width)
+                .chain(screen.rows_formatted(0, width));
+            let mut seen = 0usize;
+            for run in runs {
+                seen += 1;
+                assert!(
+                    !run.contains(&b'\r') && !run.contains(&b'\n'),
+                    "vt100 now writes a bare \\r or \\n into a row run: {:?}",
+                    String::from_utf8_lossy(&run)
+                );
+            }
+            assert!(seen > 0, "no runs inspected — the pin is vacuous");
+        }
+    }
+
     /// Every absolute move a painted run carries addresses the band's own rectangle
     /// (ADR-014). A run is painted after a bare `move_to(left_margin, offset + row)`
     /// and nothing inside it re-establishes that origin, so a position left in the

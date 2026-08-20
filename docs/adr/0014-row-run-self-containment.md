@@ -142,9 +142,20 @@ with the tracker set to 0.
 A `\n` has no in-band translation at all: a run is defined for one physical row, so
 written out it would paint the rest of the run a row below the placement, and on the
 screen's bottom row scroll the whole physical screen with nothing in the baseline to
-repair it. It is dropped, with a `debug_assert!` beside it, exactly as the `CUP` arm
-handles a row parameter it cannot honour: loud in a debug build, silent and inside the
-band in a shipped one. The tracker is left where the preceding `\r` put it.
+repair it. It is dropped, and the tracker is left where the preceding `\r` put it.
+
+For the only shape vt100 can write — the `\r\n` meaning "start of the next row", where
+the placement has already put the cursor on the row the run belongs to — rewriting the
+`\r` and dropping the `\n` is not a fallback but the correct translation. Neither arm
+carries a `debug_assert!`, unlike the `CUP` arm above: a mismatched `CUP` row really is
+a case the clipper cannot honour, while these two are handled. What the arms cannot do
+is notice that vt100's row writers have changed shape under a version bump, and a
+runtime assert is the wrong instrument for that — it fires only if a developer happens
+to run the offending stream, and it takes a live session down when it does. That job
+belongs to `no_row_run_carries_a_bare_carriage_return_or_line_feed`, which drives the
+wrap-flip stream and the wide-edge fixture through both producers and asserts no run
+carries either byte. It runs in every build profile, so an upgrade that relaxes one of
+the guards fails in CI instead of in someone's terminal.
 
 ### The backspace arm is not defensive — the scroll path needs it
 

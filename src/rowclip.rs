@@ -262,11 +262,6 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, at: Placement, out: &mut Vec<u
             // the screen's bottom row scroll the whole screen with no baseline change
             // to repair it. Dropping it leaves the tracker's column alone and the
             // rest of the run on the placement's own row.
-            debug_assert!(
-                false,
-                "line feed inside a row run ({:?})",
-                String::from_utf8_lossy(run)
-            );
             i += 1;
             continue;
         }
@@ -749,18 +744,9 @@ mod tests {
         assert!(!got.contains(&b'\r'));
     }
 
-    /// A line feed names a row a run cannot address, so it is loud in a debug build.
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "line feed inside a row run")]
-    fn line_feed_is_loud_in_a_debug_build() {
-        clip_row_to_width(b"\x1b[7mAB\nz", 40, OFFSET);
-    }
-
-    /// With the assert compiled out the line feed is dropped rather than written: it
-    /// would paint the rest of the run a row below the placement. Nothing else in the
-    /// run shifts — the tracker still reads 2, so the erase fills `W - 2`.
-    #[cfg(not(debug_assertions))]
+    /// A line feed is dropped rather than written: it would paint the rest of the run a
+    /// row below the placement. Nothing else in the run shifts — the tracker still
+    /// reads 2, so the erase fills `W - 2`.
     #[test]
     fn line_feed_is_dropped() {
         let w = 40u16;
