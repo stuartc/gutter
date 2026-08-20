@@ -105,6 +105,7 @@ Alternatively, clone the repo and `cargo build --release` to run
 
 ```
 gutter [--width <N|Npct|full>] [--center|--left] [--resize-key <chord>] <cmd> [args...]
+gutter --version
 ```
 
 ```sh
@@ -113,6 +114,7 @@ gutter --width 100 vim notes.md       # absolute width, centred
 gutter --width 50pct --left htop      # half the terminal, hugged to the left
 gutter bash                           # no --width: 100-column band, centred (the default)
 gutter --width full bash              # full width, pure passthrough
+gutter --version                      # print the build stamp and exit
 ```
 
 Flags:
@@ -128,14 +130,21 @@ Flags:
   default. Write it as `[<mod>-]...<key>`: modifiers are `ctrl`/`c`,
   `alt`/`meta`/`m` and `shift`/`s`, and the key is a single character or one of
   `esc`, `tab`, `enter`, `space`, `f1`–`f12`.
+- `--version` — print the build stamp on stdout and exit, without starting
+  anything.
 
 A few things worth knowing:
 
 - Flags are only read _before_ the command. Anything after the command name
   belongs to the child, so `gutter vim --width 100` passes `--width 100` to vim,
   not to gutter.
-- There is no `--help`. An unrecognised leading token is taken to be the command
-  you want to run.
+- There is no `--help`. Apart from `--version`, an unrecognised leading token is
+  taken to be the command you want to run.
+- The version stamp is `git describe --tags --dirty --always` from the build, or
+  the crate version where there was no checkout to describe. Treat the `-dirty`
+  suffix as a hint in both directions: cargo only reruns the build script when
+  `HEAD` or the branch ref moves, so a stamp can keep saying `-dirty` after the
+  tree was cleaned, and can leave it off a tree that is dirty now.
 - With no `--width`, gutter defaults to a 100-column band, centred (clamped to
   the real width on narrower terminals). Use `--width full` (or `--width 100%`)
   for a transparent passthrough at the real terminal width.
@@ -178,8 +187,9 @@ nothing at all until you leave.
 ## The terminal gutter talks to
 
 gutter draws on your terminal, not on stdout — the same terminal it reads the
-keyboard from. Like `tmux`, it needs one to run and it ignores where descriptor
-1 points:
+keyboard from. Like `tmux`, it needs one to run, and once it is running a child
+it ignores where descriptor 1 points (`--version` is the exception: it prints on
+stdout and exits before any of this happens):
 
 - `gutter claude > session.log` paints on the screen as normal and leaves
   `session.log` empty. The child's output goes to its own pseudo-terminal and

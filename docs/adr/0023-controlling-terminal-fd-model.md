@@ -1,4 +1,4 @@
-# ADR-023: One terminal, never stdout
+# ADR-023: One terminal, and the band never paints on stdout
 
 Status: Accepted
 
@@ -207,6 +207,23 @@ does nothing when raw mode was never taken, keeping its ADR-010 slot and its
 `TCSANOW` rather than `TCSADRAIN`: gutter's own frames are already in flight, and waiting
 on them would let the mode change lag the keystroke that caused it.
 
+## Amendment — the pre-flight stamp is stdout, before there is a terminal
+
+`--version` prints `gutter <stamp>` on stdout and returns 0. That is the one write
+to descriptor 1 in the binary, and it does not reopen anything this record decided.
+It happens at the very top of `run()`: the argument list is parsed, the stamp is
+printed, and the function returns — before `open_tty_write`, before the read-side
+open, before the child is spawned. There is no band, no sink and no terminal
+resolved at that point, so nothing here has two answers to argue over.
+
+The carve-out is deliberate rather than tolerated. A stamp asked for by name is the
+program's output, not a frame, and `gutter --version | …` has to work the way every
+other tool's does; sending it to stderr instead would keep the letter of "never
+stdout" and break the thing the flag is for. The rule the rest of this record turns
+on is narrower and unchanged: **once gutter is running a child, the band and every
+other side it has on the terminal go to the resolved device, and stdout is never
+written.** `gutter cmd > log` still paints on screen and leaves the log empty.
+
 ## Code anchors
 
 - `src/terminal.rs` — `open_tty_write`, the two routes, the startup guard and the path
@@ -217,8 +234,9 @@ on them would let the mode change lag the keystroke that caused it.
   which writes its query through the band's own sink
 - `src/clipboard.rs` — `open_tty_read_write`, the read-write open both the input
   handle and the clipboard sink are made from
-- `src/main.rs` — both opens at the top of `run()`, the resolved path threaded to the
-  keyboard and clipboard opens, and the refusal lines
+- `src/main.rs` — the `--version` early return ahead of them, both opens at the top of
+  `run()`, the resolved path threaded to the keyboard and clipboard opens, and the
+  refusal lines
 - `tests/tty_model.rs` — the refusal, the fallback, the redirect, and the
   probe-survives-a-redirect tests
 

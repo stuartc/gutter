@@ -1,14 +1,28 @@
 //! Command-line parsing.
 //!
-//! `gutter [--width <N|Npct|full>] [--center|--left] [--resize-key <chord>] <cmd>
-//! [args...]`. The first non-flag positional is the command, the rest are its
-//! arguments — a hand-rolled split of `std::env::args`, no clap.
+//! `gutter [--width <N|Npct|full>] [--center|--left] [--resize-key <chord>]
+//! <cmd> [args...]`, or `gutter --version`. The first non-flag positional is
+//! the command, the rest are its arguments — a hand-rolled split of
+//! `std::env::args`, no clap.
 
 use crate::geometry::{Layout, Width};
 use crate::chord::{parse_chord, Chord};
 
-/// The parsed invocation: the band width, the alignment, the resize-mode
-/// chord, and the child command.
+/// The build stamp: `git describe --tags --dirty --always` where the build had a
+/// checkout to describe, else the crate version. The `-dirty` suffix is
+/// best-effort — see `build.rs`.
+pub const VERSION: &str = env!("GUTTER_VERSION");
+
+/// What the argument list asked for: a child run, or the version stamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Invocation {
+    Run(Config),
+    /// `--version`: print [`VERSION`] and exit 0, spawning nothing.
+    Version,
+}
+
+/// Everything a child run needs: the band width, the alignment, the
+/// resize-mode chord, and the command to spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// The requested band width from `--width`, or `None` when the flag was
@@ -27,12 +41,14 @@ pub struct Config {
 /// Parses `gutter [--width <N|Npct|full>] [--center|--left] <cmd> [args...]` from an
 /// argument iterator (excluding argv[0]).
 ///
+/// `--version` short-circuits to [`Invocation::Version`], so it needs no command.
+///
 /// Flags are only recognised before the command; once the command is seen,
 /// everything that follows is the child's own argument (so
 /// `gutter vim --width` passes `--width` to vim).
 ///
 /// Returns `Err` with a usage message on a missing/invalid value or no command.
-pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> {
+pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, String> {
     let mut iter = args.into_iter().peekable();
     let mut width: Option<Width> = None;
     let mut layout: Option<Layout> = None;
@@ -50,6 +66,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
             let val = val.to_string();
             iter.next();
             width = Some(parse_width(&val)?);
+        } else if arg == "--version" {
+            return Ok(Invocation::Version);
         } else if arg == "--center" || arg == "--centre" {
             iter.next();
             layout = Some(Layout::Center);
@@ -73,17 +91,17 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
 
     let cmd = iter.next().ok_or_else(usage)?;
 
-    Ok(Config {
+    Ok(Invocation::Run(Config {
         width,
         layout: layout.unwrap_or_default(),
         resize_key: resize_key.unwrap_or_default(),
         cmd,
         args: iter.collect(),
-    })
+    }))
 }
 
 fn usage() -> String {
-    "usage: gutter [--width <N|Npct|full>] [--center|--left] [--resize-key <chord>] <cmd> [args...]"
+    "usage: gutter [--width <N|Npct|full>] [--center|--left] [--resize-key <chord>] <cmd> [args...]\n       gutter --version"
         .to_string()
 }
 
@@ -123,160 +141,184 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
+    fn cfg(args: Vec<String>) -> Result<Config, String> {
+        match parse(args)? {
+            Invocation::Run(cfg) => Ok(cfg),
+            Invocation::Version => panic!("expected a child run, got --version"),
+        }
+    }
+
     #[test]
     fn parses_cmd_and_args() {
-        let cfg = parse(v(&["echo", "hi", "there"])).unwrap();
-        assert_eq!(cfg.width, None);
-        assert_eq!(cfg.layout, Layout::Center); // default
-        assert_eq!(cfg.cmd, "echo");
-        assert_eq!(cfg.args, v(&["hi", "there"]));
+        let c = cfg(v(&["echo", "hi", "there"])).unwrap();
+        assert_eq!(c.width, None);
+        assert_eq!(c.layout, Layout::Center); // default
+        assert_eq!(c.cmd, "echo");
+        assert_eq!(c.args, v(&["hi", "there"]));
     }
 
     #[test]
     fn parses_bare_cmd() {
-        let cfg = parse(v(&["cat"])).unwrap();
-        assert_eq!(cfg.cmd, "cat");
-        assert!(cfg.args.is_empty());
+        let c = cfg(v(&["cat"])).unwrap();
+        assert_eq!(c.cmd, "cat");
+        assert!(c.args.is_empty());
     }
 
     #[test]
     fn parses_absolute_width_flag() {
-        let cfg = parse(v(&["--width", "100", "vim", "file"])).unwrap();
-        assert_eq!(cfg.width, Some(Width::Cols(100)));
-        assert_eq!(cfg.cmd, "vim");
-        assert_eq!(cfg.args, v(&["file"]));
+        let c = cfg(v(&["--width", "100", "vim", "file"])).unwrap();
+        assert_eq!(c.width, Some(Width::Cols(100)));
+        assert_eq!(c.cmd, "vim");
+        assert_eq!(c.args, v(&["file"]));
     }
 
     #[test]
     fn parses_width_equals_form() {
-        let cfg = parse(v(&["--width=80", "echo"])).unwrap();
-        assert_eq!(cfg.width, Some(Width::Cols(80)));
+        let c = cfg(v(&["--width=80", "echo"])).unwrap();
+        assert_eq!(c.width, Some(Width::Cols(80)));
     }
 
     #[test]
     fn parses_proportional_width_pct() {
-        let cfg = parse(v(&["--width", "50pct", "echo"])).unwrap();
-        assert_eq!(cfg.width, Some(Width::Percent(50)));
+        let c = cfg(v(&["--width", "50pct", "echo"])).unwrap();
+        assert_eq!(c.width, Some(Width::Percent(50)));
     }
 
     #[test]
     fn parses_proportional_width_percent_alias() {
-        let cfg = parse(v(&["--width", "50%", "echo"])).unwrap();
-        assert_eq!(cfg.width, Some(Width::Percent(50)));
-        let cfg = parse(v(&["--width=33%", "echo"])).unwrap();
-        assert_eq!(cfg.width, Some(Width::Percent(33)));
+        let c = cfg(v(&["--width", "50%", "echo"])).unwrap();
+        assert_eq!(c.width, Some(Width::Percent(50)));
+        let c = cfg(v(&["--width=33%", "echo"])).unwrap();
+        assert_eq!(c.width, Some(Width::Percent(33)));
     }
 
     #[test]
     fn parses_center_flag() {
-        let cfg = parse(v(&["--center", "echo"])).unwrap();
-        assert_eq!(cfg.layout, Layout::Center);
+        let c = cfg(v(&["--center", "echo"])).unwrap();
+        assert_eq!(c.layout, Layout::Center);
         // British spelling accepted too.
-        let cfg = parse(v(&["--centre", "echo"])).unwrap();
-        assert_eq!(cfg.layout, Layout::Center);
+        let c = cfg(v(&["--centre", "echo"])).unwrap();
+        assert_eq!(c.layout, Layout::Center);
     }
 
     #[test]
     fn parses_left_flag() {
-        let cfg = parse(v(&["--left", "echo"])).unwrap();
-        assert_eq!(cfg.layout, Layout::Left);
+        let c = cfg(v(&["--left", "echo"])).unwrap();
+        assert_eq!(c.layout, Layout::Left);
     }
 
     #[test]
     fn parses_width_and_alignment_together() {
-        let cfg = parse(v(&["--width", "100", "--center", "claude"])).unwrap();
-        assert_eq!(cfg.width, Some(Width::Cols(100)));
-        assert_eq!(cfg.layout, Layout::Center);
-        assert_eq!(cfg.cmd, "claude");
+        let c = cfg(v(&["--width", "100", "--center", "claude"])).unwrap();
+        assert_eq!(c.width, Some(Width::Cols(100)));
+        assert_eq!(c.layout, Layout::Center);
+        assert_eq!(c.cmd, "claude");
 
-        let cfg = parse(v(&["--left", "--width=50pct", "claude"])).unwrap();
-        assert_eq!(cfg.width, Some(Width::Percent(50)));
-        assert_eq!(cfg.layout, Layout::Left);
+        let c = cfg(v(&["--left", "--width=50pct", "claude"])).unwrap();
+        assert_eq!(c.width, Some(Width::Percent(50)));
+        assert_eq!(c.layout, Layout::Left);
     }
 
     #[test]
     fn flags_after_command_are_child_args() {
-        let cfg = parse(v(&["vim", "--width", "100", "--center"])).unwrap();
-        assert_eq!(cfg.width, None);
-        assert_eq!(cfg.layout, Layout::Center);
-        assert_eq!(cfg.cmd, "vim");
-        assert_eq!(cfg.args, v(&["--width", "100", "--center"]));
+        let c = cfg(v(&["vim", "--width", "100", "--center"])).unwrap();
+        assert_eq!(c.width, None);
+        assert_eq!(c.layout, Layout::Center);
+        assert_eq!(c.cmd, "vim");
+        assert_eq!(c.args, v(&["--width", "100", "--center"]));
     }
 
     #[test]
     fn rejects_missing_width_value() {
-        assert!(parse(v(&["--width"])).is_err());
+        assert!(cfg(v(&["--width"])).is_err());
     }
 
     #[test]
     fn rejects_non_numeric_width() {
-        assert!(parse(v(&["--width", "wide", "echo"])).is_err());
+        assert!(cfg(v(&["--width", "wide", "echo"])).is_err());
     }
 
     #[test]
     fn rejects_bad_percentage() {
-        assert!(parse(v(&["--width", "0pct", "echo"])).is_err());
-        assert!(parse(v(&["--width", "101pct", "echo"])).is_err());
-        assert!(parse(v(&["--width", "abcpct", "echo"])).is_err());
+        assert!(cfg(v(&["--width", "0pct", "echo"])).is_err());
+        assert!(cfg(v(&["--width", "101pct", "echo"])).is_err());
+        assert!(cfg(v(&["--width", "abcpct", "echo"])).is_err());
     }
 
     #[test]
     fn rejects_empty() {
-        assert!(parse(v(&[])).is_err());
+        assert!(cfg(v(&[])).is_err());
     }
 
     #[test]
     fn default_resize_key_is_ctrl_backslash() {
-        let cfg = parse(v(&["echo"])).unwrap();
-        assert_eq!(cfg.resize_key, Chord::default());
+        let c = cfg(v(&["echo"])).unwrap();
+        assert_eq!(c.resize_key, Chord::default());
     }
 
     #[test]
     fn parses_resize_key_flag() {
-        let cfg = parse(v(&["--resize-key", "ctrl-g", "echo"])).unwrap();
+        let c = cfg(v(&["--resize-key", "ctrl-g", "echo"])).unwrap();
         assert_eq!(
-            cfg.resize_key,
+            c.resize_key,
             crate::chord::parse_chord("ctrl-g").unwrap()
         );
-        let cfg = parse(v(&["--resize-key=ctrl-o", "echo"])).unwrap();
+        let c = cfg(v(&["--resize-key=ctrl-o", "echo"])).unwrap();
         assert_eq!(
-            cfg.resize_key,
+            c.resize_key,
             crate::chord::parse_chord("ctrl-o").unwrap()
         );
     }
 
     #[test]
     fn rejects_bad_resize_key() {
-        assert!(parse(v(&["--resize-key", "wat-x", "echo"])).is_err());
-        assert!(parse(v(&["--resize-key"])).is_err());
+        assert!(cfg(v(&["--resize-key", "wat-x", "echo"])).is_err());
+        assert!(cfg(v(&["--resize-key"])).is_err());
     }
 
     #[test]
     fn resize_key_after_command_is_child_arg() {
-        let cfg = parse(v(&["vim", "--resize-key", "ctrl-g"])).unwrap();
-        assert_eq!(cfg.resize_key, Chord::default());
-        assert_eq!(cfg.cmd, "vim");
-        assert_eq!(cfg.args, v(&["--resize-key", "ctrl-g"]));
+        let c = cfg(v(&["vim", "--resize-key", "ctrl-g"])).unwrap();
+        assert_eq!(c.resize_key, Chord::default());
+        assert_eq!(c.cmd, "vim");
+        assert_eq!(c.args, v(&["--resize-key", "ctrl-g"]));
     }
 
     #[test]
     fn parses_full_literal() {
-        let cfg = parse(v(&["--width", "full", "echo"])).unwrap();
-        assert_eq!(cfg.width, Some(Width::Percent(100)));
-        let cfg = parse(v(&["--width=full", "echo"])).unwrap();
-        assert_eq!(cfg.width, Some(Width::Percent(100)));
+        let c = cfg(v(&["--width", "full", "echo"])).unwrap();
+        assert_eq!(c.width, Some(Width::Percent(100)));
+        let c = cfg(v(&["--width=full", "echo"])).unwrap();
+        assert_eq!(c.width, Some(Width::Percent(100)));
     }
 
     #[test]
     fn full_equals_percent_100() {
-        let full = parse(v(&["--width", "full", "echo"])).unwrap();
-        let pct = parse(v(&["--width", "100%", "echo"])).unwrap();
+        let full = cfg(v(&["--width", "full", "echo"])).unwrap();
+        let pct = cfg(v(&["--width", "100%", "echo"])).unwrap();
         assert_eq!(full.width, pct.width);
     }
 
     #[test]
+    fn parses_version_flag() {
+        assert_eq!(parse(v(&["--version"])).unwrap(), Invocation::Version);
+        // Still an early exit with other leading flags in front of it.
+        assert_eq!(
+            parse(v(&["--width", "80", "--version"])).unwrap(),
+            Invocation::Version
+        );
+    }
+
+    #[test]
+    fn version_after_command_is_child_arg() {
+        let c = cfg(v(&["vim", "--version"])).unwrap();
+        assert_eq!(c.cmd, "vim");
+        assert_eq!(c.args, v(&["--version"]));
+    }
+
+    #[test]
     fn rejects_capitalised_full() {
-        assert!(parse(v(&["--width", "Full", "echo"])).is_err());
-        assert!(parse(v(&["--width", "FULL", "echo"])).is_err());
+        assert!(cfg(v(&["--width", "Full", "echo"])).is_err());
+        assert!(cfg(v(&["--width", "FULL", "echo"])).is_err());
     }
 }

@@ -68,7 +68,17 @@ fn main() {
 /// shell. Returns the exit code to propagate.
 fn run() -> i32 {
     let config = match cli::parse(std::env::args().skip(1)) {
-        Ok(c) => c,
+        Ok(cli::Invocation::Run(c)) => c,
+        // The one thing gutter puts on stdout: a stamp asked for by name is output,
+        // not a frame, so it belongs where a pipe can catch it.
+        Ok(cli::Invocation::Version) => {
+            // Rust ignores SIGPIPE, so a `println!` onto a closed pipe
+            // (`gutter --version | head -0`) panics out with 101.
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "gutter {}", cli::VERSION);
+            return 0;
+        }
         Err(msg) => {
             eprintln!("{msg}");
             return 2;
