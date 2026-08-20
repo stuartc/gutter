@@ -77,10 +77,16 @@ the tracker's screen alongside the live parser's.
 That leaves one thing the deque has to be emptied for. At its cap vt100 drops the
 oldest line for each new one, the length stops growing, and a growth count reads zero
 for every departure after that — the band would stop scrolling the real terminal
-altogether. On a full scrollback the tracker is re-seeded once, which does forget the
-scroll region until the child sets one again. The cap is 4096 departed lines, so it is
-paid once in a long-scrolling session rather than sixty times a second, and only ever
-in exchange for counting nothing at all.
+altogether. So the tracker is re-seeded once its headroom no longer covers a frame the
+size of the last one, rather than once the deque is actually full: the frame that
+saturates it cannot report more than the room it had left, and the departures past that
+are lost outright, not merely delayed. Waiting for a full deque would cost a `cat` of a
+long file most of its history, a chunk at a time. The re-seed does forget the scroll
+region until the child sets one again, but it can only ever fire in a frame where lines
+really departed, and vt100 pushes a line into scrollback only while no region is active
+— so the region it forgets is one that was not in force. The cap is 4096 departed
+lines, so it is paid at most once per few thousand scrolled lines rather than sixty
+times a second.
 
 ## Code anchors
 

@@ -43,9 +43,10 @@ pub const TEARDOWN_DRAIN_GRACE: Duration = Duration::from_millis(100);
 
 /// The scroll-tracker's bounded scrollback (ADR-013). The tracker keeps its screen for
 /// the whole session and counts departures as the growth of that scrollback, so the cap
-/// bounds a session's worth of departed lines rather than a single frame's. Reaching it
-/// costs one re-seed, which is the only time the tracker forgets the child's scroll
-/// region — hence a cap far above what a frame, or a run of them, will ever depart.
+/// bounds a session's worth of departed lines rather than a single frame's. Running out
+/// of headroom for the next frame costs one re-seed, which is the only time the tracker
+/// forgets the child's scroll region — hence a cap far above what a frame, or a run of
+/// them, will ever depart.
 const SCROLL_TRACKER_SCROLLBACK: usize = 4096;
 
 /// What the two restore paths hand the shell back: no leftover attribute run from the
@@ -1379,10 +1380,14 @@ impl Renderer {
         }
         self.scroll_tracker.screen_mut().set_scrollback(0);
 
-        if len == self.tracker_cap {
-            // Full: vt100 drops the oldest line for each new one, so the length stops
-            // growing and every later departure would count as zero. Re-seed once, and
-            // count from an empty scrollback again.
+        if self.tracker_cap.saturating_sub(len) < n.max(1) {
+            // Out of headroom: at the cap vt100 drops the oldest line for each new one,
+            // so the length stops growing and every later departure counts as zero. The
+            // frame that saturates it is already short-changed — it can only report the
+            // room it had, and the rest of its departures are lost, not delayed — so
+            // re-seed while a frame the size of this one still fits, not once the deque
+            // is full. `n.max(1)` keeps a quiet frame from re-seeding until the deque
+            // really is full.
             self.reseed_scroll_tracker();
         } else {
             self.tracker_scrollback = len;
@@ -1395,7 +1400,8 @@ impl Renderer {
     /// and the only thing that costs: `contents_formatted` carries no scroll region and
     /// no alt-screen flag, so a re-seeded tracker counts scrolls inside a region the
     /// child set earlier as departures until the child sets one again. Reserved for a
-    /// full scrollback, where the alternative is counting nothing at all ever again.
+    /// scrollback with no room left for a frame the size of the last one, where the
+    /// alternative is losing that frame's departures outright.
     ///
     /// Only the screen is replaced. The `Parser` owns the vte state machine, and the
     /// tracker is fed the child's raw bytes, so a chunk boundary landing mid escape
@@ -5877,6 +5883,35 @@ mod primary_scroll {
                 newlines, 1,
                 "line {i} scrolled after the tracker filled, and still has to reach \
                  the terminal's scrollback"
+            );
+        }
+    }
+
+    /// The frame that runs the tracker out of headroom still reports every line it
+    /// scrolled. vt100 stops growing the scrollback at the cap, so a re-seed triggered
+    /// only once the deque is *full* leaves the saturating frame able to report just the
+    /// room it had left — the rest of its departures never reach the terminal's
+    /// scrollback at all. With multi-line frames against a tiny cap, a per-frame count
+    /// short of the lines fed is exactly that loss.
+    #[test]
+    fn a_frame_that_fills_the_tracker_still_reports_every_line() {
+        let (w, rows, cap, per_frame) = (20u16, 4u16, 8usize, 5usize);
+        let mut renderer = renderer_primed(w, rows, &["a", "b", "c", "d"]);
+        renderer.set_tracker_cap(cap);
+
+        for frame in 0..10 {
+            let mut bytes = Vec::new();
+            for i in 0..per_frame {
+                bytes.extend_from_slice(format!("\r\nf{frame}-{i}").as_bytes());
+            }
+            feed(&mut renderer, &bytes);
+            let mut term = MockTerminal::new();
+            render_once(&mut renderer, &mut term).unwrap();
+            let newlines = term.calls.iter().filter(|c| **c == Call::Newline).count();
+            assert_eq!(
+                newlines, per_frame,
+                "frame {frame} scrolled {per_frame} lines and must advance the \
+                 terminal by all of them"
             );
         }
     }
