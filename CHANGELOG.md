@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-20
+
+### Added
+
+- `gutter --version` prints the build's git stamp, so a dev build off main and a released tag can be told apart.
+
+### Fixed
+
+- The band no longer jumps to the top of the screen and stays pinned there. Two things could set it off: a program using a scroll region, such as a pager or a status bar, and a child writing to the clipboard.
+- A long-scrolling child (`cat` of a big file, say) no longer loses chunks of its history off the top — every line that scrolls out of the band now reaches the terminal's scrollback.
+- A carriage return inside a painted row now returns to the band's own first column instead of the terminal's, and a line feed is dropped rather than painting the rest of the row a line low.
+
 ## [0.3.1] - 2026-08-11
 
 ### Fixed
@@ -143,6 +155,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stop vim integration test leaking swap files
 - Fix loose ADR cites and width-default wording in comments
 
+[0.4.0]: https://github.com/stuartc/gutter/compare/v0.3.1..v0.4.0
 [0.3.1]: https://github.com/stuartc/gutter/compare/v0.3.0..v0.3.1
 [0.3.0]: https://github.com/stuartc/gutter/compare/v0.2.2..v0.3.0
 [0.2.2]: https://github.com/stuartc/gutter/compare/v0.2.1..v0.2.2
