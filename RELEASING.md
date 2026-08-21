@@ -59,11 +59,25 @@ The first release is **`v0.1.0`**, cut from current `main` as-is.
    and stages the new `CHANGELOG.md` section), and reports the planned commit, tag, and push
    **without changing anything else**. `publish = false` means it never attempts crates.io.
 
-2. **Review** the planned bump, the new `CHANGELOG.md` section, and the tag name. The section
-   is yours to edit — the real run sees it is already there and leaves it alone, so anything
-   you fix now is what ships.
+2. **Review** the planned bump, the new `CHANGELOG.md` section, and the tag name. The
+   section is yours to edit — a `Changelog:` trailer that git-cliff mangled, two bullets
+   that read as duplicates, anything that doesn't sound like a person wrote it.
 
-3. **Execute** once you're happy:
+3. **Commit the changelog before executing.** cargo-release refuses to run with anything
+   staged or modified, and the hook stages the section it wrote, so the dry run always
+   leaves the tree dirty:
+
+   ```bash
+   git commit -m "docs(changelog): write the vX.Y.Z section by hand
+
+   Changelog: skip"
+   ```
+
+   A release is therefore **two commits**: the changelog, then the version bump. Commit
+   the section even if you changed nothing in it — the real run sees it is already there
+   and leaves it alone, so what you commit is what ships.
+
+4. **Execute** once the tree is clean:
 
    ```bash
    cargo release minor --execute
@@ -73,9 +87,9 @@ The first release is **`v0.1.0`**, cut from current `main` as-is.
 
 1. Bump the version in `Cargo.toml`.
 2. Run the pre-release hook — `scripts/changelog.sh` prepends the `v${NEW_VERSION}` section
-   and its compare link, then `git add`s the file. If the dry run already wrote that section
-   (or you wrote it yourself), it is left as it stands.
-3. Make a **single commit** containing the version bump and the changelog.
+   and its compare link, then `git add`s the file. If step 3 above already committed that
+   section, the script says so and leaves it alone.
+3. Commit the version bump.
 4. Tag that commit `v0.x.0`.
 5. Push the branch and the tag.
 
