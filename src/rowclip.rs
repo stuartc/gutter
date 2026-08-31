@@ -774,4 +774,79 @@ mod tests {
         want.extend(cup(2));
         assert_eq!(got, want);
     }
+
+    /// What the tracker believes after `run`: append an `ESC[K` and read the column
+    /// the fill's trailing absolute move names. At the pending-wrap column the clip
+    /// emits no move at all and the tracker holds `W`.
+    fn tracked_col(run: &[u8], w: u16) -> u16 {
+        let mut with_erase = run.to_vec();
+        with_erase.extend_from_slice(b"\x1b[K");
+        let got = clip_row_to_width(&with_erase, w, HOME);
+        (0..w).find(|&col| got.ends_with(&cup(col))).unwrap_or(w)
+    }
+
+    /// The row's own `rows_diff` run against a blank baseline, which is the producer
+    /// the diff paint feeds the clipper.
+    fn row_run(content: &[u8], w: u16) -> (vt100::Parser, Vec<u8>) {
+        let blank = vt100::Parser::new(1, w, 0);
+        let mut parser = vt100::Parser::new(1, w, 0);
+        parser.process(content);
+        let run = parser
+            .screen()
+            .rows_diff(blank.screen(), 0, w)
+            .next()
+            .expect("a one-row grid yields one run");
+        (parser, run)
+    }
+
+    /// The column the row's cells put the cursor at: the index of the last written
+    /// cell plus that glyph's display width.
+    fn width_sum(screen: &vt100::Screen, w: u16) -> u16 {
+        let mut col = 0;
+        for c in 0..w {
+            let contents = screen.cell(0, c).expect("a cell inside the grid").contents();
+            if !contents.is_empty() {
+                let width: u16 = contents
+                    .chars()
+                    .map(|ch| ch.width().unwrap_or(0) as u16)
+                    .sum();
+                col = c + width;
+            }
+        }
+        col
+    }
+
+    /// The clipper's column tracker agrees with the widths of the glyphs in the run it
+    /// walked: after a `rows_diff` run, the tracked column is the last written cell's
+    /// index plus that glyph's display width. A double-width glyph counted as one
+    /// column, or a combining mark counted as an extra, shows up here as a fill of the
+    /// wrong length and a reposition on the wrong cell.
+    ///
+    /// This is vt100 checked against vt100 — the run is vt100-composed and the cells it
+    /// is measured against are the same parser's. It says the tracker and vt100 agree
+    /// about the run's own accounting, and by ADR-001's amendment it cannot say anything
+    /// about where the bytes land on a real terminal. That claim only comes from the
+    /// painted-band check in `src/oracle/band.rs`.
+    #[test]
+    fn the_tracker_agrees_with_the_runs_glyph_widths() {
+        let w = 10u16;
+        for content in [
+            "AB".as_bytes(),
+            "ABCDEFGHIJ".as_bytes(),                      // fills the row
+            "AB\x1b[1;6HCD".as_bytes(),                    // a gap the run skips with a CUF
+            "\u{4e00}\u{4e8c}".as_bytes(),                 // 一二, two columns each
+            "A\u{4e00}B".as_bytes(),                       // wide glyph between narrow ones
+            "AAAAAAAA\u{4e00}".as_bytes(),                 // wide glyph on the band's edge
+            "\u{1f600}".as_bytes(),                        // 😀
+            "e\u{0301}f".as_bytes(),                       // a combining mark: one column
+        ] {
+            let (parser, run) = row_run(content, w);
+            let shown = String::from_utf8_lossy(content).to_string();
+            assert_eq!(
+                tracked_col(&run, w),
+                width_sum(parser.screen(), w),
+                "{shown}: the tracker and the run's glyph widths disagree"
+            );
+        }
+    }
 }
