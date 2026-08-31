@@ -252,13 +252,55 @@ fn tty_path(fd: i32) -> Option<PathBuf> {
     (!name.is_empty()).then(|| PathBuf::from(OsStr::from_bytes(name)))
 }
 
+/// The outer terminal's file, optionally teed to a trace file.
+///
+/// Where a glyph landed on the real screen is only recoverable from the bytes
+/// gutter wrote, and once the terminal has drawn them they are gone. Setting
+/// `GUTTER_TRACE_OUT=<path>` appends every byte to that path as well, so a
+/// corrupting frame seen on a real terminal can be replayed offline.
+pub struct TracedTty {
+    tty: File,
+    trace: Option<File>,
+}
+
+impl TracedTty {
+    fn new(tty: File) -> Self {
+        let trace = std::env::var_os("GUTTER_TRACE_OUT").and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        });
+        Self { tty, trace }
+    }
+}
+
+impl Write for TracedTty {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.tty.write(buf)?;
+        if let Some(t) = self.trace.as_mut() {
+            // Best-effort: a failed trace write must never disturb the render path.
+            let _ = t.write_all(&buf[..n]);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(t) = self.trace.as_mut() {
+            let _ = t.flush();
+        }
+        self.tty.flush()
+    }
+}
+
 /// The real outer terminal, backed by crossterm against the terminal
 /// [`open_tty_write`] resolved.
 pub struct CrosstermTerminal {
     /// Buffered: one `move_to` is several small writes, and unbuffered they would
     /// be several syscalls. Every write here is landed by an explicit flush — no
     /// destructor runs before `process::exit` (ADR-010).
-    out: BufWriter<File>,
+    out: BufWriter<TracedTty>,
     /// Whether mouse capture was enabled at startup, so teardown disables only
     /// what it set.
     mouse_enabled: bool,
@@ -273,7 +315,7 @@ pub struct CrosstermTerminal {
 impl CrosstermTerminal {
     pub fn new(tty: File) -> Self {
         Self {
-            out: BufWriter::new(tty),
+            out: BufWriter::new(TracedTty::new(tty)),
             mouse_enabled: false,
             saved_termios: None,
         }
@@ -286,7 +328,7 @@ impl CrosstermTerminal {
     }
 
     fn fd(&self) -> i32 {
-        self.out.get_ref().as_raw_fd()
+        self.out.get_ref().tty.as_raw_fd()
     }
 }
 
@@ -322,7 +364,7 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn terminal_size(&mut self) -> io::Result<(u16, u16)> {
-        tty_size(self.out.get_ref())
+        tty_size(&self.out.get_ref().tty)
     }
 
     fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
