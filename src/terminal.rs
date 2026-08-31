@@ -52,8 +52,6 @@ pub trait OuterTerminal {
     /// clamped there instead of wrapping onto the next row and soft-wrap-joining it. It
     /// is damage limitation over the clipper's absolute rewrites (ADR-014), not a
     /// replacement for them.
-    // Wired at setup, teardown and the suspend cycle in `feat(wrap-2)`; inert until then.
-    #[allow(dead_code)]
     fn set_autowrap(&mut self, on: bool) -> io::Result<()>;
     /// Enter the alternate screen, mirroring the child's `?1049h` edge (ADR-012).
     /// gutter never forces the alt screen at setup; called mid-run only when the
@@ -701,8 +699,6 @@ pub mod mock {
         EnableRawMode,
         EnableMouse,
         /// `set_autowrap(on)` — the host DECAWM `?7` gutter sets for itself.
-        // Constructed once wrap-2's call sites exercise it through a restore-order test.
-        #[allow(dead_code)]
         SetAutowrap(bool),
         EnterAltScreen,
         MoveTo(u16, u16),

@@ -1847,6 +1847,10 @@ fn ordered_restore<T: OuterTerminal>(
     restore.step(mode_reset(renderer, term));
     restore.step(relay_reset(renderer, term));
     restore.step(term.disable_mouse()); // conditional on mouse_enabled
+    // Autowrap back on, unconditionally — like the mouse disable (ADR-005), gutter puts
+    // the terminal in the state a shell expects rather than the one it found. Before
+    // `show_cursor`, whose flush is what puts the whole restore on screen (ADR-023).
+    restore.step(term.set_autowrap(true));
     restore.step(term.show_cursor());
     restore.step(term.disable_raw_mode()); // LAST (ADR-010)
     restore
@@ -1882,6 +1886,9 @@ fn park<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Res
 fn unpark<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::io::Result<()> {
     let mut restore = BestEffort::default();
     restore.step(retry_enable_raw(term));
+    // Park turned autowrap back on for the shell; re-assert it off, or one Ctrl+Z/`fg`
+    // would drop it for the rest of the run with nothing to detect the loss.
+    restore.step(term.set_autowrap(false));
     restore.step(relay_replay(renderer, term));
     restore.step(term.enable_mouse());
     let child_alt = renderer.parser.screen().alternate_screen();

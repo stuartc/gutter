@@ -237,6 +237,14 @@ fn run() -> i32 {
         eprintln!("gutter: failed to enable mouse capture: {e}");
     }
 
+    // Host autowrap off for the run (ADR-014's amendment): gutter positions every row
+    // absolutely and never wants the outer terminal to wrap on its behalf, so a byte
+    // that overruns the screen's last column is clamped there rather than wrapping onto
+    // the next row and marking it soft-wrapped. The ordered restore turns it back on.
+    if let Err(e) = terminal.set_autowrap(false) {
+        eprintln!("gutter: failed to disable autowrap: {e}");
+    }
+
     // The OSC-52 clipboard sink: a third open of the same device (ADR-004), so a
     // clipboard write and a frame repaint never share fd state. Degrades to a
     // discarding sink rather than aborting startup.
