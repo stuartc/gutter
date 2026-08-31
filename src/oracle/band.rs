@@ -372,6 +372,22 @@ mod painted_band {
                     phys_rows: CLAUDE_CODE_FLOW_ROWS,
                 },
             },
+            Case {
+                // Centred: a real gutter on both sides. Strengthens
+                // `painted_band_matches_the_child_grid_on_a_real_terminal` only — see
+                // CLAUDE_CODE_FLOW's doc comment for what the other three tests can't
+                // draw from this fixture regardless of geometry.
+                name: "claude-code-flow fixture, inset band",
+                stream: CLAUDE_CODE_FLOW,
+                geom: BandGeometry {
+                    width: CLAUDE_CODE_FLOW_WIDTH,
+                    rows: CLAUDE_CODE_FLOW_ROWS,
+                    margin: 6,
+                    base_row: 0,
+                    phys_cols: 92,
+                    phys_rows: CLAUDE_CODE_FLOW_ROWS,
+                },
+            },
         ]
     }
 
