@@ -62,6 +62,29 @@ all lands outside the band's rectangle. Any future claim that gutter positions t
 cursor correctly has to come from there or from a real PTY, never from
 `RecordingGrid`.
 
+## Amendment — the check now replays production bytes, and covers the primary fixture
+
+`Tape` no longer hand-copies `CrosstermTerminal`'s emitters. It wraps a
+`CrosstermTerminal<Vec<u8>>` (built via `from_writer`, gated behind the `oracle`
+feature) and delegates every `OuterTerminal` method to it, so the bytes replayed
+through wezterm-term are the same bytes the production path writes to a real tty,
+not a second, independently maintained copy of the logic that produces them. This
+restores the premise the Amendment above already states: that the check replays
+"the bytes *gutter* emits". Before this, a placement bug that lived only in
+`CrosstermTerminal`'s emitters — never copied into `Tape` — could pass the painted-band
+check while still shipping.
+
+The corpus also now carries `claude-code-flow.cast`, the SGR-dense fixture the
+equivalence gate already treats as primary, at its recorded 80×24, in both
+geometries: `margin == 0` (band edge on the screen edge, deferred wrap live on the
+asserted cells) and a centred band with real gutters either side. Both passed with
+zero corrupting cells and forced no new `.allowlist` entry. The fixture enters the
+alt screen in its first byte and never leaves it, so both cases exercise
+`painted_band_matches_the_child_grid_on_a_real_terminal` only — the band-vs-child
+diff, which does not care which screen is active — and not the containment or
+scroll checks, which either skip alt-screen tapes or run their own hardcoded cases
+regardless of what `cases()` carries.
+
 ## Code anchors
 
 - `src/oracle/gate.rs` — replay pipeline and the two-emulator type assertion
