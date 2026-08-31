@@ -252,6 +252,43 @@ them: `src/relay.rs`'s allowlist is keyboard-mode sequences only, and no DECSET 
 relayed ([ADR-022](0022-absorbed-mode-mirroring.md)). If either ever changes, this
 rewrite has to change with it.
 
+There is now a sibling assumption alongside them: **host autowrap (DECAWM, `?7`) is off
+for the lifetime of a run.** gutter writes `ESC[?7l` at setup, next to the eager mouse
+capture, `ESC[?7h` in the ordered restore, and re-asserts the `?7l` on unpark after a
+Ctrl+Z/`fg` — without that last one a single suspend cycle would drop it for the rest of
+the run, and nothing in gutter checks the mode again. Like mouse capture it is a
+host-side mode gutter sets for itself, and nothing about it is relayed in either
+direction, so ADR-022 is confirmed rather than contradicted: the child's own DECAWM
+stays inside the band's `W`-column grid, where it belongs.
+
+Unlike DECOM and DECSTBM this one is not a precondition the rewrite depends on — it is
+damage limitation under it. Every position gutter emits is already absolute, so nothing
+in a clipped run wants the host to wrap on its behalf; what wrap-off buys is that a byte
+which does overrun the screen's last column — an overlong `clear_gutter` fill built from
+a stale width, or any future run past the edge — is clamped there instead of landing on
+the next row and marking that line soft-wrapped, where the next reflow joins the two and
+the corruption outlives the frame.
+
+The absolute-`CUP` rewrite is still required regardless. Wrap-off removes deferred wrap
+from the host, but not the disagreement the rewrite exists for: at the band's last column
+the cursor clamps at `W - 1` while the clipper's tracker has counted `W`, so a relative
+hop computed from the tracker still lands a column early. Both of ADR-014's scars — the
+`CUB` back to the cursor after a fill, and the `CUB(1)` restamp of the last cell — still
+corrupt a cell when replayed with autowrap off, which
+`the_relative_hop_scars_still_corrupt_under_autowrap_off` in `src/oracle/band.rs` holds
+in place.
+
+The teardown `ESC[?7h` is **unconditional**: gutter does not read the terminal's DECAWM
+before it turns it off, so a user whose terminal had autowrap off when gutter started
+gets it turned back on. That is the same trade the mouse eager-capture disable already
+makes ([ADR-005](0005-mouse-eager-capture-poll-gate.md)) — one enable at startup, one
+disable at teardown, no attempt to restore what was there before — and it is accepted for
+the same reason: autowrap on is what a shell expects, and querying the mode would mean a
+round trip on the startup path for a state almost nobody has set. The write is one
+best-effort step of the ADR-010 restore, placed after the mouse disable and before
+`show_cursor`, whose flush is what actually puts the restore on screen
+([ADR-023](0023-controlling-terminal-fd-model.md)).
+
 ### Why the tests did not catch the relative form
 
 The relative version of this rewrite passed every test in the repo. Neither the render
@@ -268,7 +305,7 @@ physical screen size; a new claim about where a rewritten move lands belongs the
 - `src/render.rs` — `prepare_row_into()` and the `ESC[m` prepend; `prepare_row_over_into()`
   for a row painted over cells with no baseline; the diff paint and `emit_scroll_stream()`
   build the `Placement` each run is clipped for
-- `src/terminal.rs` — `OuterTerminal::write_row`, whose contract is that a prepared run
+- `src/terminal.rs` — `OuterTerminal::set_autowrap`, and `OuterTerminal::write_row`, whose contract is that a prepared run
   is painted at the placement it was clipped for and nowhere else, and
   `OuterTerminal::newline`, which resets the SGR before it scrolls
 - `src/oracle/band.rs` — the painted-band check, the only test in the repo that can see
