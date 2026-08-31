@@ -15,7 +15,7 @@
 use std::ffi::{CStr, OsStr};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -192,10 +192,14 @@ pub fn open_tty_write() -> io::Result<(File, PathBuf)> {
 /// all with stdout redirected, and the size is the one number that positions the band
 /// and sizes the child's PTY (ADR-023).
 pub fn tty_size(tty: &File) -> io::Result<(u16, u16)> {
+    fd_size(tty.as_raw_fd())
+}
+
+fn fd_size(fd: RawFd) -> io::Result<(u16, u16)> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     // SAFETY: `TIOCGWINSZ` writes one `winsize` through the pointer it is given, and
     // the descriptor is borrowed from a live `File` for the length of the call.
-    let rc = unsafe { libc::ioctl(tty.as_raw_fd(), libc::TIOCGWINSZ as _, &mut ws) };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut ws) };
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -296,11 +300,16 @@ impl Write for TracedTty {
 
 /// The real outer terminal, backed by crossterm against the terminal
 /// [`open_tty_write`] resolved.
-pub struct CrosstermTerminal {
+pub struct CrosstermTerminal<W: Write = TracedTty> {
     /// Buffered: one `move_to` is several small writes, and unbuffered they would
     /// be several syscalls. Every write here is landed by an explicit flush — no
     /// destructor runs before `process::exit` (ADR-010).
-    out: BufWriter<TracedTty>,
+    out: BufWriter<W>,
+    /// The sink's descriptor, captured at construction — the size and termios
+    /// ioctls need one, and a writer that is not a terminal has none.
+    fd: Option<RawFd>,
+    /// What `terminal_size` answers when the sink is not a terminal.
+    size_override: Option<(u16, u16)>,
     /// Whether mouse capture was enabled at startup, so teardown disables only
     /// what it set.
     mouse_enabled: bool,
@@ -312,10 +321,30 @@ pub struct CrosstermTerminal {
     saved_termios: Option<libc::termios>,
 }
 
-impl CrosstermTerminal {
+impl CrosstermTerminal<TracedTty> {
     pub fn new(tty: File) -> Self {
+        let fd = tty.as_raw_fd();
         Self {
             out: BufWriter::new(TracedTty::new(tty)),
+            fd: Some(fd),
+            size_override: None,
+            mouse_enabled: false,
+            saved_termios: None,
+        }
+    }
+}
+
+impl<W: Write> CrosstermTerminal<W> {
+    /// The production emitters over an arbitrary sink, for the oracle's tape: no
+    /// descriptor, so the size is declared and the raw-mode calls are no-ops.
+    // Used by the oracle's Tape, which is only constructed from tests.
+    #[cfg(feature = "oracle")]
+    #[allow(dead_code)]
+    pub fn from_writer(w: W, size: (u16, u16)) -> Self {
+        Self {
+            out: BufWriter::new(w),
+            fd: None,
+            size_override: Some(size),
             mouse_enabled: false,
             saved_termios: None,
         }
@@ -327,12 +356,12 @@ impl CrosstermTerminal {
         &mut self.out
     }
 
-    fn fd(&self) -> i32 {
-        self.out.get_ref().tty.as_raw_fd()
+    fn fd(&self) -> Option<RawFd> {
+        self.fd
     }
 }
 
-impl OuterTerminal for CrosstermTerminal {
+impl<W: Write> OuterTerminal for CrosstermTerminal<W> {
     /// Raw mode on the resolved device, by `termios` rather than through crossterm.
     ///
     /// crossterm sets it on stdin when stdin is a terminal and reopens `/dev/tty`
@@ -341,7 +370,7 @@ impl OuterTerminal for CrosstermTerminal {
     /// on the device, not on the descriptor, so setting them through the band's sink is
     /// what the read side sees too (ADR-023).
     fn enable_raw_mode(&mut self) -> io::Result<()> {
-        let fd = self.fd();
+        let Some(fd) = self.fd() else { return Ok(()) };
         let mut termios = current_termios(fd)?;
         if self.saved_termios.is_none() {
             self.saved_termios = Some(termios);
@@ -364,7 +393,11 @@ impl OuterTerminal for CrosstermTerminal {
     }
 
     fn terminal_size(&mut self) -> io::Result<(u16, u16)> {
-        tty_size(&self.out.get_ref().tty)
+        match (self.size_override, self.fd) {
+            (Some(size), _) => Ok(size),
+            (None, Some(fd)) => fd_size(fd),
+            (None, None) => Err(io::Error::other("no terminal to size")),
+        }
     }
 
     fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
@@ -494,9 +527,9 @@ impl OuterTerminal for CrosstermTerminal {
     /// what was set up (ADR-010), and restores the user's own settings rather than a
     /// canonical default.
     fn disable_raw_mode(&mut self) -> io::Result<()> {
-        match self.saved_termios {
-            Some(saved) => set_termios(self.fd(), &saved),
-            None => Ok(()),
+        match (self.saved_termios, self.fd()) {
+            (Some(saved), Some(fd)) => set_termios(fd, &saved),
+            _ => Ok(()),
         }
     }
 }
