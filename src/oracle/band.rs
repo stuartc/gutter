@@ -234,6 +234,19 @@ mod painted_band {
     /// screen. Plain text, so any width replays it faithfully.
     const PLAIN_SCROLL: &[u8] = include_bytes!("../../tests/fixtures/plain-scroll.cast");
 
+    /// The realistic, SGR-dense Claude Code baseline — the only fixture the equivalence
+    /// gate treats as primary (`gate.rs`) — and the size it was recorded at. Enters the
+    /// alt screen in its first byte (`ESC[?1049h`) and never leaves it, so it exercises
+    /// `painted_band_matches_the_child_grid_on_a_real_terminal` (the band-vs-child diff,
+    /// which is geometry-only and does not care which screen is active) but not
+    /// `nothing_is_painted_outside_the_band`'s sentinel seed (alt-screen tapes skip the
+    /// seed and fall back to an all-blank `untouched` cell, so the check still runs, just
+    /// without the shell-history sentinel) or the scroll/blank-row tests, which need the
+    /// primary screen and use their own hardcoded cases regardless.
+    const CLAUDE_CODE_FLOW: &[u8] = include_bytes!("../../tests/fixtures/claude-code-flow.cast");
+    const CLAUDE_CODE_FLOW_WIDTH: u16 = 80;
+    const CLAUDE_CODE_FLOW_ROWS: u16 = 24;
+
     /// One band-on-screen case: the child stream and the geometry it is painted at.
     struct Case {
         name: &'static str,
@@ -342,6 +355,21 @@ mod painted_band {
                     base_row: 0,
                     phys_cols: 92,
                     phys_rows: WIDE_EDGE_ROWS,
+                },
+            },
+            Case {
+                // margin 0, band edge == screen edge: deferred wrap is live on the cells
+                // this check asserts, which is the configuration the rest of the suite
+                // structurally cannot reach.
+                name: "claude-code-flow fixture, full width (margin 0, band edge == screen edge)",
+                stream: CLAUDE_CODE_FLOW,
+                geom: BandGeometry {
+                    width: CLAUDE_CODE_FLOW_WIDTH,
+                    rows: CLAUDE_CODE_FLOW_ROWS,
+                    margin: 0,
+                    base_row: 0,
+                    phys_cols: CLAUDE_CODE_FLOW_WIDTH,
+                    phys_rows: CLAUDE_CODE_FLOW_ROWS,
                 },
             },
         ]
