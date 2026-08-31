@@ -255,6 +255,37 @@ fn child_exit_restores_terminal_and_propagates_code() {
     );
 }
 
+/// **Autowrap is turned off for the run and back on at teardown (ADR-010/ADR-014).**
+/// gutter disables host autowrap at setup so a byte overrunning the screen's last column
+/// is clamped rather than wrapped; a shell handed back a terminal that no longer wraps
+/// would be a visible regression, so the restore turns it on again — unconditionally,
+/// like the mouse disable (ADR-005).
+///
+/// The order is asserted on the bytes: `?7h` lands before the `?25h` whose flush is what
+/// puts the restore on screen (ADR-023), which is the same best-effort step list
+/// `disable_raw_mode` closes. Raw mode itself is a `tcsetattr` and writes nothing, so it
+/// leaves no byte to order against.
+#[test]
+fn teardown_restores_autowrap_before_the_restores_flush() {
+    let _guard = pty_guard();
+    let child = "/bin/sh -c 'printf hi; exit 0'";
+    let mut session = spawn_gutter(80, 24, &format!("--width 60 {child}"));
+
+    let bytes = drain_window(&mut session, Duration::from_secs(3));
+    let s = String::from_utf8_lossy(&bytes);
+
+    let off = s.find("\u{1b}[?7l").expect("setup must disable autowrap");
+    let on = s.rfind("\u{1b}[?7h").expect("the restore must re-enable autowrap");
+    let show = s.rfind("\u{1b}[?25h").expect("the restore must show the cursor");
+    assert!(off < on, "the restore's `?7h` must follow setup's `?7l`");
+    assert!(
+        on < show,
+        "the `?7h` must be queued before `show_cursor`'s flush, got {s:?}"
+    );
+
+    assert_eq!(wait_exit(&session, Duration::from_secs(5)), Some(0));
+}
+
 /// **Plain output survives to the primary screen (the E2 regression, ADR-012).**
 /// A plain command that only prints to the primary screen (`printf 'line1\nline2
 /// \nline3'; exit 0`, no `?1049h`): gutter must mirror the child's mode, never

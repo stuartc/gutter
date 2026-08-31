@@ -30,11 +30,15 @@ pub struct Tape {
 }
 
 impl Tape {
+    /// The tape opens with the host autowrap gutter's own setup turns off, so what the
+    /// replay sees is the terminal a real run paints on rather than a default one.
     #[must_use]
     pub fn new(cols: u16, rows: u16) -> Self {
-        Self {
+        let mut tape = Self {
             inner: CrosstermTerminal::from_writer(Vec::new(), (cols, rows)),
-        }
+        };
+        tape.set_autowrap(false).expect("a Vec sink cannot fail");
+        tape
     }
 
     /// The recorded stream.
@@ -755,6 +759,78 @@ mod painted_band {
         let mut tape = Tape::new(20, 4);
         tape.move_to(6, 2).unwrap();
         tape.write_row(b"hi").unwrap();
-        assert_eq!(tape.into_bytes(), b"\x1b[3;7Hhi".to_vec());
+        assert_eq!(tape.into_bytes(), b"\x1b[?7l\x1b[3;7Hhi".to_vec());
+    }
+
+    /// A run that overruns the screen's last column stops there instead of spilling onto
+    /// the next row. Autowrap-off is the only thing standing between the two: with the
+    /// host wrapping, the overflow lands a row down, on cells the diff baseline never
+    /// repaints, and the terminal marks the line soft-wrapped so the next reflow joins it.
+    ///
+    /// The band's right edge is the screen's here, which is `--width full` and a default
+    /// `gutter claude` on a terminal no wider than the band.
+    #[test]
+    fn a_run_past_the_screens_last_column_does_not_reach_the_next_row() {
+        let (phys_cols, phys_rows) = (10u16, 3u16);
+        let mut tape = Tape::new(phys_cols, phys_rows);
+        tape.move_to(0, 1).unwrap();
+        tape.write_row(b"0123456789ABCDE").unwrap();
+        let screen = WeztermGrid::replay(&tape.into_bytes(), phys_cols, phys_rows);
+
+        assert_eq!(
+            screen.cell(1, phys_cols - 1).contents,
+            "E",
+            "the overrun must pile up on the row's last column"
+        );
+        for col in 0..phys_cols {
+            assert_eq!(
+                screen.cell(2, col).contents,
+                "",
+                "the run reached the row below at column {col}"
+            );
+        }
+    }
+
+    /// The relative-hop scars ADR-014 records still corrupt a cell under the autowrap-off
+    /// replay, so the absolute-`CUP` rewrite in the clipper is still what keeps them out.
+    ///
+    /// Wrap-off removes deferred wrap from the replay, which is the condition these were
+    /// originally demonstrated under — but not the disagreement itself: the cursor clamps
+    /// at the band's last column while the clipper's tracker has counted `W`, so a `CUB`
+    /// computed from the tracker still lands a column early. Proving only that the current
+    /// correct code stays green would say nothing about whether this check can still catch
+    /// the regression it was built for.
+    #[test]
+    fn the_relative_hop_scars_still_corrupt_under_autowrap_off() {
+        let (phys_cols, phys_rows) = (10u16, 2u16);
+        let row = |run: &[u8]| {
+            let mut tape = Tape::new(phys_cols, phys_rows);
+            tape.move_to(0, 0).unwrap();
+            tape.write_row(run).unwrap();
+            let screen = WeztermGrid::replay(&tape.into_bytes(), phys_cols, phys_rows);
+            (0..phys_cols)
+                .map(|c| screen.cell(0, c).contents)
+                .collect::<String>()
+        };
+
+        // ADR-014's own case: ten glyphs to the screen's edge, then a `CUB(1)` back to
+        // restamp the last cell. The hop undershoots and takes out the `8`.
+        assert_eq!(
+            row(b"0123456789\x1b[1D9"),
+            "0123456799",
+            "the relative hop must still land a column early"
+        );
+        // The rewrite that replaced it, on the same cell.
+        assert_eq!(row(b"0123456789\x1b[1;10H9"), "0123456789");
+
+        // The erase scar the Decision originally shipped: a `W`-bounded fill from column
+        // 2 to the edge, then a `CUB` back to the tracked column. The walk back lands on
+        // column 1, and the glyph after it is shifted left.
+        assert_eq!(
+            row(b"AB        \x1b[8Dz"),
+            "Az",
+            "the fill's relative walk back must still land a column early"
+        );
+        assert_eq!(row(b"AB        \x1b[1;3Hz"), "ABz");
     }
 }
