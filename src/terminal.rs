@@ -42,6 +42,19 @@ pub trait OuterTerminal {
     ///
     /// [`disable_mouse`]: OuterTerminal::disable_mouse
     fn enable_mouse(&mut self) -> io::Result<()>;
+    /// Set the outer terminal's autowrap mode (DECAWM `?7`): `false` emits `ESC[?7l`,
+    /// `true` `ESC[?7h`. Gutter turns it off for the lifetime of a run and back on in
+    /// the ordered restore.
+    ///
+    /// A host-side mode gutter sets for itself, like mouse capture — nothing about it is
+    /// relayed to or from the child (ADR-022), which keeps its own DECAWM inside the
+    /// band's `W`-column grid. Off, a byte that runs past the screen's last column is
+    /// clamped there instead of wrapping onto the next row and soft-wrap-joining it. It
+    /// is damage limitation over the clipper's absolute rewrites (ADR-014), not a
+    /// replacement for them.
+    // Wired at setup, teardown and the suspend cycle in `feat(wrap-2)`; inert until then.
+    #[allow(dead_code)]
+    fn set_autowrap(&mut self, on: bool) -> io::Result<()>;
     /// Enter the alternate screen, mirroring the child's `?1049h` edge (ADR-012).
     /// gutter never forces the alt screen at setup; called mid-run only when the
     /// child enters it.
@@ -398,6 +411,15 @@ impl<W: Write> OuterTerminal for CrosstermTerminal<W> {
         Ok(())
     }
 
+    fn set_autowrap(&mut self, on: bool) -> io::Result<()> {
+        // Flushed: at setup nothing else is queued behind it to land it, and in the
+        // restore the ordering that matters is against the steps around it, which this
+        // preserves.
+        self.out
+            .write_all(if on { b"\x1b[?7h" } else { b"\x1b[?7l" })?;
+        self.out.flush()
+    }
+
     fn enter_alt_screen(&mut self) -> io::Result<()> {
         queue!(self.out, EnterAlternateScreen)?;
         self.out.flush()
@@ -678,6 +700,10 @@ pub mod mock {
     pub enum Call {
         EnableRawMode,
         EnableMouse,
+        /// `set_autowrap(on)` — the host DECAWM `?7` gutter sets for itself.
+        // Constructed once wrap-2's call sites exercise it through a restore-order test.
+        #[allow(dead_code)]
+        SetAutowrap(bool),
         EnterAltScreen,
         MoveTo(u16, u16),
         WriteRow(Vec<u8>),
@@ -933,6 +959,13 @@ pub mod mock {
         fn enable_mouse(&mut self) -> io::Result<()> {
             Ok(())
         }
+        fn set_autowrap(&mut self, on: bool) -> io::Result<()> {
+            // vt100 models DECAWM, so the recorded grid wraps (or clamps) as the mode
+            // says — feeding it keeps the readback honest about the band's last column.
+            self.parser
+                .process(if on { b"\x1b[?7h" } else { b"\x1b[?7l" });
+            Ok(())
+        }
         fn enter_alt_screen(&mut self) -> io::Result<()> {
             Ok(())
         }
@@ -1058,6 +1091,9 @@ pub mod mock {
             self.record(Call::EnableMouse)?;
             self.mouse_enabled = true;
             Ok(())
+        }
+        fn set_autowrap(&mut self, on: bool) -> io::Result<()> {
+            self.record(Call::SetAutowrap(on))
         }
         fn enter_alt_screen(&mut self) -> io::Result<()> {
             self.record(Call::EnterAltScreen)

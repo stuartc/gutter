@@ -54,6 +54,10 @@ impl OuterTerminal for Tape {
         self.inner.enable_mouse()
     }
 
+    fn set_autowrap(&mut self, on: bool) -> io::Result<()> {
+        self.inner.set_autowrap(on)
+    }
+
     fn enter_alt_screen(&mut self) -> io::Result<()> {
         self.inner.enter_alt_screen()
     }
