@@ -18,80 +18,60 @@
 
 use std::io;
 
-use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::queue;
-use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
-
 use super::cellview::{CellView, Grid};
 use crate::geometry::Rails;
-use crate::mouse::{MOUSE_DISABLE, MOUSE_ENABLE};
-use crate::terminal::OuterTerminal;
+use crate::terminal::{CrosstermTerminal, OuterTerminal};
 
-/// An [`OuterTerminal`] that keeps the byte stream instead of a screen: every call
-/// appends exactly what [`CrosstermTerminal`] would have written, in order, so the
-/// tape can be handed to another emulator verbatim.
-///
-/// [`CrosstermTerminal`]: crate::terminal::CrosstermTerminal
-#[derive(Default)]
+/// An [`OuterTerminal`] that keeps the byte stream instead of a screen: the
+/// production [`CrosstermTerminal`] over a `Vec<u8>`, so the tape is exactly what
+/// gutter would have written and can be handed to another emulator verbatim.
 pub struct Tape {
-    out: Vec<u8>,
-    mouse_enabled: bool,
-    /// What `terminal_size` answers — `(cols, rows)` of the physical screen the
-    /// tape is destined for.
-    size: (u16, u16),
+    inner: CrosstermTerminal<Vec<u8>>,
 }
 
 impl Tape {
     #[must_use]
     pub fn new(cols: u16, rows: u16) -> Self {
         Self {
-            size: (cols, rows),
-            ..Self::default()
+            inner: CrosstermTerminal::from_writer(Vec::new(), (cols, rows)),
         }
     }
 
     /// The recorded stream.
     #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.out
-    }
-
-    fn goto(&mut self, col: u16, row: u16) -> io::Result<()> {
-        queue!(self.out, MoveTo(col, row))
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        self.inner.flush().expect("flush the tape");
+        self.inner.into_writer()
     }
 }
 
 impl OuterTerminal for Tape {
     fn enable_raw_mode(&mut self) -> io::Result<()> {
-        Ok(())
+        self.inner.enable_raw_mode()
     }
 
     fn enable_mouse(&mut self) -> io::Result<()> {
-        self.out.extend_from_slice(MOUSE_ENABLE);
-        self.mouse_enabled = true;
-        Ok(())
+        self.inner.enable_mouse()
     }
 
     fn enter_alt_screen(&mut self) -> io::Result<()> {
-        queue!(self.out, EnterAlternateScreen)
+        self.inner.enter_alt_screen()
     }
 
     fn terminal_size(&mut self) -> io::Result<(u16, u16)> {
-        Ok(self.size)
+        self.inner.terminal_size()
     }
 
     fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {
-        self.goto(col, row)
+        self.inner.move_to(col, row)
     }
 
     fn write_row(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.out.extend_from_slice(bytes);
-        Ok(())
+        self.inner.write_row(bytes)
     }
 
     fn newline(&mut self) -> io::Result<()> {
-        self.out.extend_from_slice(b"\x1b[m\r\n");
-        Ok(())
+        self.inner.newline()
     }
 
     fn clear_gutter(
@@ -102,95 +82,52 @@ impl OuterTerminal for Tape {
         row_start: u16,
         row_end: u16,
     ) -> io::Result<()> {
-        let band_end = margin.saturating_add(width).min(real_cols);
-        let left = b" ".repeat(margin as usize);
-        let right = b" ".repeat(real_cols.saturating_sub(band_end) as usize);
-        self.out.extend_from_slice(b"\x1b[0m");
-        for row in row_start..row_end {
-            if margin > 0 {
-                self.goto(0, row)?;
-                self.out.extend_from_slice(&left);
-            }
-            if real_cols > band_end {
-                self.goto(band_end, row)?;
-                self.out.extend_from_slice(&right);
-            }
-        }
-        Ok(())
+        self.inner
+            .clear_gutter(margin, width, real_cols, row_start, row_end)
     }
 
     fn clear_row_span(&mut self, row_start: u16, row_end: u16) -> io::Result<()> {
-        self.out.extend_from_slice(b"\x1b[0m");
-        for row in row_start..row_end {
-            queue!(self.out, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
-        }
-        Ok(())
+        self.inner.clear_row_span(row_start, row_end)
     }
 
     fn draw_rails(&mut self, rails: &Rails) -> io::Result<()> {
-        self.out.extend_from_slice(b"\x1b[0m");
-        for row in rails.row_start..rails.row_end {
-            if let Some(c) = rails.left_col {
-                self.goto(c, row)?;
-                self.out.extend_from_slice("\x1b[2m\u{258f}\x1b[0m".as_bytes());
-            }
-            if let Some(c) = rails.right_col {
-                self.goto(c, row)?;
-                self.out.extend_from_slice("\x1b[2m\u{2595}\x1b[0m".as_bytes());
-            }
-        }
-        if let Some(r) = &rails.readout {
-            self.goto(r.col, r.row)?;
-            self.out
-                .extend_from_slice(format!("\x1b[2m{}\x1b[0m", r.text).as_bytes());
-        }
-        Ok(())
+        self.inner.draw_rails(rails)
     }
 
     fn place_cursor(&mut self, col: u16, row: u16) -> io::Result<()> {
-        self.goto(col, row)
+        self.inner.place_cursor(col, row)
     }
 
     fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
-        if visible {
-            queue!(self.out, Show)
-        } else {
-            queue!(self.out, Hide)
-        }
+        self.inner.set_cursor_visible(visible)
     }
 
     fn set_cursor_shape(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.out.extend_from_slice(bytes);
-        Ok(())
+        self.inner.set_cursor_shape(bytes)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.inner.flush()
     }
 
     fn relay(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.out.extend_from_slice(bytes);
-        Ok(())
+        self.inner.relay(bytes)
     }
 
     fn leave_alt_screen(&mut self) -> io::Result<()> {
-        queue!(self.out, LeaveAlternateScreen)
+        self.inner.leave_alt_screen()
     }
 
     fn disable_mouse(&mut self) -> io::Result<()> {
-        if self.mouse_enabled {
-            self.out.extend_from_slice(MOUSE_DISABLE);
-            self.mouse_enabled = false;
-        }
-        Ok(())
+        self.inner.disable_mouse()
     }
 
     fn show_cursor(&mut self) -> io::Result<()> {
-        queue!(self.out, Show)
+        self.inner.show_cursor()
     }
 
     fn disable_raw_mode(&mut self) -> io::Result<()> {
-        Ok(())
+        self.inner.disable_raw_mode()
     }
 }
 

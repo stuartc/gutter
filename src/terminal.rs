@@ -356,6 +356,17 @@ impl<W: Write> CrosstermTerminal<W> {
         &mut self.out
     }
 
+    /// The sink itself, for the oracle's tape. Buffered writes not yet flushed are
+    /// dropped, so flush first.
+    #[cfg(feature = "oracle")]
+    #[allow(dead_code)]
+    pub fn into_writer(self) -> W {
+        match self.out.into_inner() {
+            Ok(w) => w,
+            Err(_) => panic!("the buffer was flushed"),
+        }
+    }
+
     fn fd(&self) -> Option<RawFd> {
         self.fd
     }
