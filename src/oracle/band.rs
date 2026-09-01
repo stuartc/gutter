@@ -374,9 +374,12 @@ mod painted_band {
             },
             Case {
                 // Centred: a real gutter on both sides. Strengthens
-                // `painted_band_matches_the_child_grid_on_a_real_terminal` only — see
-                // CLAUDE_CODE_FLOW's doc comment for what the other three tests can't
-                // draw from this fixture regardless of geometry.
+                // `painted_band_matches_the_child_grid_on_a_real_terminal`, and — unlike
+                // the margin-0 case above — also exercises `nothing_is_painted_outside_the_band`
+                // (alt-screen tapes aren't skipped there, just seeded with a blank
+                // `untouched` cell instead of shell-history sentinel text). See
+                // CLAUDE_CODE_FLOW's doc comment for what neither case can draw from this
+                // fixture regardless of geometry.
                 name: "claude-code-flow fixture, inset band",
                 stream: CLAUDE_CODE_FLOW,
                 geom: BandGeometry {

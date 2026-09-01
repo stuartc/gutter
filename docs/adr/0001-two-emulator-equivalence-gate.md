@@ -80,10 +80,14 @@ geometries: `margin == 0` (band edge on the screen edge, deferred wrap live on t
 asserted cells) and a centred band with real gutters either side. Both passed with
 zero corrupting cells and forced no new `.allowlist` entry. The fixture enters the
 alt screen in its first byte and never leaves it, so both cases exercise
-`painted_band_matches_the_child_grid_on_a_real_terminal` only — the band-vs-child
-diff, which does not care which screen is active — and not the containment or
-scroll checks, which either skip alt-screen tapes or run their own hardcoded cases
-regardless of what `cases()` carries.
+`painted_band_matches_the_child_grid_on_a_real_terminal` — the band-vs-child diff,
+which does not care which screen is active. The centred case also exercises
+`nothing_is_painted_outside_the_band`: alt-screen tapes are not skipped by that check,
+they just fall back to a blank `untouched` cell instead of seeding shell-history
+sentinel text. Only the margin-0 case is skipped there, for a structural reason
+unrelated to alt-screen — the band fills the screen, so there is no outside to escape
+to. Neither case reaches the scroll or blank-row-clear checks, which run their own
+hardcoded cases regardless of what `cases()` carries.
 
 ## Code anchors
 
