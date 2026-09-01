@@ -32,6 +32,16 @@ exit. A TUI that went straight to alt and never painted inline leaves nothing be
 - The hand-back fires only when `ever_painted_inline` is set, so a straight-to-alt
   TUI leaves no stray status line.
 - The status line prints only on a non-zero exit.
+- **Inline history is only meaningful at the width it was painted at.** The lines that
+  scroll off the band go into the real terminal's scrollback as ordinary lines of that
+  terminal, with the band's left margin baked in as leading blanks. Narrow the window
+  afterwards and the terminal reflows them like any other history — the margin folds,
+  the content splits — and the result looks like debris gutter painted. It did not; this
+  is the terminal doing exactly what it does to every wide line in its scrollback.
+  Nothing here is a defect and nothing changes in code, but it is the first thing to
+  rule out when a report describes mangled text *above* the band. The gutter clears'
+  own version of this hazard — a byte run reaching past the terminal's real edge — is
+  [ADR-024](0024-terminal-relative-gutter-erases.md).
 
 ## Amendment — the CPR query travels over the terminal that answers it
 

@@ -28,6 +28,7 @@ The decisions behind gutter's design. Code comments reference these by number
 | [021](0021-child-driven-mode-relay.md) | Child-driven outer keyboard modes |
 | [022](0022-absorbed-mode-mirroring.md) | Absorbed-mode mirroring by poll-diff |
 | [023](0023-controlling-terminal-fd-model.md) | One terminal, and the band never paints on stdout |
+| [024](0024-terminal-relative-gutter-erases.md) | Terminal-relative gutter erases |
 
 ## Format
 
