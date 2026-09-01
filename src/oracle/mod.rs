@@ -72,6 +72,16 @@ impl WeztermGrid {
             cols: width,
         }
     }
+
+    /// Whether the terminal marked `row` soft-wrapped — the durable half of an
+    /// overrunning run's damage, since the next reflow joins a wrapped line with the
+    /// one below it. Nothing gutter paints should ever set it.
+    #[must_use]
+    pub fn row_wrapped(&self, row: u16) -> bool {
+        self.lines
+            .get(row as usize)
+            .is_some_and(tattoy_wezterm_term::Line::last_cell_was_wrapped)
+    }
 }
 
 impl Grid for WeztermGrid {

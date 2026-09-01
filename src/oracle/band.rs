@@ -838,6 +838,47 @@ mod painted_band {
         }
     }
 
+    /// The stale-width scenario, on the emulator that models wrapping (ADR-024).
+    ///
+    /// The clear is composed believing the terminal is 130 columns wide — a centred
+    /// 80-wide band with 25-column gutters — and replayed on the 128 it has already
+    /// shrunk to mid-drag. A run of spaces sized from the believed width would spill two
+    /// cells onto the row below and leave the row soft-wrapped; the erases reach the real
+    /// edge, wherever it is, so they cannot.
+    ///
+    /// Replayed with the host's autowrap left ON, unlike every other case here. The
+    /// wrap-off belt would hide the mechanism entirely, and the question this asks is
+    /// whether the emission is safe without it.
+    #[test]
+    fn a_gutter_clear_composed_at_a_stale_width_stays_on_its_rows() {
+        let (believed, real, rows) = (130u16, 128u16, 4u16);
+        let (margin, width) = (25u16, 80u16);
+
+        let mut bytes = sentinel_fill(real, rows);
+        crate::terminal::clear_gutter_bytes(&mut bytes, margin, width, believed, 0, rows);
+        let screen = WeztermGrid::replay(&bytes, real, rows);
+
+        for row in 0..rows {
+            assert!(
+                !screen.row_wrapped(row),
+                "row {row} was left soft-wrapped, so the next reflow joins it with the \
+                 row below"
+            );
+            for col in 0..real {
+                let want = if (margin..margin + width).contains(&col) {
+                    SENTINEL
+                } else {
+                    ""
+                };
+                assert_eq!(
+                    screen.cell(row, col).contents,
+                    want,
+                    "physical cell (row {row}, col {col})"
+                );
+            }
+        }
+    }
+
     /// The relative-hop scars ADR-014 records still corrupt a cell under the autowrap-off
     /// replay, so the absolute-`CUP` rewrite in the clipper is still what keeps them out.
     ///
