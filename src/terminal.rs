@@ -175,21 +175,23 @@ pub(crate) fn clear_gutter_bytes(
     row_end: u16,
 ) {
     let band_end = margin.saturating_add(width).min(real_cols);
-    let left = b" ".repeat(margin as usize);
-    let right = b" ".repeat(real_cols.saturating_sub(band_end) as usize);
-    // Reset SGR first so the blanks are painted with the default background
-    // (a leftover colour run would tint the gutter).
+    // Reset SGR first so the erases fill with the default background (a leftover
+    // colour run would tint the gutter — both EL forms fill with the active one).
     out.extend_from_slice(b"\x1b[0m");
     for row in row_start..row_end {
-        // Left gutter: physical columns [0, margin).
+        // Left gutter: physical columns [0, margin). `ESC[1K` erases from the line
+        // start through the cursor inclusive, so the cursor sits on `margin - 1`.
         if margin > 0 {
-            cup(out, 0, row);
-            out.extend_from_slice(&left);
+            cup(out, margin - 1, row);
+            out.extend_from_slice(b"\x1b[1K");
         }
-        // Right gutter: physical columns [band_end, real_cols).
+        // Right gutter: `band_end` to the real right edge, wherever that currently is
+        // (ADR-024). A sized run would be composed from `real_cols` as gutter last read
+        // it and overrun a terminal that has since shrunk, wrapping onto the row below
+        // and marking it soft-wrapped; `ESC[K` cannot, in either direction.
         if real_cols > band_end {
             cup(out, band_end, row);
-            out.extend_from_slice(&right);
+            out.extend_from_slice(b"\x1b[K");
         }
     }
 }
@@ -639,6 +641,55 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    fn gutter_clear(margin: u16, width: u16, real_cols: u16, rows: std::ops::Range<u16>) -> Vec<u8> {
+        let mut out = Vec::new();
+        clear_gutter_bytes(&mut out, margin, width, real_cols, rows.start, rows.end);
+        out
+    }
+
+    /// The standing guard (ADR-024): nothing in a gutter clear may be sized from the
+    /// width gutter believes the terminal has. Two wildly different `real_cols`, both
+    /// past `band_end` so every branch resolves the same way, must emit the same bytes.
+    /// A fill sized from the cached width breaks this on the spot.
+    #[test]
+    fn gutter_clear_does_not_depend_on_the_believed_width() {
+        assert_eq!(
+            gutter_clear(25, 80, 130, 0..4),
+            gutter_clear(25, 80, 1000, 0..4)
+        );
+    }
+
+    /// The overrun made into a test. The emission is built believing the terminal is
+    /// 130 columns wide and replayed on one that is already 128: a 25-column space run
+    /// starting at column 105 would spill two cells onto the row below and mark this
+    /// row soft-wrapped. Content planted on the next row has to survive.
+    #[test]
+    fn a_stale_width_clear_cannot_reach_the_row_below() {
+        let mut parser = vt100::Parser::new(4, 128, 0);
+        parser.process(b"\x1b[2;1Hkeep me");
+        parser.process(&gutter_clear(24, 80, 130, 0..1));
+        let row = parser.screen().contents_between(1, 0, 1, 128);
+        assert_eq!(row.trim_end(), "keep me");
+    }
+
+    /// The shape, both gutters: an absolute move then the terminal's own erase —
+    /// `ESC[K` from `band_end` to the real right edge, `ESC[1K` from the line start
+    /// through `margin - 1` inclusive.
+    #[test]
+    fn gutter_clear_erases_relative_to_the_real_edges() {
+        assert_eq!(
+            gutter_clear(4, 80, 100, 2..3),
+            b"\x1b[0m\x1b[3;4H\x1b[1K\x1b[3;85H\x1b[K".to_vec()
+        );
+    }
+
+    /// `--width full`: no left gutter, and the band already ends at the real edge, so
+    /// there is nothing to erase and only the SGR reset goes out.
+    #[test]
+    fn a_full_width_band_clears_nothing() {
+        assert_eq!(gutter_clear(0, 100, 100, 0..3), b"\x1b[0m".to_vec());
     }
 
     /// The sink is buffered, so a queued frame reaches the terminal only when
