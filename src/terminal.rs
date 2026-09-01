@@ -162,6 +162,43 @@ pub trait OuterTerminal {
     fn disable_raw_mode(&mut self) -> io::Result<()>;
 }
 
+/// The bytes a gutter clear is made of. The one emitter: what `CrosstermTerminal`
+/// writes to the real terminal, what the oracle's tape replays, and what the recording
+/// mock reads back are the same stream by construction, so a change here cannot leave
+/// the painted-band check replaying bytes production no longer writes.
+pub(crate) fn clear_gutter_bytes(
+    out: &mut Vec<u8>,
+    margin: u16,
+    width: u16,
+    real_cols: u16,
+    row_start: u16,
+    row_end: u16,
+) {
+    let band_end = margin.saturating_add(width).min(real_cols);
+    let left = b" ".repeat(margin as usize);
+    let right = b" ".repeat(real_cols.saturating_sub(band_end) as usize);
+    // Reset SGR first so the blanks are painted with the default background
+    // (a leftover colour run would tint the gutter).
+    out.extend_from_slice(b"\x1b[0m");
+    for row in row_start..row_end {
+        // Left gutter: physical columns [0, margin).
+        if margin > 0 {
+            cup(out, 0, row);
+            out.extend_from_slice(&left);
+        }
+        // Right gutter: physical columns [band_end, real_cols).
+        if real_cols > band_end {
+            cup(out, band_end, row);
+            out.extend_from_slice(&right);
+        }
+    }
+}
+
+/// Absolute cursor position, in the same spelling crossterm's `MoveTo` emits.
+fn cup(out: &mut Vec<u8>, col: u16, row: u16) {
+    let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
+}
+
 /// Opens the terminal for writing — the band's sink — and names the device it came
 /// from, so every other handle gutter opens is opened from that same device.
 ///
@@ -455,25 +492,9 @@ impl<W: Write> OuterTerminal for CrosstermTerminal<W> {
         row_start: u16,
         row_end: u16,
     ) -> io::Result<()> {
-        let band_end = margin.saturating_add(width).min(real_cols);
-        let left = b" ".repeat(margin as usize);
-        let right = b" ".repeat(real_cols.saturating_sub(band_end) as usize);
-        // Reset SGR first so the blanks are painted with the default background
-        // (a leftover colour run would tint the gutter).
-        self.out.write_all(b"\x1b[0m")?;
-        for row in row_start..row_end {
-            // Left gutter: physical columns [0, margin).
-            if margin > 0 {
-                queue!(self.out, MoveTo(0, row))?;
-                self.out.write_all(&left)?;
-            }
-            // Right gutter: physical columns [band_end, real_cols).
-            if real_cols > band_end {
-                queue!(self.out, MoveTo(band_end, row))?;
-                self.out.write_all(&right)?;
-            }
-        }
-        Ok(())
+        let mut bytes = Vec::new();
+        clear_gutter_bytes(&mut bytes, margin, width, real_cols, row_start, row_end);
+        self.out.write_all(&bytes)
     }
 
     fn clear_row_span(&mut self, row_start: u16, row_end: u16) -> io::Result<()> {
@@ -993,20 +1014,11 @@ pub mod mock {
             row_start: u16,
             row_end: u16,
         ) -> io::Result<()> {
-            // Paint blanks over the physical gutter columns, as the real terminal
-            // would, so the readback sees them cleared.
-            let band_end = margin.saturating_add(width).min(real_cols);
-            self.parser.process(b"\x1b[0m");
-            for row in row_start..row_end {
-                if margin > 0 {
-                    self.goto(0, row);
-                    self.parser.process(&b" ".repeat(margin as usize));
-                }
-                if real_cols > band_end {
-                    self.goto(band_end, row);
-                    self.parser.process(&b" ".repeat((real_cols - band_end) as usize));
-                }
-            }
+            // Feed the production emitter's own bytes through the physical parser, so
+            // the readback sees exactly what the real terminal would.
+            let mut bytes = Vec::new();
+            super::clear_gutter_bytes(&mut bytes, margin, width, real_cols, row_start, row_end);
+            self.parser.process(&bytes);
             Ok(())
         }
         fn clear_row_span(&mut self, row_start: u16, row_end: u16) -> io::Result<()> {
