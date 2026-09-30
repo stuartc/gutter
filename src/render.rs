@@ -139,7 +139,7 @@ pub struct Renderer {
     /// keyboard-protocol report (ADR-021). Such a mode reports a key as a press, any
     /// repeats and a release, so consuming only the press hands the child a key-up with
     /// no key-down, which is the very state it turned event reporting on to track. One
-    /// slot: a key's reports arrive together, and any other key clears it.
+    /// slot: a key's reports arrive together, and any other escape sequence clears it.
     consumed_press: Option<u32>,
 }
 
@@ -6467,14 +6467,13 @@ mod resize {
     }
 
     /// ADR-008: one resize tells `master.resize` the band width `W`, once, and leaves
-    /// the parser at `(rows, W)`. The order is `ordering_pty_resize_precedes_set_size`.
+    /// the parser at `(rows, W)`. `ordering_pty_resize_precedes_set_size` checks the order.
     #[test]
-    fn ordering_master_resize_then_set_size() {
+    fn resize_tells_pty_w_and_parser_rows_w() {
         let mut r = renderer(80, 24, 80, Layout::Center, Width::Cols(80));
         let resizer = RecResizer::default();
         let mut term = MockTerminal::new();
 
-        // The grid is still at the OLD size when handle_resize starts; capture it.
         assert_eq!(r.parser.screen().size(), (24, 80));
         handle_resize(&mut r, &resizer, &mut term, 100, 30);
 
