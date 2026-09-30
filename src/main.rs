@@ -237,10 +237,11 @@ fn run() -> i32 {
         eprintln!("gutter: failed to enable mouse capture: {e}");
     }
 
-    // Host autowrap off for the run (ADR-014's amendment): gutter positions every row
-    // absolutely and never wants the outer terminal to wrap on its behalf, so a byte
-    // that overruns the screen's last column is clamped there rather than wrapping onto
-    // the next row and marking it soft-wrapped. The ordered restore turns it back on.
+    // Host autowrap off for the run (ADR-014, "What the absolute coordinate assumes"):
+    // gutter positions every row absolutely and never wants the outer terminal to wrap
+    // on its behalf, so a byte that overruns the screen's last column is clamped there
+    // rather than wrapping onto the next row and marking it soft-wrapped. The ordered
+    // restore turns it back on.
     if let Err(e) = terminal.set_autowrap(false) {
         eprintln!("gutter: failed to disable autowrap: {e}");
     }

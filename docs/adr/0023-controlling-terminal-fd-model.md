@@ -34,7 +34,7 @@ Three consequences, all measured rather than theorised:
 
 ## Decision
 
-**One terminal.** Every side gutter has on the outer terminal goes through one device
+**One terminal.** Everything gutter does on the outer terminal goes through one device
 — `/dev/tty`, the controlling terminal, or, when the process has none, the terminal its
 own stdio names (*the terminal gutter's stdio names* below) — and stdout is never
 written.
@@ -58,8 +58,8 @@ read side sees too.
 gutter never writes stdout, and reads stdin in no code of its own — with no controlling
 terminal it asks its three standard descriptors for a name and nothing more. stderr
 carries gutter's own diagnostics — the startup refusal, a keyboard that would not open,
-and a failed clipboard write — never the child's output, which goes to its PTY and
-reaches the screen only as band paint.
+and the handful of setup and clipboard failures it reports and carries on past — never
+the child's output, which goes to its PTY and reaches the screen only as band paint.
 
 **The write open is the guard.** A terminal that opens for writing is a terminal gutter
 can paint on, so there is no separate `isatty` check to write and no way for the check
@@ -117,11 +117,11 @@ All three descriptors are asked, stdin first, where tmux asks only stdin. A laun
 attaches a PTY normally puts it on all three and stdin answers; a supervisor that pipes
 gutter's input — `setsid sh -c 'true | gutter bash'` — leaves a usable screen on 1 or 2
 and nothing on 0, and refusing there would be refusing a terminal gutter can see. Asking
-the other two costs two `ttyname_r` calls. It only became reachable once raw mode moved
-off crossterm's stdin-first path: a run with a pipe on stdin resolved and painted, then
-failed to go raw and refused anyway.
+the other two costs two `ttyname_r` calls. It depends on raw mode being taken on the
+resolved device (below): crossterm's stdin-first raw mode would find the pipe, fall back
+to the `/dev/tty` open that already failed, and refuse the run anyway.
 
-Reopening by name is load-bearing, not incidental. `dup(0)` would hand back the
+Reopening by name matters. `dup(0)` would hand back the
 caller's own file description, shared offset and flags and all; a fresh `open` is an
 independent one, which is what ADR-004's separate-open rule and the probe/Thread-3
 sharing rule both assume. Every open carries `O_NOCTTY`, which means nothing on
@@ -162,8 +162,8 @@ case above; it is left as tmux's behaviour, not gutter's.
   gutter prints one line and exits 1 **before** the child is spawned. There is no
   half-started run to clean up and no child left behind.
 - `setsid gutter bash`, and any launcher that hands over a PTY without `TIOCSCTTY` from
-  outside a terminal session, starts and paints on that PTY. The old `dup(0)` fallback
-  in `open_input_tty` is still gone; what replaces it is a whole terminal, resolved by
+  outside a terminal session, starts and paints on that PTY. It does not come back
+  as the old `dup(0)` fallback in `open_input_tty`; what stands in its place is a whole terminal, resolved by
   name and used for the sink, the keyboard and the clipboard alike, so the two-handle
   disagreement this record exists to remove cannot come back through it.
 - The degraded "keyboard input is disabled" branch survives, on a narrower trigger: the
@@ -172,7 +172,7 @@ case above; it is left as tmux's behaviour, not gutter's.
 - The clipboard's separateness (ADR-004) survives unchanged, but its rule is now
   stated correctly: a distinct **open**, not a fd that differs from stdout.
 - The size is read off the sink's own descriptor, so it cannot answer for a terminal the
-  band is not on, and `80×24` is reached only when that ioctl itself fails. `setsid`, a
+  band is not on, and `80×24` is reached only when that ioctl fails or reports a zero dimension. `setsid`, a
   200×50 terminal on stdin, stdout to a file, `--width 40 --center`: the band centres for
   200 columns and the child gets 50 rows. Under crossterm's resolution the same run
   centred for 80 and gave the child 24.
@@ -220,8 +220,8 @@ The carve-out is deliberate rather than tolerated. A stamp asked for by name is 
 program's output, not a frame, and `gutter --version | …` has to work the way every
 other tool's does; sending it to stderr instead would keep the letter of "never
 stdout" and break the thing the flag is for. The rule the rest of this record turns
-on is narrower and unchanged: **once gutter is running a child, the band and every
-other side it has on the terminal go to the resolved device, and stdout is never
+on is narrower and unchanged: **once gutter is running a child, the band and everything
+else it does on the terminal go to the resolved device, and stdout is never
 written.** `gutter cmd > log` still paints on screen and leaves the log empty.
 
 ## Code anchors

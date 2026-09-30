@@ -13,9 +13,9 @@
 //! sent to an orphaned group — verified empirically: a child that runs
 //! `kill -TSTP $$` here never stops (it prints straight through). `SIGSTOP` is
 //! *not* subject to that rule, always stops, and gutter's design reacts to every
-//! stop signal identically (`WSTOPSIG` is carried for logging only — see the
-//! ADR-0019 edge-case table), so `kill -STOP $$` is a faithful, deterministic
-//! trigger for the exact same suspend path a real `Ctrl-Z` drives.
+//! stop signal identically (`WSTOPSIG` is carried for logging only — see
+//! ADR-018), so `kill -STOP $$` is a faithful, deterministic trigger for the
+//! exact same suspend path a real `Ctrl-Z` drives.
 //!
 //! **2. gutter's own `suspend_self` (`kill(0, SIGTSTP)`) is a no-op here, so we
 //! assert on the emitted park/resume bytes, not on a real `WaitStatus::Stopped`.**

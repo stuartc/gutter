@@ -1722,7 +1722,7 @@ where
     let _ = park(renderer, term);
 
     // Step 4 — stop gutter's own process group. THE WHOLE PROCESS STOPS HERE until
-    // the shell `fg`s it; all four threads freeze at this call site.
+    // the shell `fg`s it; all five threads freeze at this call site.
     suspender.suspend_self();
 
     // Step 5 — unpark (resume, inverse order, raw mode FIRST).
@@ -1959,7 +1959,7 @@ fn relay_write<T: OuterTerminal>(
 
 /// Re-enter raw mode on resume, retrying a bounded number of times on `EINTR`: the
 /// `tcsetattr` inside `enable_raw_mode` can be interrupted by the SIGCONT that woke
-/// gutter (open question #3, ADR-0019).
+/// gutter (ADR-0019, "Raw mode dropped last, re-taken first").
 fn retry_enable_raw<T: OuterTerminal>(term: &mut T) -> std::io::Result<()> {
     for _ in 0..4 {
         match term.enable_raw_mode() {
@@ -6356,7 +6356,7 @@ mod resize {
     use std::cell::RefCell;
 
     /// A recording [`PtyResizer`] capturing each `master.resize(cols, rows)` in order.
-    /// The ADR-008 gate asserts `master.resize` preceded `set_size`.
+    /// The ADR-008 test checks what the PTY was told and where the parser ended up.
     #[derive(Default)]
     struct RecResizer {
         calls: RefCell<Vec<(u16, u16)>>,
@@ -6380,9 +6380,10 @@ mod resize {
         Renderer::new(width, rows, real_cols, layout, cfg, Box::new(std::io::sink()), 0)
     }
 
-    /// Resize ordering (ADR-008 gate). Drive one resize and assert `master.resize` was
-    /// recorded before `set_size` ran, both inside the one `handle_resize` invocation, and
-    /// that `set_size` left the parser at the band width `W`.
+    /// Resize ordering (ADR-008). Drive one resize and assert `master.resize` was told
+    /// the band width `W`, once, inside the one `handle_resize` invocation, and that
+    /// `set_size` left the parser at `(rows, W)`. The order between the two is held by
+    /// the handler body, not observed here.
     #[test]
     fn ordering_master_resize_then_set_size() {
         let mut r = renderer(80, 24, 80, Layout::Center, Width::Cols(80));
@@ -6487,7 +6488,7 @@ mod resize {
     /// Mid-burst case C — physical gutter has no stale cells. Paint a wide left-aligned
     /// frame in the alt screen, then resize so the band shrinks and the margin moves;
     /// after the gutter clear + repaint, every physical cell outside the band must be
-    /// blank. Proves the explicit gutter clear (ADR-008 step 4 / ADR-016) — the
+    /// blank. Proves the explicit gutter clear (ADR-008 step 5 / ADR-016) — the
     /// `rows_diff` repaint alone touches only `[margin, margin+W)`.
     #[test]
     fn mid_burst_case_c_physical_gutter_clear() {

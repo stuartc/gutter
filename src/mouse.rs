@@ -2,8 +2,8 @@
 //! child expects, or a decision to drop it. See ADR-005.
 //!
 //! Pure — no I/O, no terminal, no channel. The render loop reads the child's live
-//! `(mode, encoding)` from the screen each frame and passes them in; that poll is
-//! the only mirror point, because the child's mode-set escapes are absorbed into
+//! `(mode, encoding)` from the screen for each report and passes them in; that
+//! read is the only mirror point, because the child's mode-set escapes are absorbed into
 //! vt100's screen state and never reach a callback we can hook.
 //!
 //! The reports arrive from gutter's own scanner (ADR-020). gutter forces the
@@ -39,7 +39,7 @@ pub enum MouseDecision {
     /// motion event filtered out by the child's granularity).
     Swallow,
     /// A reporting mode with a non-Sgr encoding — out of v1 scope. The render
-    /// loop turns this into a loud abort rather than emitting malformed bytes.
+    /// loop drops the report rather than emitting malformed bytes.
     BailNonSgr,
 }
 

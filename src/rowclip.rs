@@ -824,7 +824,7 @@ mod tests {
     ///
     /// This is vt100 checked against vt100 — the run is vt100-composed and the cells it
     /// is measured against are the same parser's. It says the tracker and vt100 agree
-    /// about the run's own accounting, and by ADR-001's amendment it cannot say anything
+    /// about the run's own accounting, and by ADR-001's first amendment it cannot say anything
     /// about where the bytes land on a real terminal. That claim only comes from the
     /// painted-band check in `src/oracle/band.rs`.
     #[test]
