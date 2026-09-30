@@ -31,9 +31,14 @@ the child was told before any byte the child writes in reply is processed.
 ## Consequences
 
 - `resizer.resize()` runs before `set_size()`, and `PtyResizer` is always told the
-  band width `W`, never the real width. The recording resizer in the resize tests
-  checks the PTY was told `W` and the parser ended at `(rows, W)`; the order itself
-  is held by the handler body.
+  band width `W`, never the real width. Both live in one helper,
+  `resize_pty_then_grids`, which `handle_resize` and `apply_resize_step` share.
+  `ordering_pty_resize_precedes_set_size` enforces the order: its resizer panics,
+  and the parser and scroll tracker must still be at the old size. That pins source
+  order within one dispatch turn, which nothing inside the turn can observe; the
+  promise the rest of gutter relies on is that both sizes have changed before the
+  next message is handled. `ordering_master_resize_then_set_size` checks the PTY
+  was told `W` and the parser ended at `(rows, W)`.
 - `set_size(rows, cols)` takes its arguments in the opposite order to the PTY size
   `(cols, rows)` — the transposition is an easy copy-paste trap, hence the explicit
   note.
@@ -46,8 +51,9 @@ the child was told before any byte the child writes in reply is processed.
 
 ## Code anchors
 
-- `src/render.rs` — `handle_resize`, `apply_resize_step`, and the `resize` test module
-  (`ordering_master_resize_then_set_size`, the `mid_burst_case_*` tests)
+- `src/render.rs` — `handle_resize`, `apply_resize_step`, `resize_pty_then_grids`,
+  and the `resize` test module (`ordering_pty_resize_precedes_set_size`,
+  `ordering_master_resize_then_set_size`, the `mid_burst_case_*` tests)
 - `src/pty.rs` — the `PtyResizer` trait and the production `MasterResizer`
 
 Proportional recompute is [ADR-011](0011-width-resolution.md).

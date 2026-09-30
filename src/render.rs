@@ -307,7 +307,7 @@ enum Flow {
 /// assert "key bytes reached the PTY-master mock within one frame" against a
 /// recording `Vec<u8>` with no real child. The `PtyResizer` and outer terminal
 /// are injected for the same reason — the resize handler is driven against a
-/// recording mock that captures the `master.resize` / `set_size` call order.
+/// recording mock that captures what `master.resize` was told.
 fn dispatch<P, R, T>(
     msg: Msg,
     renderer: &mut Renderer,
@@ -455,14 +455,8 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
     // Step 0 — recompute W (identity for an absolute width).
     let w = geometry::resolve_width(renderer.width_config, cols);
 
-    // Step 1 — resize the PTY FIRST: cols = band width W, NEVER real_cols.
-    let _ = resizer.resize(w, rows);
-
-    // Step 2 — resize the parser screen IMMEDIATELY, same turn. (rows, cols).
-    renderer.parser.screen_mut().set_size(rows, w);
-    // The tracker carries the child's screen state, region and alt flag included
-    // (ADR-013), so it is resized alongside the live parser and never rebuilt.
-    renderer.scroll_tracker.screen_mut().set_size(rows, w);
+    // Steps 1-2 — PTY first, then the parser and scroll tracker.
+    resize_pty_then_grids(renderer, resizer, w, rows);
 
     // Update the live geometry.
     renderer.width = w;
@@ -602,6 +596,19 @@ pub(crate) fn clear_resize_overlay<T: OuterTerminal>(
     repaint_margins(renderer, term, false)
 }
 
+/// The ADR-008 core shared by `handle_resize` and `apply_resize_step`: tell the PTY
+/// it is `w × rows` (always the band width, never the real width), then resize the
+/// parser and the scroll tracker to match in the same turn. `set_size` takes
+/// `(rows, cols)`, the reverse of the PTY's `(cols, rows)`.
+///
+/// The tracker carries the child's screen state, region and alt flag included
+/// (ADR-013), so it is resized alongside the live parser and never rebuilt.
+fn resize_pty_then_grids<R: PtyResizer>(renderer: &mut Renderer, resizer: &R, w: u16, rows: u16) {
+    let _ = resizer.resize(w, rows);
+    renderer.parser.screen_mut().set_size(rows, w);
+    renderer.scroll_tracker.screen_mut().set_size(rows, w);
+}
+
 /// Apply one resize-mode step: change the band width by `delta` units, holding
 /// real_cols fixed, in the ADR-008 order. PRD 0001 §"Resize implementation shape".
 ///
@@ -626,11 +633,8 @@ fn apply_resize_step<R: PtyResizer, T: OuterTerminal>(
     // baseline reset), but still refresh the overlay so the readout stays consistent.
     let changed = w != renderer.width;
     if changed {
-        // Step 1 — PTY first, cols = W, never real_cols.
-        let _ = resizer.resize(w, rows);
-        // Step 2 — parser, same turn. (rows, cols).
-        renderer.parser.screen_mut().set_size(rows, w);
-        renderer.scroll_tracker.screen_mut().set_size(rows, w);
+        // Steps 1-2 — PTY first, then the parser and scroll tracker.
+        resize_pty_then_grids(renderer, resizer, w, rows);
         // Step 3 — live geometry (real_cols unchanged).
         renderer.width = w;
         renderer.left_margin = geometry::margin(renderer.layout, real, w);
@@ -6439,7 +6443,6 @@ mod resize {
     use std::cell::RefCell;
 
     /// A recording [`PtyResizer`] capturing each `master.resize(cols, rows)` in order.
-    /// The ADR-008 test checks what the PTY was told and where the parser ended up.
     #[derive(Default)]
     struct RecResizer {
         calls: RefCell<Vec<(u16, u16)>>,
@@ -6463,10 +6466,8 @@ mod resize {
         Renderer::new(width, rows, real_cols, layout, cfg, Box::new(std::io::sink()), 0)
     }
 
-    /// Resize ordering (ADR-008). Drive one resize and assert `master.resize` was told
-    /// the band width `W`, once, inside the one `handle_resize` invocation, and that
-    /// `set_size` left the parser at `(rows, W)`. The order between the two is held by
-    /// the handler body, not observed here.
+    /// ADR-008: one resize tells `master.resize` the band width `W`, once, and leaves
+    /// the parser at `(rows, W)`. The order is `ordering_pty_resize_precedes_set_size`.
     #[test]
     fn ordering_master_resize_then_set_size() {
         let mut r = renderer(80, 24, 80, Layout::Center, Width::Cols(80));
@@ -6484,14 +6485,37 @@ mod resize {
             vec![(80, 30)],
             "master.resize(cols=W=80, rows=30) recorded once"
         );
-        // set_size ran AFTER (the grid is now at the new size). If set_size had
-        // run before master.resize, the recorded resize would have observed a
-        // different state — the ordering is enforced by the handler body, and
-        // this asserts the post-state the ordered turn produced.
         assert_eq!(
             r.parser.screen().size(),
             (30, 80),
             "set_size left the parser at (rows=30, cols=W=80)"
+        );
+    }
+
+    /// ADR-008 order: a resizer that panics stops `handle_resize` at the PTY call, so
+    /// the parser and scroll tracker must still be at the old size. Were `set_size` to
+    /// run first, both would already be at `(30, 80)`.
+    #[test]
+    fn ordering_pty_resize_precedes_set_size() {
+        struct PanicResizer;
+        impl PtyResizer for PanicResizer {
+            fn resize(&self, _: u16, _: u16) -> Result<(), String> {
+                panic!("stop at the PTY resize");
+            }
+        }
+        let mut r = renderer(80, 24, 80, Layout::Center, Width::Cols(80));
+        let mut term = MockTerminal::new();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_resize(&mut r, &PanicResizer, &mut term, 100, 30);
+        }));
+
+        assert!(result.is_err(), "the resizer was reached");
+        assert_eq!(r.parser.screen().size(), (24, 80), "parser untouched before the PTY resize");
+        assert_eq!(
+            r.scroll_tracker.screen().size(),
+            (24, 80),
+            "scroll tracker untouched before the PTY resize"
         );
     }
 
