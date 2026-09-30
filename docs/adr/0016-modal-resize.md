@@ -42,10 +42,17 @@ Supporting choices:
   must not count as a second press, or the mode would toggle straight back out on
   key-up. kitty carries the event type as a sub-parameter of the *modifier* field, not
   the key field, so the release is `ESC[92;5:3u`, and the matcher accepts press forms
-  only. The release that follows a press gutter consumed is swallowed too, so the
-  child never gets the second half of a key it never saw. Step keys act on repeats
-  (hold `h` to keep shrinking), which needs no code: an auto-repeating legacy key
-  simply sends its byte again.
+  only. Step keys act on repeats (hold `h` to keep shrinking): an auto-repeating
+  legacy key sends its byte again, and a kitty repeat report (`:2`) reduces to the
+  same byte as its press, so it steps too.
+- **A consumed press owes the child nothing.** gutter remembers the key of the last
+  report press it consumed, so the child never gets the rest of a key it never saw.
+  That key's release (`:3`) is swallowed and settles it. Its repeats are swallowed
+  out of the mode and leave it owed; in the mode they reach the classifier and step
+  (or are swallowed) the same way. Any other key clears it. So a key held across the
+  mode's edge stays with gutter until key-up: a step key released after the idle
+  exit, an `Esc` held to leave, and a chord held from outside the mode, whose
+  repeats land in the mode as unrecognised keys and are swallowed.
 - **Unit-preserving steps.** `step_width` nudges a `Width` in its own unit — columns
   for `Cols`, percent for `Percent` — and never converts between them. A `Cols` step
   starts from the effective width and is clamped to `[MIN_W, real_cols]`, but the

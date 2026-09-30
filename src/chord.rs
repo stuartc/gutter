@@ -79,7 +79,8 @@ impl Chord {
         if self.legacy_bytes().is_some_and(|b| b == unit) {
             return true;
         }
-        csi_key(unit).is_some_and(|k| k.code == code && k.mods == self.mods && k.press)
+        csi_key(unit)
+            .is_some_and(|k| k.code == code && k.mods == self.mods && k.event == KeyEvent::Press)
     }
 
     /// The classic byte form, when the modifier set has one. A Shift chord has
@@ -139,9 +140,16 @@ pub struct CsiKey {
     pub code: u32,
     /// `SHIFT | ALT | CTRL`, decoded from the wire parameter's `1 + mask`.
     pub mods: u8,
-    /// Whether this is a press. Absent or `1` is a press; `2` (repeat) and `3`
-    /// (release) are not.
-    pub press: bool,
+    pub event: KeyEvent,
+}
+
+/// The kitty event sub-parameter: absent or `1` is a press, `2` a repeat, `3` a
+/// release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyEvent {
+    Press,
+    Repeat,
+    Release,
 }
 
 impl CsiKey {
@@ -176,18 +184,20 @@ pub fn csi_key(unit: &[u8]) -> Option<CsiKey> {
         let mut fields = body.split(|&b| b == b';');
         let code = fields.next().and_then(number)?;
         let Some(mod_field) = fields.next() else {
-            return Some(CsiKey { code, mods: 0, press: true });
+            return Some(CsiKey { code, mods: 0, event: KeyEvent::Press });
         };
         if fields.next().is_some() {
             return None;
         }
         let mut parts = mod_field.split(|&b| b == b':');
         let mods = u8::try_from(parts.next().and_then(number)?.checked_sub(1)?).ok()?;
-        let press = match parts.next() {
-            None => true,
-            Some(ev) => number(ev) == Some(1),
+        let event = match parts.next().map(number) {
+            None | Some(Some(1)) => KeyEvent::Press,
+            Some(Some(2)) => KeyEvent::Repeat,
+            Some(Some(3)) => KeyEvent::Release,
+            Some(_) => return None,
         };
-        return parts.next().is_none().then_some(CsiKey { code, mods, press });
+        return parts.next().is_none().then_some(CsiKey { code, mods, event });
     }
     let body = csi_body(unit, b'~')?;
     let fields: Vec<&[u8]> = body.split(|&b| b == b';').collect();
@@ -196,7 +206,7 @@ pub fn csi_key(unit: &[u8]) -> Option<CsiKey> {
     }
     let mods = u8::try_from(number(fields[1])?.checked_sub(1)?).ok()?;
     // modifyOtherKeys has no event sub-parameter: every report is a press.
-    Some(CsiKey { code: number(fields[2])?, mods, press: true })
+    Some(CsiKey { code: number(fields[2])?, mods, event: KeyEvent::Press })
 }
 
 /// The parameter body of a CSI sequence ending in `final_byte`.
@@ -428,10 +438,12 @@ mod tests {
 
     #[test]
     fn csi_reports_carry_the_event_type() {
-        assert!(csi_key(b"\x1b[108u").unwrap().press);
-        assert!(csi_key(b"\x1b[108;1:1u").unwrap().press);
-        assert!(!csi_key(b"\x1b[108;1:2u").unwrap().press, "a repeat is not a press");
-        assert!(!csi_key(b"\x1b[108;1:3u").unwrap().press, "a release is not a press");
+        let event = |unit: &[u8]| csi_key(unit).map(|k| k.event);
+        assert_eq!(event(b"\x1b[108u"), Some(KeyEvent::Press));
+        assert_eq!(event(b"\x1b[108;1:1u"), Some(KeyEvent::Press));
+        assert_eq!(event(b"\x1b[108;1:2u"), Some(KeyEvent::Repeat));
+        assert_eq!(event(b"\x1b[108;1:3u"), Some(KeyEvent::Release));
+        assert_eq!(event(b"\x1b[108;1:4u"), None, "no such event type");
     }
 
     #[test]

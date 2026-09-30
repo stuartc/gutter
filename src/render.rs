@@ -14,7 +14,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use crate::callbacks::GutterCallbacks;
-use crate::chord::{self, Chord};
+use crate::chord::{self, Chord, KeyEvent};
 use crate::clock::{Clock, Recv};
 use crate::geometry::{self, Layout, Width};
 use crate::modes::ModeMirror;
@@ -136,10 +136,10 @@ pub struct Renderer {
     /// the mirrored child cursor while the resize overlay owns the band.
     resize_active: bool,
     /// The codepoint of a key whose press gutter consumed, when that press arrived as a
-    /// keyboard-protocol report (ADR-021). Such a mode reports a key twice — press and
-    /// release — so consuming only the press hands the child a key-up with no key-down,
-    /// which is the very state it turned event reporting on to track. One slot: a key's
-    /// two reports arrive together, and the next sequence clears it either way.
+    /// keyboard-protocol report (ADR-021). Such a mode reports a key as a press, any
+    /// repeats and a release, so consuming only the press hands the child a key-up with
+    /// no key-down, which is the very state it turned event reporting on to track. One
+    /// slot: a key's reports arrive together, and any other key clears it.
     consumed_press: Option<u32>,
 }
 
@@ -201,22 +201,36 @@ impl Renderer {
         }
     }
 
-    /// Whether `unit` is the follow-up report gutter owes a press it consumed — a
-    /// release or a repeat of the same key — and clear the slot either way, so a
-    /// consumed press never shadows more than the reports that came with it.
-    fn owed_key_report(&mut self, unit: &[u8]) -> bool {
-        match (self.consumed_press.take(), chord::csi_key(unit)) {
-            (Some(code), Some(key)) => key.code == code && !key.press,
-            _ => false,
+    /// Whether `unit` is a follow-up report gutter owes a press it consumed, and so is
+    /// swallowed. The release settles the debt. A repeat out of resize mode is
+    /// swallowed and leaves it owed; in the mode a repeat is not owed here, so it
+    /// reaches the classifier and steps like an auto-repeated byte, and the slot
+    /// stays for the release. Any other unit clears the slot.
+    fn owed_key_report(&mut self, unit: &[u8], in_mode: bool) -> bool {
+        let Some(code) = self.consumed_press else {
+            return false;
+        };
+        match chord::csi_key(unit) {
+            Some(key) if key.code == code && key.event == KeyEvent::Repeat => !in_mode,
+            Some(key) if key.code == code && key.event == KeyEvent::Release => {
+                self.consumed_press = None;
+                true
+            }
+            _ => {
+                self.consumed_press = None;
+                false
+            }
         }
     }
 
     /// Remember that gutter consumed this unit's press, so [`owed_key_report`] can
-    /// consume its release too. A unit that is not a key report leaves nothing owed.
+    /// consume its repeats and release too.
     ///
     /// [`owed_key_report`]: Renderer::owed_key_report
     fn note_consumed_press(&mut self, unit: &[u8]) {
-        self.consumed_press = chord::csi_key(unit).filter(|k| k.press).map(|k| k.code);
+        if let Some(key) = chord::csi_key(unit).filter(|k| k.event == KeyEvent::Press) {
+            self.consumed_press = Some(key.code);
+        }
     }
 
     /// Override the resize-mode enter chord (from `--resize-key`). Called once at
@@ -385,8 +399,8 @@ enum KeyAction {
 /// its own key-up cannot toggle the mode back off (ADR-016).
 ///
 /// The in-mode set is exact byte strings, no parsing. Repeats act on step keys
-/// (holding `h` keeps shrinking) automatically: an auto-repeating key simply
-/// sends its byte again, which is a fresh unit.
+/// (holding `h` keeps shrinking): an auto-repeating key sends its byte again, and
+/// a kitty repeat report reduces to the same byte as its press.
 ///
 /// A relayed keyboard mode (ADR-021) reports those keys as `CSI` sequences rather than
 /// bare bytes, so a report is first reduced to the byte the key would have sent — the
@@ -405,7 +419,9 @@ fn classify_unit(unit: &[u8], chord: &Chord, in_mode: bool) -> KeyAction {
     if Chord::ESC.matches(unit) {
         return KeyAction::Exit;
     }
-    let reduced = chord::csi_key(unit).filter(|k| k.press).and_then(|k| k.literal());
+    let reduced = chord::csi_key(unit)
+        .filter(|k| k.event != KeyEvent::Release)
+        .and_then(|k| k.literal());
     let unit: &[u8] = match &reduced {
         Some(b) => std::slice::from_ref(b),
         None => unit,
@@ -799,10 +815,10 @@ fn walk_tokens<C, T, P, R>(
             // A complete escape sequence is atomic: matched whole or forwarded
             // whole, never split into an Escape plus literal characters.
             Token::Seq(bytes) => {
-                // The release half of a press gutter already consumed. It has to be
-                // caught before the classifier, because leaving the mode is what makes
-                // the release look like an ordinary key to forward.
-                if renderer.owed_key_report(bytes) {
+                // The rest of a press gutter already consumed. It has to be caught
+                // before the classifier, because leaving the mode is what makes the
+                // release look like an ordinary key to forward.
+                if renderer.owed_key_report(bytes, resize.active()) {
                     continue;
                 }
                 match classify_unit(bytes, &renderer.resize_key, resize.active()) {
@@ -4189,6 +4205,72 @@ line two\r\n\
             ctx.send(b"l");
             assert_eq!(ctx.renderer.width, 81, "l still steps after the release");
             assert!(ctx.pty.is_empty());
+        }
+
+        /// A held step key under kitty event reporting sends one press, then repeat
+        /// reports, then a release. Every repeat is another step, as an auto-repeated
+        /// bare byte would be.
+        #[test]
+        fn a_held_step_key_keeps_stepping_on_kitty_repeats() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            ctx.send(b"\x1b[108u");
+            for _ in 0..3 {
+                ctx.send(b"\x1b[108;1:2u");
+            }
+            ctx.send(b"\x1b[108;1:3u");
+            assert_eq!(ctx.renderer.width, 84, "the press and each of three repeats step");
+            assert!(ctx.resize.active());
+            assert!(
+                ctx.pty.is_empty(),
+                "nothing reaches the child, got {:?}",
+                String::from_utf8_lossy(&ctx.pty)
+            );
+        }
+
+        /// Holding Escape to leave the mode: the press exits, and the repeats and the
+        /// release that follow belong to that consumed press, so none reach the child.
+        #[test]
+        fn a_held_exit_key_owes_the_child_nothing() {
+            let mut ctx = Ctx::new(80, 24, 200, Width::Cols(80));
+            ctx.enter();
+            ctx.send(b"\x1b[27u");
+            assert!(!ctx.resize.active(), "the Escape press exits");
+            for _ in 0..3 {
+                ctx.send(b"\x1b[27;1:2u");
+            }
+            ctx.send(b"\x1b[27;1:3u");
+            assert!(
+                ctx.pty.is_empty(),
+                "the held Escape's repeats and release must not reach the child, got {:?}",
+                String::from_utf8_lossy(&ctx.pty)
+            );
+            ctx.send(b"x");
+            assert_eq!(ctx.pty, b"x", "the next key is forwarded as normal");
+        }
+
+        /// A step key held until the mode idles out: its release arrives out of mode,
+        /// and is still owed to the press gutter consumed, not to the child.
+        #[test]
+        fn a_step_key_released_after_idle_exit_is_still_swallowed() {
+            let script = vec![
+                (0, Msg::Input(CHORD.to_vec())),
+                (0, Msg::Input(b"\x1b[108u".to_vec())),
+                (0, Msg::Input(b"\x1b[108;1:2u".to_vec())),
+                (0, Msg::Input(b"\x1b[108;1:2u".to_vec())),
+                (5000, Msg::Input(b"\x1b[108;1:3u".to_vec())),
+                (0, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+            ];
+            let (pty, renderer, code, _resizer, _term) =
+                run_with_resizer(script, 80, 24, 200, Width::Cols(80));
+
+            assert_eq!(code, Some(0));
+            assert!(
+                pty.is_empty(),
+                "the release after idle-exit must not reach the child, got {:?}",
+                String::from_utf8_lossy(&pty)
+            );
+            assert_eq!(renderer.width, 83, "the press and both repeats stepped");
         }
 
         /// A chunk can carry the chord and step keys together: the classifier

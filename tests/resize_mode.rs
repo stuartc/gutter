@@ -66,6 +66,43 @@ fn resize_key_grows_band() {
     drop(session);
 }
 
+/// **A held step key keeps stepping under kitty event reporting.** A terminal
+/// reporting event types sends a held `l` as one press, repeat reports and a
+/// release. The press and each repeat step; the release is swallowed, so the
+/// child's tty never echoes a stray report.
+#[test]
+fn held_step_key_steps_on_kitty_repeats() {
+    let child = "/bin/sh -c 'trap \"stty size\" WINCH; stty size; while true; do sleep 0.2; done'";
+    let mut session =
+        spawn_gutter(160, 40, &format!("--width 60 --left --resize-key ctrl-o {child}"));
+
+    let mut bytes = drain_window(&mut session, Duration::from_millis(500));
+
+    session.write_all(&[0x0F]).unwrap();
+    session.flush().unwrap();
+    bytes.extend(drain_window(&mut session, Duration::from_millis(100)));
+    session.write_all(b"\x1b[108u").unwrap();
+    for _ in 0..4 {
+        session.write_all(b"\x1b[108;1:2u").unwrap();
+    }
+    session.write_all(b"\x1b[108;1:3u").unwrap();
+    session.flush().unwrap();
+
+    bytes.extend(drain_window(&mut session, Duration::from_millis(900)));
+    let parser = outer_grid(&bytes, 160, 40);
+    let rows: Vec<String> = parser.screen().rows(0, 160).collect();
+    assert!(
+        rows.iter().any(|r| r.contains("40 65")),
+        "the press and four repeats: the child must report 65 columns, got {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("40 66") || r.contains("108")),
+        "no extra step and no report reaches the child, got {rows:?}"
+    );
+
+    drop(session);
+}
+
 /// **Shrink narrows the band.** Grow then shrink back down with `h`; the child's
 /// reported columns must decrease.
 #[test]
