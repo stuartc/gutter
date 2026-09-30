@@ -402,7 +402,7 @@ impl<W: Write> CrosstermTerminal<W> {
 
     /// The band's sink, for the startup CPR probe: its query has to leave by the
     /// same terminal the reply comes back from.
-    pub fn writer(&mut self) -> &mut impl Write {
+    pub fn writer(&mut self) -> &mut BufWriter<W> {
         &mut self.out
     }
 

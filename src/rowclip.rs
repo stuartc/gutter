@@ -277,10 +277,10 @@ pub fn clip_row_to_width_into(run: &[u8], w: u16, at: Placement, out: &mut Vec<u
         let len = utf8_len(b);
         let end = (i + len).min(run.len());
         let bytes = &run[i..end];
-        if let Ok(s) = std::str::from_utf8(bytes) {
-            if let Some(ch) = s.chars().next() {
-                col = col.saturating_add(ch.width().unwrap_or(0) as u16);
-            }
+        if let Ok(s) = std::str::from_utf8(bytes)
+            && let Some(ch) = s.chars().next()
+        {
+            col = col.saturating_add(ch.width().unwrap_or(0) as u16);
         }
         out.extend_from_slice(bytes);
         i = end;

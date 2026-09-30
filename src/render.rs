@@ -1498,28 +1498,28 @@ where
         // draining a PTY burst flushes this frame rather than at the burst's end.
         // Runs before the idle check because it is the cheaper one and its flushed
         // bytes may feed the mode.
-        if let Some(dl) = input.hold_deadline {
-            if clock.now() >= dl {
-                flush_hold(
-                    &mut input, clock, renderer, &mut resize, term, pty_writer, resizer,
-                );
-                // The flushed Escape may have left resize mode, whose overlay clear
-                // is only queued — render so it reaches the terminal even if the
-                // child never writes again.
-                let _ = render_once(renderer, term);
-                continue 'frames;
-            }
+        if let Some(dl) = input.hold_deadline
+            && clock.now() >= dl
+        {
+            flush_hold(
+                &mut input, clock, renderer, &mut resize, term, pty_writer, resizer,
+            );
+            // The flushed Escape may have left resize mode, whose overlay clear
+            // is only queued — render so it reaches the terminal even if the
+            // child never writes again.
+            let _ = render_once(renderer, term);
+            continue 'frames;
         }
 
         // Top-of-frame idle check (handles a flooding child that never lets Phase A
         // block): if the idle deadline has already passed, exit the mode and repaint
         // before doing anything else this frame.
-        if let Some(dl) = resize.idle_deadline {
-            if clock.now() >= dl {
-                leave_resize_mode(&mut resize, renderer, term);
-                let _ = render_once(renderer, term); // erase rails this frame
-                continue 'frames;
-            }
+        if let Some(dl) = resize.idle_deadline
+            && clock.now() >= dl
+        {
+            leave_resize_mode(&mut resize, renderer, term);
+            let _ = render_once(renderer, term); // erase rails this frame
+            continue 'frames;
         }
 
         // --- Phase A: block for the first message (zero idle CPU with no deadline
@@ -4964,10 +4964,11 @@ mod cjk {
         let (rows, _) = screen.size();
         for row in 0..rows {
             for col in 0..width {
-                if let Some(cell) = screen.cell(row, col) {
-                    if cell.is_wide() && cell.contents() == HAN {
-                        return Some((row, col));
-                    }
+                if let Some(cell) = screen.cell(row, col)
+                    && cell.is_wide()
+                    && cell.contents() == HAN
+                {
+                    return Some((row, col));
                 }
             }
         }
