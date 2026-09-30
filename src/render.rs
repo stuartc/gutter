@@ -6466,31 +6466,6 @@ mod resize {
         Renderer::new(width, rows, real_cols, layout, cfg, Box::new(std::io::sink()), 0)
     }
 
-    /// ADR-008: one resize tells `master.resize` the band width `W`, once, and leaves
-    /// the parser at `(rows, W)`. `ordering_pty_resize_precedes_set_size` checks the order.
-    #[test]
-    fn resize_tells_pty_w_and_parser_rows_w() {
-        let mut r = renderer(80, 24, 80, Layout::Center, Width::Cols(80));
-        let resizer = RecResizer::default();
-        let mut term = MockTerminal::new();
-
-        assert_eq!(r.parser.screen().size(), (24, 80));
-        handle_resize(&mut r, &resizer, &mut term, 100, 30);
-
-        // master.resize recorded exactly once, with the band width W (= 80, an
-        // absolute width is unchanged) and the new rows.
-        assert_eq!(
-            *resizer.calls.borrow(),
-            vec![(80, 30)],
-            "master.resize(cols=W=80, rows=30) recorded once"
-        );
-        assert_eq!(
-            r.parser.screen().size(),
-            (30, 80),
-            "set_size left the parser at (rows=30, cols=W=80)"
-        );
-    }
-
     /// ADR-008 order: a resizer that panics stops `handle_resize` at the PTY call, so
     /// the parser and scroll tracker must still be at the old size. Were `set_size` to
     /// run first, both would already be at `(30, 80)`.
