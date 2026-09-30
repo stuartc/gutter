@@ -39,8 +39,8 @@ jobs:
           # default shallow fetch brings down no tags at all.
           fetch-depth: 0
 
-      - name: Install Rust 1.97.1
-        uses: dtolnay/rust-toolchain@1.97.1
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@1.98.1
 
       - name: Build and upload binary
         uses: taiki-e/upload-rust-binary-action@v1
