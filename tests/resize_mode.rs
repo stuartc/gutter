@@ -20,17 +20,22 @@
 //! does not need the mode to still be on afterwards, so that limit is only met by a
 //! test starved for the whole 3 s.
 //!
+//! That idle exit takes the rails down too, so the rail going does not show that
+//! the lone Escape was what left the mode. Two tests show an Escape leaving it:
+//! `esc_exits_mode_key_reaches_child` for the lone byte, by the clock, and
+//! `swallowed_key_does_not_leak_and_mode_persists` for the `CSI 27 u` form, which
+//! needs no hold and so no clock.
+//!
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
 use std::time::{Duration, Instant};
 
 mod common;
-use common::{cell_text, leave_resize_mode, row_text, Gutter, RIGHT_RAIL, SIZE_CHILD};
+use common::{cell_text, leave_resize_mode, rails, row_text, Gutter, SIZE_CHILD};
 
-/// Whether the right rail is up at column `col` on a mid-band row — the rails are
-/// drawn across every row of the span, so any row does.
+/// Whether the right rail is up at column `col`.
 fn rail_at(s: &vt100::Screen, col: u16) -> bool {
-    cell_text(s, 10, col) == RIGHT_RAIL
+    rails(s).1 == Some(col)
 }
 
 /// Whether some row of a left-aligned band `width` columns wide holds exactly `text`.
@@ -113,6 +118,11 @@ fn held_step_key_steps_on_kitty_repeats() {
     assert!(
         !lines.iter().any(|l| l.contains("108")),
         "no report reaches the child, got {lines:?}"
+    );
+    // The child's tty is cooked: a chord byte that reached it was echoed as `^O`.
+    assert!(
+        !lines.iter().any(|l| l.contains("^O")),
+        "the chord byte must not reach the child, got {lines:?}"
     );
 }
 
@@ -204,19 +214,24 @@ fn default_chord_enters_via_raw_fs_byte() {
 
 /// A stray key while in mode is swallowed, not leaked to the child, and the
 /// mode stays active — a following `Esc` still leaves it.
+///
+/// The Escape is the `CSI 27 u` report a terminal in a relayed keyboard mode sends.
+/// Unlike the lone byte it is complete as it stands, so nothing is held and the key
+/// after it can follow at once. The three go in one write, which leaves the idle
+/// exit no part: with an Escape that did nothing the second `z` is swallowed as
+/// well, `cat` is never sent a line, and the wait below runs out.
 #[test]
 fn swallowed_key_does_not_leak_and_mode_persists() {
     let mut gutter = Gutter::spawn(120, 40, "--width 60 --resize-key ctrl-o /bin/cat");
 
     gutter.send(&[0x0F]); // enter
     gutter.wait_for("the rail at column 90", |s| rail_at(s, 90));
-    gutter.send(b"z"); // unrecognised in-mode key
-    leave_resize_mode(&mut gutter);
-
-    gutter.send(b"z\r"); // now passes through to cat
+    // An unrecognised in-mode key, the Escape, and a line that passes through to cat.
+    gutter.send(b"z\x1b[27uz\r");
     // The tty echoes what was typed on row 0 and cat writes what it read on row 1.
+    // The band starts at column 30; the rails may still share the row.
     gutter.wait_for("cat's copy of the line typed after Esc", |s| {
-        !row_text(s, 1).is_empty()
+        cell_text(s, 1, 30) == "z"
     });
 
     // Ctrl-D on an empty line ends `cat`.

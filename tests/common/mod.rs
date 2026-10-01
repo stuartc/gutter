@@ -116,22 +116,32 @@ pub const SIZE_CHILD: &str =
     "/bin/sh -c 'trap \"stty size\" WINCH; stty size; until read _; do :; done'";
 
 /// The resize-mode rails: the left one sits at `margin - 1`, the right at `band_end`.
-pub const LEFT_RAIL: &str = "\u{258f}";
-pub const RIGHT_RAIL: &str = "\u{2595}";
+const LEFT_RAIL: &str = "\u{258f}";
+const RIGHT_RAIL: &str = "\u{2595}";
 
-/// Leave resize mode, returning once the rails are gone. The caller has seen a rail
-/// up first.
+/// The columns the left and the right resize-mode rail stand in, or `None` for a
+/// rail that is not up. Read off one mid-band row: the rails are drawn across every
+/// row of the span, so any row does.
+pub fn rails(screen: &vt100::Screen) -> (Option<u16>, Option<u16>) {
+    let (_, cols) = screen.size();
+    let col_of = |rail| (0..cols).find(|&c| cell_text(screen, 10, c) == rail);
+    (col_of(LEFT_RAIL), col_of(RIGHT_RAIL))
+}
+
+/// Send a lone Escape to leave resize mode, returning once the rails are gone. The
+/// caller has seen a rail up first.
 ///
 /// In the mode every key is swallowed, and a key typed straight after the Escape
-/// would join it as Alt+<key>. The rails going shows the Escape was taken alone and
-/// keys reach the child again.
+/// would join it as Alt+<key>. Once the rails are gone the mode is off and keys
+/// reach the child again.
+///
+/// The rails going does not prove the Escape was taken: gutter leaves the mode by
+/// itself after `RESIZE_IDLE` (3 s), so with an Escape that did nothing this returns
+/// all the same, 3 s later. `resize_mode::esc_exits_mode_key_reaches_child` is the
+/// test that fails for that, and it needs a clock to do it.
 pub fn leave_resize_mode(gutter: &mut Gutter) {
     gutter.send(&[0x1b]);
-    // The rails are drawn across every row of the span, so any row does.
-    gutter.wait_for("the rails to go", |s| {
-        let row = row_text(s, 10);
-        !row.contains(LEFT_RAIL) && !row.contains(RIGHT_RAIL)
-    });
+    gutter.wait_for("the rails to go", |s| rails(s) == (None, None));
 }
 
 /// The physical column of the first painted (non-blank) cell on row 0, or `None`
@@ -192,6 +202,9 @@ const SCROLLBACK: usize = 4096;
 /// - [`Gutter::resize`] — resize the outer terminal.
 /// - [`Gutter::finish`] — read until gutter exits; returns a [`Finished`].
 ///
+/// A `Gutter` dropped before `finish` — a test that panicked, or one whose child has
+/// no way to be released — kills its gutter, so no test leaves a process behind.
+///
 /// Waiting is always reading ([`Gutter::wait_for`], [`Gutter::finish`]): there is no
 /// way to pause without draining the PTY, so gutter is never left blocked in `write`.
 ///
@@ -203,9 +216,10 @@ const SCROLLBACK: usize = 4096;
 /// lets it through with `send(b"\n")` once it has seen what came before.
 pub struct Gutter {
     master: File,
-    /// Waits for gutter and returns its exit code. Owns whatever spawned gutter, so
-    /// dropping an unfinished `Gutter` lets go of the process too.
-    exit: Box<dyn FnOnce() -> Option<i32>>,
+    pid: libc::pid_t,
+    /// Waits for gutter and returns its exit code; owns whatever spawned gutter.
+    /// `None` once gutter has been waited for.
+    exit: Option<Box<dyn FnOnce() -> Option<i32>>>,
     output: Receiver<Vec<u8>>,
     bytes: Vec<u8>,
     /// How much of `bytes` the parser has been fed.
@@ -309,19 +323,14 @@ impl Gutter {
         Self::spawn_argv_with(child_argv, |_| {})
     }
 
-    /// Take over a gutter the test started itself on a `cols × rows` terminal it
-    /// built: `master` is that terminal's master side, in blocking mode, and `exit`
-    /// waits for gutter and returns its exit code.
+    /// Take over `gutter`, which the test started itself on a `cols × rows` terminal
+    /// it built: `master` is that terminal's master side, in blocking mode.
     ///
     /// The stream only ends once every copy of the slave side is closed, so the test
     /// must have dropped its own.
-    pub fn attach(
-        master: File,
-        cols: u16,
-        rows: u16,
-        exit: impl FnOnce() -> Option<i32> + 'static,
-    ) -> Self {
-        Self::reading(master, cols, rows, exit).started()
+    pub fn attach(master: File, cols: u16, rows: u16, mut gutter: std::process::Child) -> Self {
+        let pid = gutter.id() as libc::pid_t;
+        Self::reading(master, cols, rows, pid, move || gutter.wait().ok()?.code()).started()
     }
 
     fn from_session(session: OsSession, cols: u16, rows: u16) -> Self {
@@ -329,7 +338,9 @@ impl Gutter {
             .get_process()
             .get_raw_handle()
             .expect("duplicate the outer PTY master");
-        Self::reading(master, cols, rows, move || {
+        // The session's process is gutter itself: the shell forms `exec` it.
+        let pid = session.get_process().pid().as_raw();
+        Self::reading(master, cols, rows, pid, move || {
             // The outer PTY only reaches its end once gutter has let go of it, so
             // this returns at once.
             match session.get_process().wait() {
@@ -344,6 +355,7 @@ impl Gutter {
         master: File,
         cols: u16,
         rows: u16,
+        pid: libc::pid_t,
         exit: impl FnOnce() -> Option<i32> + 'static,
     ) -> Self {
         let mut reader = master.try_clone().expect("duplicate the outer PTY master");
@@ -359,7 +371,8 @@ impl Gutter {
         });
         Gutter {
             master,
-            exit: Box::new(exit),
+            pid,
+            exit: Some(Box::new(exit)),
             output,
             bytes: Vec::new(),
             fed: 0,
@@ -419,11 +432,12 @@ impl Gutter {
         let deadline = Instant::now() + DEADLINE;
         while self.read_chunk(deadline, "gutter to exit") {}
         self.parser.process(&self.bytes[self.fed..]);
+        let exit = self.exit.take().expect("gutter is waited for once");
         Finished {
-            code: (self.exit)(),
-            bytes: self.bytes,
+            code: exit(),
+            bytes: std::mem::take(&mut self.bytes),
             screen: self.parser.screen().clone(),
-            alt_screen: self.alt_screen,
+            alt_screen: self.alt_screen.take(),
         }
     }
 
@@ -481,6 +495,16 @@ impl Gutter {
             if screen.alternate_screen() { "alternate" } else { "primary" },
             self.bytes.len(),
         )
+    }
+}
+
+impl Drop for Gutter {
+    fn drop(&mut self) {
+        if let Some(exit) = self.exit.take() {
+            // SAFETY: gutter has not been waited for, so the pid is still its own.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            exit();
+        }
     }
 }
 

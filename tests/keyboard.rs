@@ -150,11 +150,27 @@ fn bare_control_bytes_reach_the_child() {
 /// hold expires. It must still arrive, exactly once, and nothing else with it.
 #[test]
 fn a_lone_escape_reaches_the_child_after_the_hold() {
-    let text = transcript(b"\x1b", |t| t.contains("^["));
-    assert!(
-        text.contains("^["),
-        "a bare Escape must reach the child once the hold resolves it; \
-         transcript was {text:?}"
+    // The `.` goes in a second write, once the Escape has come back: sent with it,
+    // it would complete the pair `ESC .` and the hold would never be what released
+    // the Escape.
+    let mut gutter =
+        Gutter::spawn(OUTER_COLS, OUTER_ROWS, &format!("--width 100 {CARET_ECHO_CHILD}"));
+    gutter.wait_for("the child's READY", |s| s.contents().contains("READY"));
+    gutter.send(b"\x1b");
+    gutter.wait_for("the Escape, once the hold resolves it", |s| s.contents().contains("^["));
+    gutter.send(b".");
+
+    let mut text = String::new();
+    gutter.wait_for("the child's echo of the dot", |s| {
+        text = s.contents();
+        text.contains('.')
+    });
+    // The transcript is painted in order, so with the dot on screen everything the
+    // child was sent before it is too.
+    assert_eq!(
+        text.trim(),
+        "READY^[.",
+        "a bare Escape must reach the child once, with nothing else"
     );
 }
 
@@ -275,11 +291,16 @@ fn enter_reaches_child() {
 ///
 /// The shell waits in a foreground `cat` rather than in `read`: shells differ on
 /// whether a trapped signal interrupts `read`, but all of them run the trap once the
-/// foreground command the signal killed has gone. `READY` follows the `trap`, since a
-/// `0x03` that arrives before it kills the shell.
+/// foreground command the signal killed has gone.
+///
+/// `READY` is printed by the process that becomes that `cat` — a second shell that
+/// `exec`s it — so it means the thing SIGINT has to kill is running. Printed by the
+/// trapping shell itself, it comes before `cat` exists, and a `0x03` landing between
+/// the shell's fork and the exec is caught by the fork's copy of the trap and lost.
 #[test]
 fn ctrl_c_delivers_interrupt_to_child() {
-    let child = "/bin/sh -c 'trap \"printf GOTSIGINT\" INT; printf READY; cat; read _'";
+    let child = "/bin/sh -c 'trap \"printf GOTSIGINT\" INT; \
+                 /bin/sh -c \"printf READY; exec cat\"; read _'";
     let mut gutter = Gutter::spawn(OUTER_COLS, OUTER_ROWS, &format!("--width 100 {child}"));
     gutter.wait_for("the child's READY", |s| s.contents().contains("READY"));
 

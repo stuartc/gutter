@@ -6,11 +6,8 @@
 
 mod common;
 
-use std::ffi::{CStr, OsStr};
-use std::fs::{self, File, OpenOptions};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs::{self, File};
+use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -83,37 +80,35 @@ fn no_controlling_terminal_refuses_before_spawning_the_child() {
 /// terminal, so a child that only inherits the descriptor ends up with a terminal on
 /// its stdio and no controlling terminal — the shape this file's fallback test needs.
 fn pty_pair(cols: u16, rows: u16) -> (File, File) {
-    // SAFETY: each call is checked before its result is used; `ptsname`'s pointer is
-    // copied out before anything else can overwrite its static buffer, and the master
-    // fd is handed to `File` exactly once.
-    unsafe {
-        let master_fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-        assert!(master_fd >= 0, "posix_openpt failed");
-        assert_eq!(libc::grantpt(master_fd), 0, "grantpt failed");
-        assert_eq!(libc::unlockpt(master_fd), 0, "unlockpt failed");
-        let name = libc::ptsname(master_fd);
-        assert!(!name.is_null(), "ptsname failed");
-        let path = PathBuf::from(OsStr::from_bytes(CStr::from_ptr(name).to_bytes()));
-        let slave = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOCTTY)
-            .open(&path)
-            .expect("open the PTY slave");
-        let size = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        assert_eq!(
-            libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ as _, &size),
-            0,
-            "TIOCSWINSZ failed: {}",
-            std::io::Error::last_os_error()
-        );
-        (File::from_raw_fd(master_fd), slave)
+    let mut size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let (mut master, mut slave) = (-1, -1);
+    // `openpty` hands back both ends. Looking the slave up by name instead goes
+    // through `ptsname`, whose one static buffer every thread shares.
+    //
+    // macOS can fail a PTY open that races another thread's (errno -6), so a failed
+    // call is tried again. A real failure fails every time and is reported.
+    for _ in 0..20 {
+        // SAFETY: the three pointers are live for the call, and each descriptor is
+        // handed to a `File` exactly once, after the call is known to have succeeded.
+        unsafe {
+            let rc = libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            );
+            if rc == 0 {
+                return (File::from_raw_fd(master), File::from_raw_fd(slave));
+            }
+        }
     }
+    panic!("openpty failed: {}", std::io::Error::last_os_error());
 }
 
 /// A terminal on descriptors 0/1/2 that was never made the controlling terminal:
@@ -158,13 +153,13 @@ fn a_terminal_with_no_controlling_terminal_still_paints() {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().expect("spawn gutter on a PTY it does not control");
+    let child = cmd.spawn().expect("spawn gutter on a PTY it does not control");
 
     // The outer terminal's stream only ends once the test holds no copy of the slave.
     drop(cmd);
     drop(slave);
 
-    let mut gutter = Gutter::attach(master, 120, 40, move || child.wait().ok()?.code());
+    let mut gutter = Gutter::attach(master, 120, 40, child);
     gutter.wait_for("the child's output", |s| s.contents().contains("hi-no-ctty"));
     gutter.send(b"\n");
     let done = gutter.finish();
@@ -224,13 +219,13 @@ fn a_terminal_on_stdout_alone_still_paints() {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().expect("spawn gutter with a terminal on stdout only");
+    let child = cmd.spawn().expect("spawn gutter with a terminal on stdout only");
 
     // The outer terminal's stream only ends once the test holds no copy of the slave.
     drop(cmd);
     drop(slave);
 
-    let mut gutter = Gutter::attach(master, 120, 40, move || child.wait().ok()?.code());
+    let mut gutter = Gutter::attach(master, 120, 40, child);
     gutter.wait_for("the child's output", |s| s.contents().contains("hi-stdout-only"));
     gutter.send(b"\n");
     let done = gutter.finish();
