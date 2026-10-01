@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-10-01
+
+### Fixed
+
+- Rows no longer smear into each other while you drag the terminal window to resize it, and columns uncovered by making the window wider are cleared properly.
+- Output that runs past the right-hand edge of the screen now stops there instead of wrapping round and corrupting the line below.
+- Holding down a step key in resize mode keeps resizing when the program inside gutter has turned on kitty key event reporting. Before, only the first press counted.
+- Holding Esc to leave resize mode no longer sends stray key-repeat and key-release reports to the program.
+
 ## [0.4.0] - 2026-08-20
 
 ### Added
@@ -155,6 +164,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stop vim integration test leaking swap files
 - Fix loose ADR cites and width-default wording in comments
 
+[0.4.1]: https://github.com/stuartc/gutter/compare/v0.4.0..v0.4.1
 [0.4.0]: https://github.com/stuartc/gutter/compare/v0.3.1..v0.4.0
 [0.3.1]: https://github.com/stuartc/gutter/compare/v0.3.0..v0.3.1
 [0.3.0]: https://github.com/stuartc/gutter/compare/v0.2.2..v0.3.0
