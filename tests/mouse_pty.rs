@@ -4,7 +4,7 @@
 //! their coordinates carry the band's left margin, so gutter's own scanner
 //! extracts them and re-encodes (ADR-005/020). These tests assert on what the
 //! **child actually receives** — never the grid. The child is a tiny shell that
-//! negotiates SGR mouse (`CSI ?1000h ?1006h`) and then idles in line-discipline
+//! negotiates SGR mouse (`CSI ?1000h ?1006h`) and then waits for a line of input in
 //! cooked mode, where the tty driver **echoes** the bytes it receives back in
 //! caret notation (`ESC` → `^[`). So the SGR report gutter forwards shows up as
 //! visible `^[[<…M` text on the outer frame — an unambiguous child-side oracle of
@@ -27,23 +27,16 @@
 //!
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
-use std::io::Write;
-use std::time::Duration;
-
 mod common;
-use common::{drain_window, grid_text, pty_guard, screen_text, spawn_gutter, Gutter};
+use common::{screen_text, Gutter};
 
-/// A child that negotiates SGR press/release mouse, then idles. The tty driver is
-/// in cooked mode, so any bytes gutter forwards to the child's stdin are echoed
-/// back in caret notation (`ESC` → `^[`) and rendered onto gutter's band — the
-/// child-side oracle. The long `sleep` keeps the child alive so the echo stays on
-/// the live alt-screen frame the drain captures.
-const SGR_MOUSE_CHILD: &str = "/bin/sh -c 'printf \"\\033[?1000h\\033[?1006h\"; sleep 5'";
-
-/// The same child, announcing itself and then blocking on a line of input instead of
-/// idling. `READY` follows the mode requests in the one `printf`, and gutter paints
-/// only what it has already parsed, so `READY` on screen means the gate will forward.
-/// Enter ends the child; its echo is on the primary screen and survives the exit.
+/// A child that negotiates SGR press/release mouse, announces itself and then blocks
+/// on a line of input. The tty driver is in cooked mode, so any bytes gutter forwards
+/// to the child's stdin are echoed back in caret notation (`ESC` → `^[`) and rendered
+/// onto gutter's band — the child-side oracle. `READY` follows the mode requests in
+/// the one `printf`, and gutter paints only what it has already parsed, so `READY` on
+/// screen means the gate will forward. Enter ends the child; its echo is on the
+/// primary screen and survives the exit.
 const GATED_MOUSE_CHILD: &str =
     "/bin/sh -c 'printf \"\\033[?1000h\\033[?1006hREADY\"; read _'";
 
@@ -116,19 +109,17 @@ fn gutter_click_delivers_nothing() {
 /// decoded button is what loses it.
 #[test]
 fn shift_click_keeps_the_modifier_bit() {
-    let _g = pty_guard();
-    let mut session = spawn_gutter(120, 40, &format!("--width 40 --center {SGR_MOUSE_CHILD}"));
-    std::thread::sleep(Duration::from_millis(600));
+    let mut gutter = Gutter::spawn(120, 40, &format!("--width 40 --center {GATED_MOUSE_CHILD}"));
+    gutter.wait_for("the child's READY", |s| s.contents().contains("READY"));
 
-    session.write_all(b"\x1b[<4;46;5M").unwrap();
-    session.flush().unwrap();
+    gutter.send(b"\x1b[<4;46;5M");
+    gutter.wait_for("the echo of a mouse report", |s| s.contents().ends_with('M'));
+    gutter.send(b"\n");
 
-    let bytes = drain_window(&mut session, Duration::from_millis(900));
-    let text = grid_text(&bytes, 120, 40);
+    let done = gutter.finish();
+    let text = screen_text(&done.screen, 120);
     assert!(
         text.contains("^[[<4;6;5M"),
         "the shift bit must survive the margin translation; grid was {text:?}"
     );
-
-    drop(session);
 }
