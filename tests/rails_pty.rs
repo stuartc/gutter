@@ -14,7 +14,7 @@ use std::io::Write;
 use std::time::Duration;
 
 mod common;
-use common::{assert_cols_blank, drain_window, outer_grid, spawn_gutter};
+use common::{assert_cols_blank, cell_text, drain_window, outer_grid, spawn_gutter, Gutter};
 
 /// **Entering resize mode paints the rails at the band edges and a width readout in
 /// the right gutter.** A centred 60-column band in a 160-column terminal has margin
@@ -97,41 +97,34 @@ fn resize_mode_step_slides_rails() {
 }
 
 /// **Exiting the mode erases the rails and readout.** After `Esc`, the gutter
-/// columns the rails occupied are blank again. The byte stream is accumulated into
-/// ONE parser from before the enter chord through the exit — parsing only the
-/// post-Esc bytes into a fresh (already-blank) grid would pass even if the exit
-/// clear were a no-op, since a fresh vt100 grid starts blank regardless.
+/// columns the rails occupied are blank again. The screen is one parser fed from
+/// before the enter chord through gutter's exit — a fresh grid starts blank, so one
+/// fed only the bytes after `Esc` would pass even if the exit clear were a no-op.
 #[test]
 fn resize_mode_exit_clears_rails() {
-    let child = "/bin/sh -c 'while true; do sleep 0.2; done'";
-    let mut session =
-        spawn_gutter(160, 40, &format!("--width 60 --center --resize-key ctrl-o {child}"));
+    // The child prints nothing and holds on a `read`; Enter, once the mode is left
+    // and keys reach the child again, ends the run.
+    let child = "/bin/sh -c 'read _'";
+    let mut gutter =
+        Gutter::spawn(160, 40, &format!("--width 60 --center --resize-key ctrl-o {child}"));
 
-    let mut bytes = drain_window(&mut session, Duration::from_millis(400));
+    gutter.send(&[0x0F]); // enter
+    // The rails are up before Esc, so the blank gutters below were cleared rather
+    // than never drawn.
+    gutter.wait_for("the rails at columns 49 and 110", |s| {
+        cell_text(s, 10, 49) == "\u{258f}" && cell_text(s, 10, 110) == "\u{2595}"
+    });
 
-    session.write_all(&[0x0F]).unwrap(); // enter
-    session.flush().unwrap();
-    bytes.extend(drain_window(&mut session, Duration::from_millis(300)));
+    gutter.send(&[0x1b]); // Esc: exit
+    // In the mode Enter would be swallowed, and straight after the Esc it would join
+    // it as one key. The rails going shows the Esc was taken alone.
+    gutter.wait_for("the rails to go", |s| {
+        cell_text(s, 10, 49).trim().is_empty() && cell_text(s, 10, 110).trim().is_empty()
+    });
+    gutter.send(b"\n");
 
-    // Confirm the rails are actually up before Esc, so the post-Esc blank assertion
-    // below proves they were cleared rather than never having been drawn.
-    {
-        let parser = outer_grid(&bytes, 160, 40);
-        let screen = parser.screen();
-        let left_rail = screen.cell(10, 49).map(|c| c.contents()).unwrap_or_default();
-        let right_rail = screen.cell(10, 110).map(|c| c.contents()).unwrap_or_default();
-        assert_eq!(left_rail, "\u{258f}", "left rail must be present before Esc");
-        assert_eq!(right_rail, "\u{2595}", "right rail must be present before Esc");
-    }
-
-    session.write_all(&[0x1b]).unwrap(); // Esc: exit
-    session.flush().unwrap();
-    bytes.extend(drain_window(&mut session, Duration::from_millis(500)));
-
-    let parser = outer_grid(&bytes, 160, 40);
+    let done = gutter.finish();
     // Rails sat at columns 49 and 110; both gutters must read blank post-exit.
-    assert_cols_blank(parser.screen(), 0, 50, 40);
-    assert_cols_blank(parser.screen(), 110, 160, 40);
-
-    drop(session);
+    assert_cols_blank(&done.screen, 0, 50, 40);
+    assert_cols_blank(&done.screen, 110, 160, 40);
 }

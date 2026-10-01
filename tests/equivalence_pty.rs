@@ -11,7 +11,7 @@
 //! The fixture is replayed INTO gutter by a small shell child that emits its
 //! bytes then idles (so the live alt-screen frame is captured, not the post-exit
 //! primary screen). Harness facts are shared with `tests/pty.rs` /
-//! `tests/resize.rs`: `stty` sets the outer size before gutter reads it, and a
+//! `tests/resize.rs`: the outer size is set before gutter starts and reads it, and a
 //! bounded non-blocking drain captures the live frame.
 //!
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
@@ -20,8 +20,8 @@ use std::time::Duration;
 
 mod common;
 use common::{
-    assert_cols_blank, drain_window, outer_grid, recoverable_from_scrollback, screen_text,
-    spawn_gutter, spawn_gutter_anchored, wait_exit,
+    assert_cols_blank, cell_text, drain_window, outer_grid, recoverable_from_scrollback,
+    screen_text, spawn_gutter, spawn_gutter_anchored, wait_exit, Gutter,
 };
 
 /// A checked-in fixture's path, so a shell child can `cat` it into gutter (the
@@ -105,60 +105,64 @@ fn reverse_video_statusline_highlight_stops_at_band_edge() {
 fn resize_stress_against_fixture_no_panic_no_stale_gutter() {
     // Absolute --width 80 (the width the wide-edge fixture was recorded at),
     // centred so a resize moves the margin and would strand cells if the gutter
-    // clear failed. The child idles after the cat so the live frame stays painted.
-    let mut session = spawn_gutter(
+    // clear failed. The child holds on a `read` after the cat, so the frame stays
+    // painted until the test ends the run with Enter.
+    let mut gutter = Gutter::spawn(
         120,
         30,
         &format!(
-            "--width 80 --center /bin/sh -c 'cat {}; sleep 4'",
+            "--width 80 --center /bin/sh -c 'cat {}; read _'",
             fixture("wide-edge.cast")
         ),
     );
 
-    // Let the first frame land.
-    let _ = drain_window(&mut session, Duration::from_millis(500));
+    // The child prints nothing on a resize, so the only sign that gutter handled one
+    // is its own repaint at the new margin. The fixture's row 2 is 78 `A`s and a `漢`:
+    // it starts exactly at `margin`, with a blank cell before it, at one margin only.
+    let row_2_at = |margin: u16| {
+        move |s: &vt100::Screen| {
+            cell_text(s, 2, margin - 1).trim().is_empty()
+                && cell_text(s, 2, margin) == "A"
+                && cell_text(s, 2, margin + 78) == "漢"
+        }
+    };
+    gutter.wait_for("the fixture at margin 20", row_2_at(20));
 
-    // A sequence of rapid resizes: wider, narrower (below W so the centred margin
-    // clamps to 0), wider again — the wide content must re-wrap at each width.
-    for &(cols, rows) in &[(160u16, 40u16), (90, 24), (200, 50)] {
-        session
-            .get_process_mut()
-            .set_window_size(cols, rows)
-            .expect("resize outer PTY");
-        // Give gutter a moment to handle the SIGWINCH and repaint.
-        let _ = drain_window(&mut session, Duration::from_millis(250));
+    // Wider, narrower, wider again, each to a margin of its own (40, 5, 60), and each
+    // repainted before the next: resizes fired blind collapse into one SIGWINCH and
+    // the layouts in between are never exercised.
+    //
+    // The last size is one no earlier step used. Ending back at the launch size
+    // would leave a screen that looks the same whether the resizes were handled or not.
+    for (cols, rows, margin) in [(160u16, 40u16, 40u16), (90, 24, 5), (200, 50, 60), (140, 30, 30)] {
+        gutter.resize(cols, rows);
+        gutter.wait_for(
+            &format!("the repaint at {cols}x{rows}, margin {margin}"),
+            row_2_at(margin),
+        );
     }
 
-    // Final settle: one last resize back to 120x30 immediately before the
-    // capture, so gutter's resize handler forces a fresh full repaint (the
-    // ADR-008 step-4 gutter-clear + repaint) into the window we drain.
-    session
-        .get_process_mut()
-        .set_window_size(120, 30)
-        .expect("resize outer PTY");
-    let bytes = drain_window(&mut session, Duration::from_millis(900));
-    assert!(!bytes.is_empty(), "gutter must keep painting through the resizes");
+    gutter.send(b"\n");
+    let done = gutter.finish();
+    let screen = done
+        .alt_screen
+        .expect("the fixture's alt screen is left at teardown");
 
-    let parser = outer_grid(&bytes, 120, 30);
-    let screen = parser.screen();
-
-    // A centred 80-band in a 120 terminal has margin (120-80)/2 = 20; both
-    // gutters must be blank — no stale cells from any intermediate wider layout,
-    // and no wide-glyph half stranded outside the band by a re-wrap.
-    assert_cols_blank(screen, 0, 20, 30);
-    assert_cols_blank(screen, 100, 120, 30);
+    // A centred 80-band in a 140 terminal has margin (140-80)/2 = 30; both gutters
+    // must be blank. The screen has been fed every byte since launch and resized in
+    // step with the terminal, so a cell an earlier, wider layout left behind — or a
+    // wide-glyph half stranded outside the band by a re-wrap — is still on it.
+    assert_cols_blank(&screen, 0, 30, 30);
+    assert_cols_blank(&screen, 110, 140, 30);
 
     // Content equivalence after the reflow: the wide glyphs survive
     // the resize stress, intact and inside the band's physical columns
-    // `[20, 100)`. A wide glyph mangled by a bad re-wrap would lose its character
+    // `[30, 110)`. A wide glyph mangled by a bad re-wrap would lose its character
     // or strand a half in the gutter — both caught here. We assert at least one
     // CJK glyph and the emoji are present somewhere inside the band region.
     let band_text: String = (0..30u16)
-        .flat_map(|r| {
-            (20..100u16).filter_map(move |c| {
-                screen.cell(r, c).map(|cell| cell.contents())
-            })
-        })
+        .flat_map(|r| (30..110u16).map(move |c| (r, c)))
+        .map(|(r, c)| cell_text(&screen, r, c))
         .collect();
     assert!(
         band_text.contains('漢') || band_text.contains('字'),
@@ -168,8 +172,6 @@ fn resize_stress_against_fixture_no_panic_no_stale_gutter() {
         band_text.contains('🌟'),
         "the wide emoji must survive the reflow inside the band, got {band_text:?}"
     );
-
-    drop(session);
 }
 
 /// **Plain non-alt-screen output survives to the primary screen (the E2

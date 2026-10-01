@@ -9,10 +9,10 @@
 //! Two harness facts shape the tests:
 //!
 //! - **Outer size.** The PTY's default is 80x24. To run gutter inside a wider
-//!   terminal (so a `--width 100` band leaves real gutters) the command is
-//!   `sh -c 'stty cols C rows R; exec gutter ...'`: `stty` resizes gutter's own
-//!   controlling terminal BEFORE it reads its size at startup — deterministic,
-//!   no resize race.
+//!   terminal (so a `--width 100` band leaves real gutters) the test resizes the
+//!   PTY and only then lets the wrapping shell through to `exec gutter`
+//!   (`spawn_sized` in `tests/common/mod.rs`), so gutter reads the intended size
+//!   at startup — deterministic, no resize race.
 //! - **Capture the LIVE frame, not the post-exit screen.** gutter mirrors the
 //!   child's screen mode (ADR-012): a TUI's content is painted into the outer
 //!   alternate screen, which is discarded on the alt-leave at teardown. So the
@@ -25,13 +25,12 @@
 //!
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
-use std::io::Write;
 use std::time::{Duration, Instant};
 
 mod common;
 use common::{
-    assert_cols_blank, drain_window, first_content_row, first_painted_col, outer_grid, pty_guard,
-    recoverable_from_scrollback, screen_text, spawn_gutter, wait_exit,
+    assert_cols_blank, cell_text, drain_window, first_content_row, first_painted_col, outer_grid,
+    pty_guard, recoverable_from_scrollback, row_text, screen_text, spawn_gutter, wait_exit, Gutter,
 };
 
 /// **Child sees `COLUMNS == W`** — asserted from inside the child (`stty size`
@@ -199,32 +198,35 @@ fn cursor_visibility_mirrored_on_outer() {
 /// positioning, SGR) works through gutter, not just `echo`.
 #[test]
 fn vim_renders_inside_band() {
-    let _guard = pty_guard();
     let child = "/usr/bin/vim -u NONE -N -n -i NONE";
-    let mut session = spawn_gutter(120, 40, &format!("--width 100 --left {child}"));
+    let mut gutter = Gutter::spawn(120, 40, &format!("--width 100 --left {child}"));
 
-    // Let vim enter the alt screen and lay out.
-    std::thread::sleep(Duration::from_millis(700));
-    // Insert mode, type a marker at the top-left, then leave insert mode.
-    session.write_all(b"ggIGUTTERVIMOK\x1b").unwrap();
-    session.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(500));
+    // Once the `~` column reaches the last text row vim is in the alt screen, laid
+    // out and reading keys.
+    gutter.wait_for("vim's ~ rows", |s| {
+        s.alternate_screen() && cell_text(s, 1, 0) == "~" && cell_text(s, 38, 0) == "~"
+    });
 
-    let bytes = drain_window(&mut session, Duration::from_millis(600));
-    let parser = outer_grid(&bytes, 120, 40);
-    let screen = parser.screen();
+    // Insert mode, type a marker at the top-left, then leave insert mode — which
+    // steps the cursor back onto the marker's last character.
+    gutter.send(b"ggIGUTTERVIMOK\x1b");
+    gutter.wait_for("the marker on row 0 and vim back in normal mode", |s| {
+        row_text(s, 0).starts_with("GUTTERVIMOK") && s.cursor_position() == (0, 10)
+    });
 
-    let row0: String = screen.rows(0, 120).next().unwrap_or_default();
+    // Quit without saving; the frame vim leaves is the one checked.
+    gutter.send(b":q!\r");
+    let done = gutter.finish();
+    let screen = done.alt_screen.expect("vim leaves the alt screen on exit");
+
+    let row0 = row_text(&screen, 0);
     assert!(
         row0.starts_with("GUTTERVIMOK"),
         "vim edit must render at the band's left margin (row 0 = {row0:?})"
     );
     // Content stays inside the band — gutter columns still empty.
-    assert_cols_blank(screen, 100, 120, 1);
-
-    // Quit vim without saving so the process exits cleanly.
-    session.write_all(b"\x1b:q!\r").unwrap();
-    let _ = session.flush();
+    assert_cols_blank(&screen, 100, 120, 40);
+    assert_eq!(done.code, Some(0), "vim exits cleanly through gutter");
 }
 
 /// **Child-exit restore + exit code (real-PTY smoke).** A child that enters the
@@ -331,14 +333,23 @@ fn plain_command_output_survives_to_primary_screen() {
 /// lines — not at startup, and restore cleanly (leave the alt screen) on exit.
 #[test]
 fn mode_switch_mid_run_enters_alt_after_primary_lines() {
-    let _guard = pty_guard();
     // Print a primary marker, then enter the alt screen and paint, then exit in
-    // alt. The `?1049h` must appear in the stream AFTER the primary marker.
-    let child = "/bin/sh -c \"printf 'primline'; sleep 0.3; printf '\\033[?1049h\\033[1;1Halt-frame'; sleep 0.3; exit 0\"";
-    let mut session = spawn_gutter(80, 24, &format!("--width 60 --left {child}"));
+    // alt. Each `read` holds the child until the test has seen the step before it
+    // on the outer screen, so gutter paints each in a frame of its own.
+    let child = "/bin/sh -c \"printf 'primline'; read _; printf '\\033[?1049h\\033[1;1Halt-frame'; read _; exit 0\"";
+    let mut gutter = Gutter::spawn(80, 24, &format!("--width 60 --left {child}"));
 
-    let bytes = drain_window(&mut session, Duration::from_secs(3));
-    let s = String::from_utf8_lossy(&bytes);
+    gutter.wait_for("primline on the primary screen", |s| {
+        !s.alternate_screen() && s.contents().contains("primline")
+    });
+    gutter.send(b"\n");
+    gutter.wait_for("alt-frame on the alt screen", |s| {
+        s.alternate_screen() && s.contents().contains("alt-frame")
+    });
+    gutter.send(b"\n");
+
+    let done = gutter.finish();
+    let s = String::from_utf8_lossy(&done.bytes);
 
     // The outer alt screen is entered (the child's `?1049h` edge) and later left.
     let enter = s
@@ -359,7 +370,7 @@ fn mode_switch_mid_run_enters_alt_after_primary_lines() {
         "the primary lines must be painted before the ?1049h edge (not forced at startup)"
     );
 
-    let _ = wait_exit(&session, Duration::from_secs(5));
+    assert_eq!(done.code, Some(0), "gutter propagates the zero exit");
 }
 
 /// **Real-PTY smoke (cap).** Feed a few MB of scrolling output through a real

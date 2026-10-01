@@ -7,8 +7,9 @@
 //! so physical-column assertions can read which column each glyph landed in.
 //!
 //! Two harness facts (shared with `tests/pty.rs`):
-//! - **Outer size** is set by `sh -c 'stty cols C rows R; exec gutter ...'` so
-//!   gutter reads the intended size at startup with no race. For the resize
+//! - **Outer size** is set by the test before the wrapping shell is let through to
+//!   `exec gutter`, so gutter reads the intended size at startup with no race
+//!   (`spawn_sized` in `tests/common/mod.rs`). For the resize
 //!   tests the outer PTY is then resized live via `set_window_size`, which sends
 //!   SIGWINCH to gutter's process group; gutter's own signal thread turns that
 //!   into a `Msg::Resize` (ADR-020).
