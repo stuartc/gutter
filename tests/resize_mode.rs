@@ -8,62 +8,61 @@
 //! `ctrl-\` (raw `0x1C`) gets one dedicated smoke test so that path is exercised
 //! end-to-end too. Under byte matching both are unambiguous.
 //!
-//! Between writes the suite DRAINS rather than sleeps. gutter's output goes into
-//! the same PTY the test reads, so a test that only sleeps lets that buffer fill
-//! — a full-screen rails repaint is enough — and gutter's render thread blocks in
-//! `write`. Input then queues up and a lone Escape arrives glued to the keystroke
-//! behind it, which is Alt+<key>, not Escape.
+//! Inside the mode every key is swallowed, so nothing typed there can be echoed
+//! back as proof it was handled. The rail at the band's right edge is the signal
+//! instead: it is up once the chord is taken, it sits at `band_end` once the steps
+//! are, and it is gone once a lone Escape has left the mode. A key typed straight
+//! after that Escape would join it as Alt+<key>, so the next key waits for the rail
+//! to go.
+//!
+//! The mode also leaves by itself after `RESIZE_IDLE` (3 s) without a resize key. A
+//! test acts on a rail as soon as it sees it, and one that then waits on the child
+//! does not need the mode to still be on afterwards, so that limit is only met by a
+//! test starved for the whole 3 s.
 //!
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
-use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod common;
-use common::{drain_window, first_painted_col, outer_grid, spawn_gutter};
+use common::{cell_text, leave_resize_mode, row_text, Gutter, RIGHT_RAIL, SIZE_CHILD};
 
-/// The last painted (non-blank) physical column on row 0, or `None` if blank.
-fn last_painted_col(screen: &vt100::Screen, cols: u16) -> Option<u16> {
-    (0..cols).rev().find(|&c| {
-        screen
-            .cell(0, c)
-            .map(|cell| !cell.contents().is_empty() && cell.contents() != " ")
-            .unwrap_or(false)
-    })
+/// Whether the right rail is up at column `col` on a mid-band row — the rails are
+/// drawn across every row of the span, so any row does.
+fn rail_at(s: &vt100::Screen, col: u16) -> bool {
+    cell_text(s, 10, col) == RIGHT_RAIL
 }
 
-/// **`--resize-key ctrl-o` grows the band live.** Wrap a child that reprints its
-/// `stty size` on SIGWINCH (the resize path re-sizes the child's PTY, which the
-/// child observes exactly like a real terminal resize). Send the enter chord
-/// then several `l`s; the child's reported columns must grow.
+/// Whether some row of a left-aligned band `width` columns wide holds exactly `text`.
+/// Only the band's columns are read: in the mode the rail shares the row.
+fn has_row(s: &vt100::Screen, width: u16, text: &str) -> bool {
+    s.rows(0, width).any(|r| r.trim_end() == text)
+}
+
+/// **`--resize-key ctrl-o` grows the band live.** Send the enter chord then several
+/// `l`s; the columns the child reports must grow.
 #[test]
 fn resize_key_grows_band() {
-    let child = "/bin/sh -c 'trap \"stty size\" WINCH; stty size; while true; do sleep 0.2; done'";
-    let mut session =
-        spawn_gutter(160, 40, &format!("--width 60 --left --resize-key ctrl-o {child}"));
-
-    let mut bytes = drain_window(&mut session, Duration::from_millis(500));
-    let parser0 = outer_grid(&bytes, 160, 40);
-    assert!(
-        parser0.screen().rows(0, 160).any(|r| r.contains("60")),
-        "launch: the child sees COLUMNS = 60"
+    let mut gutter = Gutter::spawn(
+        160,
+        40,
+        &format!("--width 60 --left --resize-key ctrl-o {SIZE_CHILD}"),
     );
+    gutter.wait_for("the child's launch size, 60 columns", |s| has_row(s, 60, "40 60"));
 
     // Enter mode (Ctrl-O = 0x0F) then grow by 10 columns (l x10).
-    session.write_all(&[0x0F]).unwrap();
-    session.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(50));
-    session.write_all(b"llllllllll").unwrap();
-    session.flush().unwrap();
+    gutter.send(&[0x0F]);
+    gutter.send(b"llllllllll");
+    gutter.wait_for("the rail at column 70 after 10 x l", |s| rail_at(s, 70));
+    // gutter's own width readout says 70 before the child's PTY is resized, so the
+    // condition is the child's line.
+    gutter.wait_for("the child's own report of 70 columns", |s| {
+        has_row(s, 70, "40 70")
+    });
 
-    bytes.extend(drain_window(&mut session, Duration::from_millis(900)));
-    let parser1 = outer_grid(&bytes, 160, 40);
-    assert!(
-        parser1.screen().rows(0, 160).any(|r| r.contains("70")),
-        "after 10 x l: the child must report COLUMNS = 70"
-    );
-
-    drop(session);
+    leave_resize_mode(&mut gutter);
+    gutter.send(b"\n");
+    assert_eq!(gutter.finish().code, Some(0));
 }
 
 /// **A held step key keeps stepping under kitty event reporting.** A terminal
@@ -72,93 +71,106 @@ fn resize_key_grows_band() {
 /// child's tty never echoes a stray report.
 #[test]
 fn held_step_key_steps_on_kitty_repeats() {
-    let child = "/bin/sh -c 'trap \"stty size\" WINCH; stty size; while true; do sleep 0.2; done'";
-    let mut session =
-        spawn_gutter(160, 40, &format!("--width 60 --left --resize-key ctrl-o {child}"));
+    // The child reports its width when asked rather than from a WINCH trap, so the
+    // report is known to come after every key report was handled.
+    let child = "/bin/sh -c 'stty size; read _; printf \"END \"; stty size; printf READY; read _'";
+    let mut gutter = Gutter::spawn(
+        160,
+        40,
+        &format!("--width 60 --left --resize-key ctrl-o {child}"),
+    );
+    gutter.wait_for("the child's launch size, 60 columns", |s| has_row(s, 60, "40 60"));
 
-    let mut bytes = drain_window(&mut session, Duration::from_millis(500));
-
-    session.write_all(&[0x0F]).unwrap();
-    session.flush().unwrap();
-    bytes.extend(drain_window(&mut session, Duration::from_millis(100)));
-    session.write_all(b"\x1b[108u").unwrap();
+    gutter.send(&[0x0F]);
+    gutter.send(b"\x1b[108u");
     for _ in 0..4 {
-        session.write_all(b"\x1b[108;1:2u").unwrap();
+        gutter.send(b"\x1b[108;1:2u");
     }
-    session.write_all(b"\x1b[108;1:3u").unwrap();
-    session.flush().unwrap();
+    gutter.send(b"\x1b[108;1:3u");
+    gutter.wait_for("the rail at column 65 after the press and four repeats", |s| {
+        rail_at(s, 65)
+    });
 
-    bytes.extend(drain_window(&mut session, Duration::from_millis(900)));
-    let parser = outer_grid(&bytes, 160, 40);
-    let rows: Vec<String> = parser.screen().rows(0, 160).collect();
+    // The Escape is read after the release, and the Enter after the Escape, so the
+    // size the child prints next is the one every report above left it with.
+    leave_resize_mode(&mut gutter);
+    gutter.send(b"\n");
+    gutter.wait_for("the child's READY", |s| s.contents().contains("READY"));
+    gutter.send(b"\n");
+
+    let done = gutter.finish();
+    let lines: Vec<String> = done
+        .screen
+        .rows(0, 65)
+        .map(|r| r.trim_end().to_string())
+        .filter(|r| !r.is_empty())
+        .collect();
     assert!(
-        rows.iter().any(|r| r.contains("40 65")),
-        "the press and four repeats: the child must report 65 columns, got {rows:?}"
+        lines.iter().any(|l| l == "END 40 65"),
+        "the press and four repeats step once each and the release not at all: the child \
+         must report 65 columns, got {lines:?}"
     );
     assert!(
-        !rows.iter().any(|r| r.contains("40 66") || r.contains("108")),
-        "no extra step and no report reaches the child, got {rows:?}"
+        !lines.iter().any(|l| l.contains("108")),
+        "no report reaches the child, got {lines:?}"
     );
-
-    drop(session);
 }
 
-/// **Shrink narrows the band.** Grow then shrink back down with `h`; the child's
+/// **Shrink narrows the band.** Grow then shrink back down with `H`; the child's
 /// reported columns must decrease.
 #[test]
 fn resize_key_shrinks_band() {
-    let child = "/bin/sh -c 'trap \"stty size\" WINCH; stty size; while true; do sleep 0.2; done'";
-    let mut session =
-        spawn_gutter(160, 40, &format!("--width 60 --left --resize-key ctrl-o {child}"));
-
-    let _ = drain_window(&mut session, Duration::from_millis(500));
-
-    session.write_all(&[0x0F]).unwrap();
-    session.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(50));
-    // Grow by 20, then shrink by 30 — net -10 from the start.
-    session.write_all(b"llllllllllllllllllll").unwrap();
-    session.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(200));
-    session.write_all(b"HHH").unwrap();
-    session.flush().unwrap();
-
-    let bytes = drain_window(&mut session, Duration::from_millis(900));
-    let parser = outer_grid(&bytes, 160, 40);
-    assert!(
-        parser.screen().rows(0, 160).any(|r| r.contains("50")),
-        "after +20 then -30 (H x3): the child must report COLUMNS = 50"
+    let mut gutter = Gutter::spawn(
+        160,
+        40,
+        &format!("--width 60 --left --resize-key ctrl-o {SIZE_CHILD}"),
     );
+    gutter.wait_for("the child's launch size, 60 columns", |s| has_row(s, 60, "40 60"));
 
-    drop(session);
+    gutter.send(&[0x0F]);
+    // Grow by 20, then shrink by 30 — net -10 from the start.
+    gutter.send(b"llllllllllllllllllll");
+    gutter.wait_for("the rail at column 80 after 20 x l", |s| rail_at(s, 80));
+    gutter.send(b"HHH");
+    gutter.wait_for("the rail at column 50 after +20 then -30 (H x3)", |s| {
+        rail_at(s, 50)
+    });
+    gutter.wait_for("the child's own report of 50 columns", |s| {
+        has_row(s, 50, "40 50")
+    });
+
+    leave_resize_mode(&mut gutter);
+    gutter.send(b"\n");
+    assert_eq!(gutter.finish().code, Some(0));
 }
 
 /// **`Esc` exits the mode and releases the key to the child.** Enter, `Esc`,
-/// then send a printable that the child echoes; the child must receive it (the
-/// mode really released the key, it did not swallow it as a stray in-mode key).
+/// then type a line; `cat` must write it back (the mode really released the keys,
+/// it did not swallow them as stray in-mode keys).
 #[test]
 fn esc_exits_mode_key_reaches_child() {
-    let mut session = spawn_gutter(120, 40, "--width 60 --resize-key ctrl-o /bin/cat");
-    std::thread::sleep(Duration::from_millis(300));
+    let mut gutter = Gutter::spawn(120, 40, "--width 60 --resize-key ctrl-o /bin/cat");
 
-    session.write_all(&[0x0F]).unwrap(); // enter
-    session.flush().unwrap();
-    let _ = drain_window(&mut session, Duration::from_millis(150));
-    session.write_all(&[0x1b]).unwrap(); // Esc
-    session.flush().unwrap();
-    let _ = drain_window(&mut session, Duration::from_millis(150));
-    session.write_all(b"MARKER_AFTER_ESC").unwrap();
-    session.flush().unwrap();
+    let entered = Instant::now();
+    gutter.send(&[0x0F]); // enter
+    gutter.wait_for("the rail at column 90", |s| rail_at(s, 90));
+    leave_resize_mode(&mut gutter);
+    // Exposed to RESIZE_IDLE: the mode leaves by itself 3 s after the chord, so only
+    // rails that went sooner than that were cleared by the Escape.
+    assert!(
+        entered.elapsed() < Duration::from_secs(3),
+        "the rails went, but no sooner than the idle exit would have cleared them"
+    );
 
-    let bytes = drain_window(&mut session, Duration::from_millis(600));
-    let parser = outer_grid(&bytes, 120, 40);
-    let seen = parser
-        .screen()
-        .rows(0, 120)
-        .any(|r| r.contains("MARKER_AFTER_ESC"));
-    assert!(seen, "after Esc, a printable key must reach the child (cat echoes it)");
+    gutter.send(b"MARKER_AFTER_ESC\r");
+    // The tty echoes the line as it is typed; the second copy is cat's own.
+    gutter.wait_for("cat's copy of the line typed after Esc", |s| {
+        s.contents().matches("MARKER_AFTER_ESC").count() == 2
+    });
 
-    drop(session);
+    // Ctrl-D on an empty line ends `cat`.
+    gutter.send(b"\x04");
+    assert_eq!(gutter.finish().code, Some(0));
 }
 
 /// **The default chord (`Ctrl-\`) enters via the raw legacy byte `0x1C`.** One
@@ -166,67 +178,54 @@ fn esc_exits_mode_key_reaches_child() {
 /// `ctrl-o`.
 #[test]
 fn default_chord_enters_via_raw_fs_byte() {
-    let child = "/bin/sh -c 'trap \"stty size\" WINCH; stty size; while true; do sleep 0.2; done'";
-    let mut session = spawn_gutter(160, 40, &format!("--width 60 --left {child}"));
+    let mut gutter = Gutter::spawn(160, 40, &format!("--width 60 --left {SIZE_CHILD}"));
+    gutter.wait_for("the child's launch size, 60 columns", |s| has_row(s, 60, "40 60"));
 
-    let mut bytes = drain_window(&mut session, Duration::from_millis(500));
-    let parser0 = outer_grid(&bytes, 160, 40);
-    let before = first_painted_col(parser0.screen(), 160);
-    let before_last = last_painted_col(parser0.screen(), 160);
-    assert!(before.is_some(), "startup content painted");
-
-    session.write_all(&[0x1c]).unwrap(); // raw Ctrl-\ (FS)
-    session.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(50));
-    session.write_all(b"llllllllll").unwrap(); // grow by 10
-    session.flush().unwrap();
-
-    bytes.extend(drain_window(&mut session, Duration::from_millis(900)));
-    let parser1 = outer_grid(&bytes, 160, 40);
-    assert!(
-        parser1.screen().rows(0, 160).any(|r| r.contains("70")),
-        "the default Ctrl-\\ chord (raw 0x1C) must have entered the mode and grown the band"
+    gutter.send(&[0x1c]); // raw Ctrl-\ (FS)
+    gutter.send(b"llllllllll"); // grow by 10
+    gutter.wait_for(
+        "the rail at column 70: the default Ctrl-\\ chord (raw 0x1C) must have entered \
+         the mode and grown the band",
+        |s| rail_at(s, 70),
     );
-    // Sanity that anything moved at all beyond just the printed number.
-    let after_last = last_painted_col(parser1.screen(), 160);
-    assert!(
-        before_last.is_some() && after_last.is_some(),
-        "row 0 must still have painted content after the grow"
-    );
+    gutter.wait_for("the child's own report of 70 columns", |s| {
+        has_row(s, 70, "40 70")
+    });
 
-    drop(session);
+    leave_resize_mode(&mut gutter);
+    gutter.send(b"\n");
+    let done = gutter.finish();
+    assert_eq!(
+        row_text(&done.screen, 0),
+        "40 60",
+        "the launch line must still be painted after the grow"
+    );
 }
 
 /// A stray key while in mode is swallowed, not leaked to the child, and the
-/// mode stays active — a following resize key still works.
+/// mode stays active — a following `Esc` still leaves it.
 #[test]
 fn swallowed_key_does_not_leak_and_mode_persists() {
-    let mut session = spawn_gutter(120, 40, "--width 60 --resize-key ctrl-o /bin/cat");
-    std::thread::sleep(Duration::from_millis(300));
+    let mut gutter = Gutter::spawn(120, 40, "--width 60 --resize-key ctrl-o /bin/cat");
 
-    session.write_all(&[0x0F]).unwrap(); // enter
-    session.flush().unwrap();
-    let _ = drain_window(&mut session, Duration::from_millis(150));
-    session.write_all(b"z").unwrap(); // unrecognised in-mode key
-    session.flush().unwrap();
-    let _ = drain_window(&mut session, Duration::from_millis(150));
-    session.write_all(&[0x1b]).unwrap(); // Esc: exit
-    session.flush().unwrap();
-    let _ = drain_window(&mut session, Duration::from_millis(150));
-    session.write_all(b"z").unwrap(); // now passes through to cat
-    session.flush().unwrap();
+    gutter.send(&[0x0F]); // enter
+    gutter.wait_for("the rail at column 90", |s| rail_at(s, 90));
+    gutter.send(b"z"); // unrecognised in-mode key
+    leave_resize_mode(&mut gutter);
 
-    let bytes = drain_window(&mut session, Duration::from_millis(600));
-    let parser = outer_grid(&bytes, 120, 40);
-    let zs: usize = parser
-        .screen()
-        .rows(0, 120)
-        .map(|r| r.matches('z').count())
-        .sum();
+    gutter.send(b"z\r"); // now passes through to cat
+    // The tty echoes what was typed on row 0 and cat writes what it read on row 1.
+    gutter.wait_for("cat's copy of the line typed after Esc", |s| {
+        !row_text(s, 1).is_empty()
+    });
+
+    // Ctrl-D on an empty line ends `cat`.
+    gutter.send(b"\x04");
+    let done = gutter.finish();
+    let lines = [row_text(&done.screen, 0), row_text(&done.screen, 1)];
     assert_eq!(
-        zs, 1,
+        lines.each_ref().map(|l| l.trim()),
+        ["z", "z"],
         "the in-mode 'z' must be swallowed; only the post-Esc 'z' reaches cat"
     );
-
-    drop(session);
 }
