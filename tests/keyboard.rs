@@ -14,7 +14,7 @@
 //! **What these tests cannot prove**, stated plainly so nobody reads more into a
 //! green run than is there:
 //!
-//! - **Not that Shift+Enter works in iTerm2.** `expectrl` writes bytes; it does
+//! - **Not that Shift+Enter works in iTerm2.** The harness writes bytes; it does
 //!   not press keys. These prove that *if* the terminal sends `ESC[13;2u`, the
 //!   child receives it. Whether the terminal sends that depends on the terminal
 //!   honouring a relayed mode request, which only a real terminal can do. That
@@ -25,61 +25,61 @@
 //!
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
-use std::io::Write;
-use std::time::Duration;
-
 mod common;
-use common::{drain_window, pty_guard, read_until, spawn_gutter};
+use common::{screen_text, Gutter};
 
 /// The outer terminal these tests run gutter in.
 const OUTER_COLS: u16 = 120;
 const OUTER_ROWS: u16 = 40;
 
-/// The band as the outer terminal rendered it.
-fn band_text(bytes: &[u8]) -> String {
-    common::grid_text(bytes, OUTER_COLS, OUTER_ROWS)
-}
-
 /// A `cat -v` child in raw mode: what it prints is a caret-notation transcript of
 /// exactly the bytes that reached it. It announces `READY` once its own `stty raw`
 /// has landed — a `0x1A` written before that is SUSP and stops the child instead of
-/// reaching `cat`, so waiting on a fixed sleep is a race rather than a delay.
+/// reaching `cat`.
+///
+/// A raw-mode `cat` has no byte that ends it, so these children are never released:
+/// the test checks the live screen and drops the session. The transcript is one row,
+/// painted left to right, so everything before the byte a test waited for is on
+/// screen by the time that byte is.
 const CARET_ECHO_CHILD: &str = "/bin/sh -c 'stty raw -echo; printf READY; exec cat -v'";
 
 /// The same child without `-v`, for the cases where caret notation would obscure
 /// what is being asserted (`cat -v` renders every non-ASCII byte as `M-…`).
 const RAW_ECHO_CHILD: &str = "/bin/sh -c 'stty raw -echo; printf READY; exec cat'";
 
-/// Write `payload` into a fresh `cat -v` session and return the band transcript.
-fn transcript(payload: &[u8]) -> String {
-    echo_transcript(CARET_ECHO_CHILD, payload)
+/// Write `payload` into a fresh `cat -v` session and return the band transcript as
+/// it stood once `arrived` accepted it.
+fn transcript(payload: &[u8], arrived: impl Fn(&str) -> bool) -> String {
+    echo_transcript(CARET_ECHO_CHILD, payload, arrived)
 }
 
 /// Write `payload` once the child has announced itself, and return the band
-/// transcript.
-fn echo_transcript(child: &str, payload: &[u8]) -> String {
-    let mut session = spawn_gutter(OUTER_COLS, OUTER_ROWS, &format!("--width 100 {child}"));
-    let (_, seen) = read_until(&mut session, "READY", Duration::from_secs(5));
-    assert!(seen.contains("READY"), "the child never came up");
+/// transcript as it stood once `arrived` accepted it.
+fn echo_transcript(child: &str, payload: &[u8], arrived: impl Fn(&str) -> bool) -> String {
+    let mut gutter = Gutter::spawn(OUTER_COLS, OUTER_ROWS, &format!("--width 100 {child}"));
+    gutter.wait_for("the child's READY", |s| s.contents().contains("READY"));
 
-    session.write_all(payload).unwrap();
-    session.flush().unwrap();
+    gutter.send(payload);
 
-    let bytes = drain_window(&mut session, Duration::from_millis(700));
-    let text = band_text(&bytes);
-    drop(session);
+    let mut text = String::new();
+    gutter.wait_for("the child's echo of the payload", |s| {
+        text = s.contents();
+        arrived(&text)
+    });
     text
 }
 
-/// Write every case into one session, separated by a marker so a failure can be
-/// read off the transcript, and assert each arrived in caret notation.
+/// Write every case into one session, each followed by a `.` so a failure can be
+/// read off the transcript, and assert each arrived in caret notation. The dots are
+/// plain bytes that arrive whatever became of the keys, so the last dot marks the
+/// whole payload as echoed.
 fn assert_all_arrive(cases: &[(&str, &[u8])], why: &str) {
     let mut payload: Vec<u8> = Vec::new();
     for (_, bytes) in cases {
         payload.extend_from_slice(bytes);
         payload.push(b'.');
     }
-    let text = transcript(&payload);
+    let text = transcript(&payload, |t| t.matches('.').count() == cases.len());
 
     for (name, bytes) in cases {
         let caret = caret_notation(bytes);
@@ -96,7 +96,6 @@ fn assert_all_arrive(cases: &[(&str, &[u8])], why: &str) {
 /// nothing in a TUI, with no error anywhere to say so.
 #[test]
 fn keys_that_were_silently_dead_reach_the_child() {
-    let _g = pty_guard();
     let cases: &[(&str, &[u8])] = &[
         ("Delete", b"\x1b[3~"),
         ("Home", b"\x1b[H"),
@@ -120,7 +119,6 @@ fn keys_that_were_silently_dead_reach_the_child() {
 /// whatever the terminal sent is what arrives.
 #[test]
 fn modified_and_alt_keys_arrive_byte_identical() {
-    let _g = pty_guard();
     let cases: &[(&str, &[u8])] = &[
         ("Ctrl+Right", b"\x1b[1;5C"),
         ("Shift+Left", b"\x1b[1;2D"),
@@ -140,8 +138,7 @@ fn modified_and_alt_keys_arrive_byte_identical() {
 /// reaching the child's own line discipline (ADR-0018).
 #[test]
 fn bare_control_bytes_reach_the_child() {
-    let _g = pty_guard();
-    let text = transcript(b"A\x7fB\x1aC");
+    let text = transcript(b"A\x7fB\x1aC", |t| t.contains('C'));
     assert!(
         text.contains("A^?B^ZC"),
         "DEL and SUB must arrive verbatim; transcript was {text:?}"
@@ -153,8 +150,7 @@ fn bare_control_bytes_reach_the_child() {
 /// hold expires. It must still arrive, exactly once, and nothing else with it.
 #[test]
 fn a_lone_escape_reaches_the_child_after_the_hold() {
-    let _g = pty_guard();
-    let text = transcript(b"\x1b");
+    let text = transcript(b"\x1b", |t| t.contains("^["));
     assert!(
         text.contains("^["),
         "a bare Escape must reach the child once the hold resolves it; \
@@ -167,10 +163,11 @@ fn a_lone_escape_reaches_the_child_after_the_hold() {
 /// are not swallowed by the mode it opened.
 #[test]
 fn the_reserved_chord_byte_never_reaches_the_child() {
-    let _g = pty_guard();
     // `Ctrl-\` (0x1C) is the default chord; `a` and `b` bracket it so the test
     // fails loudly if the surrounding bytes went missing too.
-    let text = transcript(b"a\x1c\x1cb");
+    // Neither the rails nor the width readout contains a `b`, so the first one on
+    // screen is the child's echo.
+    let text = transcript(b"a\x1c\x1cb", |t| t.contains('b'));
     assert!(text.contains("ab"), "the bytes either side must arrive: {text:?}");
     assert!(
         !text.contains("^\\"),
@@ -188,8 +185,9 @@ const PASTE_ECHO_CHILD: &str =
 /// other pasted byte.
 #[test]
 fn a_pasted_chord_byte_reaches_the_child() {
-    let _g = pty_guard();
-    let text = echo_transcript(PASTE_ECHO_CHILD, b"\x1b[200~abc\x1cdef\x1b[201~");
+    let text = echo_transcript(PASTE_ECHO_CHILD, b"\x1b[200~abc\x1cdef\x1b[201~", |t| {
+        t.contains("201~")
+    });
     assert!(
         text.contains("^[[200~abc^\\def^[[201~"),
         "the whole paste, guards and chord byte included, must arrive verbatim; \
@@ -202,8 +200,11 @@ fn a_pasted_chord_byte_reaches_the_child() {
 /// verbatim rather than margin-translated, and a malformed one is not swallowed.
 #[test]
 fn a_pasted_mouse_report_is_not_extracted() {
-    let _g = pty_guard();
-    let text = echo_transcript(PASTE_ECHO_CHILD, b"\x1b[200~\x1b[<0;10;5M\x1b[<99M\x1b[201~");
+    let text = echo_transcript(
+        PASTE_ECHO_CHILD,
+        b"\x1b[200~\x1b[<0;10;5M\x1b[<99M\x1b[201~",
+        |t| t.contains("201~"),
+    );
     assert!(
         text.contains("^[[200~^[[<0;10;5M^[[<99M^[[201~"),
         "pasted text is data, not input protocol; transcript was {text:?}"
@@ -213,62 +214,58 @@ fn a_pasted_mouse_report_is_not_extracted() {
 /// UTF-8 must never be split across the scanner's buffering.
 #[test]
 fn multi_byte_utf8_survives_intact() {
-    let _g = pty_guard();
-    let text = echo_transcript(RAW_ECHO_CHILD, "MARK-é🎉-END".as_bytes());
+    let text = echo_transcript(RAW_ECHO_CHILD, "MARK-é🎉-END".as_bytes(), |t| t.contains("END"));
     assert!(
         text.contains("MARK-é🎉-END"),
         "multi-byte characters must arrive whole; transcript was {text:?}"
     );
 }
 
-/// **Ordinary typing reaches the child.** Type ASCII into a `cat` that echoes its
-/// stdin; the echoed text must appear in gutter's band.
+/// **Ordinary typing reaches the child.** Type a line into a `cat`; the tty echoes
+/// it as it is typed and `cat` writes it back once Enter completes the line, so a
+/// second copy in gutter's band is the child's own.
 #[test]
 fn ordinary_typing_reaches_child() {
-    let _g = pty_guard();
-    let mut session = spawn_gutter(OUTER_COLS, OUTER_ROWS, "--width 100 /bin/cat");
-    std::thread::sleep(Duration::from_millis(400));
+    let mut gutter = Gutter::spawn(OUTER_COLS, OUTER_ROWS, "--width 100 /bin/cat");
 
-    session.write_all(b"HELLO_KBD").unwrap();
-    session.flush().unwrap();
+    gutter.send(b"HELLO_KBD\r");
+    gutter.wait_for("cat's copy of the typed line", |s| {
+        s.contents().matches("HELLO_KBD").count() == 2
+    });
+    // Ctrl-D on an empty line ends `cat`.
+    gutter.send(b"\x04");
 
-    let bytes = drain_window(&mut session, Duration::from_millis(600));
-    let text = band_text(&bytes);
-    assert!(
-        text.contains("HELLO_KBD"),
+    let done = gutter.finish();
+    let text = screen_text(&done.screen, OUTER_COLS);
+    assert_eq!(
+        text.matches("HELLO_KBD").count(),
+        2,
         "ordinary typing must reach the child; grid was {text:?}"
     );
-
-    drop(session);
 }
 
 /// **Enter reaches the child.** A shell `read` loop completes one read per Enter
 /// and prints a per-line marker, so each Enter that arrives becomes a `GOT:`
 /// token — unambiguous, unlike `cat`, where a bare `\r` just rewinds the cursor.
-/// Two Enters → two markers. The child stays alive (a long sleep after the loop)
-/// so the live frame is captured.
+/// Two Enters → two markers. A third lets the child go.
 #[test]
 fn enter_reaches_child() {
-    let _g = pty_guard();
-    let child = "/bin/sh -c 'i=0; while [ $i -lt 2 ] && read x; do printf \"GOT:%s \" \"$x\"; i=$((i+1)); done; sleep 3'";
-    let mut session = spawn_gutter(OUTER_COLS, OUTER_ROWS, &format!("--width 100 {child}"));
-    std::thread::sleep(Duration::from_millis(400));
+    let child = "/bin/sh -c 'i=0; while [ $i -lt 2 ] && read x; do printf \"GOT:%s \" \"$x\"; i=$((i+1)); done; read _'";
+    let mut gutter = Gutter::spawn(OUTER_COLS, OUTER_ROWS, &format!("--width 100 {child}"));
 
     // Two lines, each terminated by Enter (\r): the read loop fires twice.
-    session.write_all(b"ALPHA\r").unwrap();
-    session.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(200));
-    session.write_all(b"BETA\r").unwrap();
-    session.flush().unwrap();
+    gutter.send(b"ALPHA\r");
+    gutter.wait_for("the first line's marker", |s| s.contents().contains("GOT:ALPHA"));
+    gutter.send(b"BETA\r");
+    gutter.wait_for("the second line's marker", |s| s.contents().contains("GOT:BETA"));
+    gutter.send(b"\r");
 
-    let bytes = drain_window(&mut session, Duration::from_millis(700));
-    let text = band_text(&bytes);
+    let done = gutter.finish();
+    let text = screen_text(&done.screen, OUTER_COLS);
     assert!(
         text.contains("GOT:ALPHA") && text.contains("GOT:BETA"),
         "each Enter must complete a child read (two markers); grid was {text:?}"
     );
-
-    drop(session);
 }
 
 /// **Ctrl-C reaches the child as the raw `0x03`.** Wrap a shell that reports when
@@ -276,26 +273,26 @@ fn enter_reaches_child() {
 /// send Ctrl-C. Seeing the trap's marker proves the control byte transited the
 /// scanner untouched.
 ///
-/// The trap prints its marker then keeps the child ALIVE (a long sleep), so the
-/// marker stays on the live frame the drain window captures.
+/// The shell waits in a foreground `cat` rather than in `read`: shells differ on
+/// whether a trapped signal interrupts `read`, but all of them run the trap once the
+/// foreground command the signal killed has gone. `READY` follows the `trap`, since a
+/// `0x03` that arrives before it kills the shell.
 #[test]
 fn ctrl_c_delivers_interrupt_to_child() {
-    let _g = pty_guard();
-    let child = "/bin/sh -c 'trap \"printf GOTSIGINT; sleep 3\" INT; while true; do sleep 0.1; done'";
-    let mut session = spawn_gutter(OUTER_COLS, OUTER_ROWS, &format!("--width 100 {child}"));
-    std::thread::sleep(Duration::from_millis(500));
+    let child = "/bin/sh -c 'trap \"printf GOTSIGINT\" INT; printf READY; cat; read _'";
+    let mut gutter = Gutter::spawn(OUTER_COLS, OUTER_ROWS, &format!("--width 100 {child}"));
+    gutter.wait_for("the child's READY", |s| s.contents().contains("READY"));
 
-    session.write_all(&[0x03]).unwrap();
-    session.flush().unwrap();
+    gutter.send(&[0x03]);
+    gutter.wait_for("the trap's marker", |s| s.contents().contains("GOTSIGINT"));
+    gutter.send(b"\r");
 
-    let bytes = drain_window(&mut session, Duration::from_millis(900));
-    let text = band_text(&bytes);
+    let done = gutter.finish();
+    let text = screen_text(&done.screen, OUTER_COLS);
     assert!(
         text.contains("GOTSIGINT"),
         "Ctrl-C must reach the child as 0x03 and raise SIGINT; grid was {text:?}"
     );
-
-    drop(session);
 }
 
 /// Render bytes the way `cat -v` does, so a test can search the band for them.
