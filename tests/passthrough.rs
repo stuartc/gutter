@@ -17,11 +17,8 @@
 
 use std::path::{Path, PathBuf};
 
-use expectrl::process::unix::WaitStatus;
-use expectrl::{Eof, Expect};
-
 mod common;
-use common::{spawn_gutter_argv as spawn_gutter, spawn_gutter_argv_with as spawn_gutter_with};
+use common::{row_text, Gutter};
 
 /// The window size expectrl gives the outer PTY. Tests that need the child to
 /// see this exact column count pass `--width full`, since the no-flag default
@@ -39,13 +36,14 @@ fn fresh_temp_dir(tag: &str) -> PathBuf {
     std::fs::canonicalize(&dir).expect("canonicalize temp dir")
 }
 
-/// Passthrough of a non-full-screen child: `gutter echo hi-from-gutter` shows
-/// the child's output, then the process completes cleanly.
+/// Passthrough of a non-full-screen child: its output shows on the outer terminal,
+/// and gutter exits cleanly once it does.
 #[test]
 fn passthrough_echo() {
-    let mut p = spawn_gutter(&["echo", "hi-from-gutter"]);
-    p.expect("hi-from-gutter").expect("child output passed through");
-    p.expect(Eof).expect("gutter exits after child completes");
+    let mut gutter = Gutter::spawn_argv(&["sh", "-c", "echo hi-from-gutter; read _"]);
+    gutter.wait_for("the child's output", |s| s.contents().contains("hi-from-gutter"));
+    gutter.send(b"\n");
+    assert_eq!(gutter.finish().code, Some(0), "gutter exits after child completes");
 }
 
 /// `--width full` sizes the child's PTY to the real terminal's dimensions: the
@@ -56,49 +54,53 @@ fn passthrough_echo() {
 #[test]
 fn child_sees_real_dimensions() {
     // `tput cols` reads the child's own controlling tty (gutter's inner PTY).
-    let mut p = spawn_gutter(&["--width", "full", "sh", "-c", "tput cols"]);
+    let mut gutter = Gutter::spawn_argv(&["--width", "full", "sh", "-c", "tput cols; read _"]);
     let expected = OUTER_COLS.to_string();
-    p.expect(expected.as_str())
-        .unwrap_or_else(|e| panic!("child should report {OUTER_COLS} columns: {e:?}"));
-    p.expect(Eof).expect("gutter exits");
+    gutter.wait_for("the child's column count", |s| row_text(s, 0) == expected);
+    gutter.send(b"\n");
+    gutter.finish();
 }
 
 /// Exit-code propagation: wrap a child that exits non-zero; gutter exits with
 /// the same code.
 #[test]
 fn exit_code_propagation() {
-    let mut p = spawn_gutter(&["sh", "-c", "exit 42"]);
-    // Drain to EOF so the child (and gutter) have fully exited before we wait.
-    let _ = p.expect(Eof);
-    match p.get_process().wait().expect("wait on gutter") {
-        WaitStatus::Exited(_, code) => assert_eq!(code, 42, "gutter must propagate the child's exit code"),
-        other => panic!("expected clean exit 42, got {other:?}"),
-    }
+    // The child prints nothing, so there is nothing to see first.
+    let done = Gutter::spawn_argv(&["sh", "-c", "exit 42"]).finish();
+    assert_eq!(done.code, Some(42), "gutter must propagate the child's exit code");
 }
 
 /// Child-exit-restore real-PTY smoke + no-hang-on-teardown.
 ///
-/// Wrap a child that enters the alt screen and then exits immediately. After
-/// gutter exits — with NO keystroke sent — the controlling terminal must be
-/// back on the primary screen (the leave-alt-screen restore ran) and the
-/// process must have terminated within the timeout (no hang: the detached
-/// input thread parked in `event::read()` is reaped by `process::exit`).
+/// Wrap a child that enters the alt screen and exits inside it. After gutter
+/// exits — with NO keystroke sent — the controlling terminal must be back on the
+/// primary screen (the leave-alt-screen restore ran) and the process must have
+/// terminated (no hang: the detached input thread parked in `read()` is reaped by
+/// `process::exit`).
 #[test]
 fn child_exit_restores_terminal_no_keystroke() {
-    // `tput smcup` enters the alt screen; the child then exits straight away.
-    // gutter's teardown must emit the leave-alt-screen (`rmcup`) sequence.
-    let mut p = spawn_gutter(&["sh", "-c", "tput smcup; printf done; exit 0"]);
+    // The child is held on a FIFO rather than on its terminal, so the test can let
+    // it go without typing anything at gutter.
+    let gate = fresh_temp_dir("gate").join("fifo");
+    let mut gutter = Gutter::spawn_argv(&[
+        "sh",
+        "-c",
+        "mkfifo \"$0\"; tput smcup; printf done; read _ < \"$0\"",
+        gate.to_str().expect("a UTF-8 temp path"),
+    ]);
+    gutter.wait_for("the child in the alt screen", |s| {
+        s.alternate_screen() && s.contents().contains("done")
+    });
+    std::fs::write(&gate, "\n").expect("release the child");
 
-    // No keystroke is ever sent. We just read to EOF; reaching EOF inside the
-    // timeout is the no-hang proof.
-    p.expect("done").expect("child ran mid-alt-screen");
-    p.expect(Eof).expect("gutter restores and exits with no keystroke");
-
-    // And gutter exited cleanly (code 0).
-    match p.get_process().wait().expect("wait on gutter") {
-        WaitStatus::Exited(_, code) => assert_eq!(code, 0),
-        other => panic!("expected clean exit 0, got {other:?}"),
-    }
+    // Reaching the end of the stream at all is the no-hang proof.
+    let done = gutter.finish();
+    assert!(
+        !done.screen.alternate_screen(),
+        "gutter must leave the alt screen with no keystroke"
+    );
+    assert_eq!(done.code, Some(0));
+    let _ = std::fs::remove_dir_all(gate.parent().expect("the gate's directory"));
 }
 
 /// **The child spawns in the launcher's cwd, not `$HOME`.** Set
@@ -110,13 +112,15 @@ fn child_exit_restores_terminal_no_keystroke() {
 fn child_spawns_in_launcher_cwd() {
     let launch_dir = fresh_temp_dir("cwd");
     // `pwd -P` resolves symlinks, matching our canonicalised `launch_dir`.
-    let mut p = spawn_gutter_with(&["sh", "-c", "pwd -P"], |cmd| {
+    let mut gutter = Gutter::spawn_argv_with(&["sh", "-c", "pwd -P; read _"], |cmd| {
         cmd.current_dir(&launch_dir);
     });
 
+    // The rows are joined because a long temp path wraps at the band's 80 columns.
     let expected = launch_dir.to_string_lossy().into_owned();
-    p.expect(expected.as_str())
-        .unwrap_or_else(|e| panic!("child should report the launcher cwd {expected:?}: {e:?}"));
+    gutter.wait_for("the launcher's cwd", |s| {
+        s.rows(0, OUTER_COLS).collect::<String>().contains(&expected)
+    });
 
     // And it must NOT be `$HOME` — guards against the home fallback regressing.
     if let Some(home) = std::env::var_os("HOME") {
@@ -129,7 +133,8 @@ fn child_spawns_in_launcher_cwd() {
         );
     }
 
-    p.expect(Eof).expect("gutter exits after child completes");
+    gutter.send(b"\n");
+    gutter.finish();
     let _ = std::fs::remove_dir_all(&launch_dir);
 }
 
@@ -140,11 +145,12 @@ fn child_spawns_in_launcher_cwd() {
 #[test]
 fn child_inherits_launcher_env() {
     const PROBE_VALUE: &str = "gutter-env-probe-value-9173";
-    let mut p = spawn_gutter_with(&["sh", "-c", "printf '%s\\n' \"$GUTTER_ENV_PROBE\""], |cmd| {
+    let child = "printf '%s\\n' \"$GUTTER_ENV_PROBE\"; read _";
+    let mut gutter = Gutter::spawn_argv_with(&["sh", "-c", child], |cmd| {
         cmd.env("GUTTER_ENV_PROBE", PROBE_VALUE);
     });
 
-    p.expect(PROBE_VALUE)
-        .expect("child must receive the launcher-exported env var");
-    p.expect(Eof).expect("gutter exits after child completes");
+    gutter.wait_for("the launcher's env var", |s| s.contents().contains(PROBE_VALUE));
+    gutter.send(b"\n");
+    gutter.finish();
 }

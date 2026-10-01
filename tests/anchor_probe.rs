@@ -6,10 +6,7 @@
 
 mod common;
 
-use std::io::Write;
-use std::time::Duration;
-
-use common::{answer_cpr, drain_window, outer_grid, pty_guard, read_until, spawn_gutter_probing};
+use common::Gutter;
 
 /// The row the fake terminal reports, 1-based on the wire and 0-based in the grid.
 const PROBED_ROW: u16 = 10;
@@ -17,18 +14,18 @@ const ANCHOR_ROW: usize = PROBED_ROW as usize - 1;
 
 #[test]
 fn the_cpr_reply_is_swallowed_and_never_reaches_the_child() {
-    let _guard = pty_guard();
-    let mut session =
-        spawn_gutter_probing(80, 24, "--width 40 --left sh -c 'stty -echo; cat -v'");
-    answer_cpr(&mut session, PROBED_ROW, Duration::from_secs(5));
+    // Exposed to gutter's `CPR_TIMEOUT` (100 ms): the reply has to be written within it.
+    let mut gutter =
+        Gutter::spawn_probed(80, 24, PROBED_ROW, "--width 40 --left sh -c 'stty -echo; cat -v'");
 
     // The reply has no newline, so the child's line discipline holds it until this
     // marker arrives: whatever leaked and the marker land in `cat -v` together.
-    session.write_all(b"hello\r").expect("send a keystroke");
-    let (_, text) = read_until(&mut session, "hello", Duration::from_secs(5));
-    drop(session);
+    gutter.send(b"hello\r");
+    gutter.wait_for("the child's echo of the marker", |s| s.contents().contains("hello"));
+    // End of input for `cat`.
+    gutter.send(b"\x04");
+    let text = gutter.finish().screen.contents();
 
-    assert!(text.contains("hello"), "the child never echoed the marker: {text:?}");
     assert!(
         !text.contains("^[[10;1R"),
         "the CPR reply leaked into the child: {text:?}"
@@ -37,15 +34,18 @@ fn the_cpr_reply_is_swallowed_and_never_reaches_the_child() {
 
 #[test]
 fn the_band_anchors_at_the_probed_row() {
-    let _guard = pty_guard();
-    let mut session =
-        spawn_gutter_probing(80, 24, "--width 40 --left sh -c 'printf hello; sleep 0.5'");
-    answer_cpr(&mut session, PROBED_ROW, Duration::from_secs(5));
-    let out = drain_window(&mut session, Duration::from_secs(2));
-    drop(session);
+    // Exposed to gutter's `CPR_TIMEOUT` (100 ms): the reply has to be written within it.
+    let mut gutter = Gutter::spawn_probed(
+        80,
+        24,
+        PROBED_ROW,
+        "--width 40 --left sh -c 'printf hello; read _'",
+    );
+    gutter.wait_for("the child's output", |s| s.contents().contains("hello"));
+    gutter.send(b"\n");
+    let done = gutter.finish();
 
-    let parser = outer_grid(&out, 80, 24);
-    let rows: Vec<String> = parser.screen().rows(0, 80).collect();
+    let rows: Vec<String> = done.screen.rows(0, 80).collect();
     let painted = rows.iter().position(|r| r.contains("hello"));
     assert_eq!(
         painted,
