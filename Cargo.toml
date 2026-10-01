@@ -1,6 +1,6 @@
 [package]
 name = "gutter"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Render a child terminal program inside a narrower column band while it behaves as if it owns the full terminal."
