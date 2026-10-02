@@ -13,13 +13,17 @@
 //! 250 resize <cols> <rows>
 //! 900 mode <on | off>
 //! 950 step <delta>
+//! 1200 suspend
 //! ```
 //!
 //! `mode` and `step` are resize mode (ADR-016): entering and leaving it, and one
-//! width nudge in the width's own unit with the real size held fixed.
+//! width nudge in the width's own unit with the real size held fixed. `suspend`
+//! marks a Ctrl-Z cycle (ADR-019): what the terminal did while gutter was stopped
+//! is not in the file, so the recording cannot be replayed past it.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use crate::geometry::{Layout, Width};
@@ -46,6 +50,8 @@ pub enum Event {
     ResizeMode(bool),
     /// One resize-mode width step.
     Step(i32),
+    /// A suspend/resume cycle began.
+    Suspend,
 }
 
 pub struct Recorder {
@@ -57,7 +63,13 @@ pub struct Recorder {
 
 impl Recorder {
     pub fn create(path: &Path) -> io::Result<Self> {
-        let mut file = File::create(path)?;
+        // Owner-only: the file holds everything the child put on screen.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
         writeln!(file, "{HEADER}")?;
         Ok(Self { file })
     }
@@ -81,10 +93,17 @@ impl Recorder {
                 };
                 format!("start {cols} {rows} {base_row} {width} {layout}")
             }
-            Event::Output(bytes) => format!("out {}", bytes.escape_ascii()),
+            // No line ends in a space, so an editor that strips trailing
+            // whitespace cannot shorten a chunk.
+            Event::Output(bytes) => match bytes.split_last() {
+                None => "out".to_string(),
+                Some((b' ', head)) => format!("out {}\\x20", head.escape_ascii()),
+                Some(_) => format!("out {}", bytes.escape_ascii()),
+            },
             Event::Resize { cols, rows } => format!("resize {cols} {rows}"),
             Event::ResizeMode(on) => format!("mode {}", if *on { "on" } else { "off" }),
             Event::Step(delta) => format!("step {delta}"),
+            Event::Suspend => "suspend".to_string(),
         };
         let _ = self.file.write_all(format!("{at_ms} {body}\n").as_bytes());
     }
@@ -141,6 +160,7 @@ fn parse_line(line: &str) -> Result<(u64, Event), String> {
             other => return Err(format!("unknown mode {other:?}")),
         }),
         "step" => Event::Step(num(f.next())?),
+        "suspend" => Event::Suspend,
         other => return Err(format!("unknown event {other:?}")),
     };
     Ok((at, event))
@@ -207,6 +227,7 @@ mod tests {
             (900, Event::ResizeMode(true)),
             (950, Event::Step(-10)),
             (4000, Event::ResizeMode(false)),
+            (4000, Event::Suspend),
             (
                 4001,
                 Event::Start {
@@ -228,6 +249,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(text.lines().count(), events.len() + 1, "one line per event:\n{text}");
+        assert!(!text.lines().any(|l| l.ends_with(' ')), "a line ends in a space:\n{text}");
         assert_eq!(parse(&text).unwrap(), events);
     }
 

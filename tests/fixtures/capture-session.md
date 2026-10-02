@@ -2,7 +2,7 @@
 
 A replay recording is one real session: the child's output plus every resize made by hand. It is captured once and checked in; the child's output is not reproducible, so a recapture replaces the snapshots that go with it.
 
-Run from an empty scratch directory so nothing private reaches the screen, and read the recording before checking it in.
+Run from an empty scratch directory so nothing private reaches the screen, and read the recording before checking it in. Do not suspend with Ctrl-Z while capturing: the replay check refuses a recording that holds a `suspend` event.
 
 ## Claude Code, inline on the primary screen
 

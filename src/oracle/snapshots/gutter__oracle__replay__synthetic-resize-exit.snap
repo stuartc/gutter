@@ -1,15 +1,11 @@
 ---
 source: src/oracle/replay.rs
-expression: shown
+expression: dump_screen(&term)
 ---
-quiet from 14731 ms
-band: columns 14-125, rows from 0
-rules not checked: none
+size: 140x20 (primary screen)
+cursor: row 19 col 0 (Visible)
 
-size: 140x30 (primary screen)
-cursor: row 29 col 14 (Visible)
-
-scrollback: 66 lines
+scrollback: 78 lines
    |$ history 00
    |$ history 01
    |$ history 02
@@ -76,38 +72,40 @@ scrollback: 66 lines
    |            line 41
    |         line 42
    |              line 43
+   |              line 44
+   |              line 45
+   |              line 46
+   |              line 47
+   |              line 48
+   |              line 49
+   |              line 50
+   |              line 51
+   |              line 52
+   |              line 53
+   |              line 44
+   |              line 45
 
 screen:
-  0|              line 44
-  1|              line 45
-  2|              line 46
-  3|              line 47
-  4|              line 48
-  5|              line 49
-  6|              line 50
-  7|              line 51
-  8|              line 52
-  9|              line 53
- 10|              line 54
- 11|              line 55
- 12|              line 56
- 13|              line 57
- 14|              line 58
- 15|              line 59
- 16|              line 60
- 17|              line 61
- 18|              line 62
- 19|              line 63
- 20|              line 64
- 21|              line 65
- 22|              line 66
- 23|              line 67
- 24|              line 68
- 25|              line 69
- 26|              line 70
- 27|              after narrower: 30 72
- 28|              after wider: 30 112
- 29|
+  0|              line 46
+  1|              line 47
+  2|              line 48
+  3|              line 49
+  4|              line 50
+  5|              line 51
+  6|              line 52
+  7|              line 53
+  8|              line 54
+  9|              line 55
+ 10|              line 56
+ 11|              line 57
+ 12|              line 58
+ 13|              line 59
+ 14|              line 60
+ 15|              line 61
+ 16|              line 62
+ 17|              after shorter: 20 112
+ 18|
+ 19|
 
 hyperlinks: none
 

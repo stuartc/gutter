@@ -17,6 +17,9 @@
 #   RUN=2                write <patch>.run2.txt instead of <patch>.txt (a re-run)
 #   TEST_TIMEOUT=900     seconds before a hung test run is killed
 #   RUST_TEST_THREADS    passed through to cargo test if set
+#   ORACLE=1             also run the in-crate unit tests with `--features oracle` (the
+#                        equivalence gate, the painted-band check and the replay check);
+#                        they are listed as `gutter::<test path>`
 #
 # A patch that breaks most of the suite makes every waiting test run out its 30 s
 # deadline; with RUST_TEST_THREADS=1 that needs TEST_TIMEOUT=3600.
@@ -32,8 +35,13 @@ WORK="$REPO/target/breakage"
 WT="$WORK/wt/run"
 export CARGO_TARGET_DIR="$WORK/target"
 export TERM=xterm-256color
+# A snapshot that no longer matches is a failure, and nothing gets rewritten.
+export INSTA_UPDATE=no
+unset INSTA_FORCE_PASS
+TARGETS=(--test '*')
+[ -n "${ORACLE:-}" ] && TARGETS+=(--bin gutter --features oracle)
 
-[ $# -ge 1 ] || { sed -n '2,26p' "$0"; exit 2; }
+[ $# -ge 1 ] || { sed -n '2,29p' "$0"; exit 2; }
 REF="$1"; shift
 SHA="$(git -C "$REPO" rev-parse --short "$REF^{commit}")" || exit 2
 LABEL="${LABEL:-$SHA}"
@@ -52,10 +60,11 @@ trap cleanup EXIT
 # A binary cargo reports as failed without any FAILED line died or hung.
 failing_tests() {
   awk '
+    /^ +Running unittests / { bin = "gutter"; next }
     /^ +Running tests\// { sub(/^ +Running tests\//, ""); sub(/\.rs .*/, ""); bin = $0; next }
     /^test .* \.\.\. FAILED$/ { print bin "::" $2; seen[bin] = 1; next }
-    /^error: test failed, to rerun pass `--test / {
-      b = $0; sub(/.*--test /, "", b); sub(/`.*/, "", b); died[b] = 1 }
+    /^error: test failed, to rerun pass `--(test|bin) / {
+      b = $0; sub(/.*--(test|bin) /, "", b); sub(/`.*/, "", b); died[b] = 1 }
     END { for (b in died) if (!(b in seen)) print b "::<binary died or hung, see log>" }
   ' "$1" | sort -u
 }
@@ -81,13 +90,13 @@ for arg in "$@"; do
   if [ -n "$patch" ] && ! git -C "$WT" apply --include='src/*' "$patch" 2>"$log"; then
     echo "<patch did not apply>" > "$result"; cat "$log" >&2; status=1; cleanup; continue
   fi
-  if ! (cd "$WT" && cargo test --no-run --test '*') >"$log" 2>&1; then
+  if ! (cd "$WT" && cargo test --no-run "${TARGETS[@]}") >"$log" 2>&1; then
     echo "<build failed>" > "$result"; tail -20 "$log" >&2; status=1; cleanup; continue
   fi
 
   # perl's alarm is the watchdog; macOS has no timeout(1).
   (cd "$WT" && perl -e 'alarm shift; exec @ARGV' "${TEST_TIMEOUT:-900}" \
-     cargo test --no-fail-fast --test '*') >>"$log" 2>&1
+     cargo test --no-fail-fast "${TARGETS[@]}") >>"$log" 2>&1
   rc=$?
   failing_tests "$log" > "$result"
   [ $rc -ge 128 ] && echo "<run killed after ${TEST_TIMEOUT:-900}s, results incomplete>" >> "$result"

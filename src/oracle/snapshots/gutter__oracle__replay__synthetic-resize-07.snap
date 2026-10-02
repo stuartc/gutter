@@ -4,6 +4,7 @@ expression: shown
 ---
 quiet from 11708 ms
 band: columns 9-80, rows from 0
+rules not checked: none
 
 size: 90x30 (primary screen)
 cursor: row 29 col 9 (Visible)

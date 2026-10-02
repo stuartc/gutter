@@ -1778,6 +1778,7 @@ where
     // clears `resize_active`, or the cursor tail would stay suppressed after resume;
     // park/unpark re-mirror the cursor themselves from there.
     leave_resize_mode(clock, resize, renderer, term);
+    renderer.record(clock, || Event::Suspend);
 
     // Step 1 — pre-stop drain: bounded quiet-gap drain of the child's terminal-
     // restore bytes. Aborts to a normal shutdown if the child died right after

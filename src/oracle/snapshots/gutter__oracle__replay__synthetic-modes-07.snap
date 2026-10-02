@@ -1,0 +1,56 @@
+---
+source: src/oracle/replay.rs
+expression: shown
+---
+quiet from 11077 ms
+band: columns 15-93, rows from 0
+rules not checked: history (alternate screen)
+
+size: 110x34 (alternate screen)
+cursor: row 6 col 46 (Visible)
+
+scrollback: 0 lines
+
+screen:
+  0|                alternate screen
+  1|
+  2|                   bold blue
+  3|                   underlined and italic
+  4|                   colour on colour
+  5|
+  6|               waiting on the alternate screen
+  7|
+  8|
+  9|
+ 10|
+ 11|
+ 12|
+ 13|
+ 14|
+ 15|
+ 16|
+ 17|
+ 18|
+ 19|
+ 20|
+ 21|
+ 22|
+ 23|
+ 24|
+ 25|
+ 26|
+ 27|
+ 28|
+ 29|
+ 30|
+ 31|
+ 32|
+ 33|
+
+hyperlinks: none
+
+attributes:
+  0| 15-32 inverse
+  2| 19-27 fg=4 bold
+  3| 19-28 underline; 34-39 italic
+  4| 19-34 fg=220 bg=52

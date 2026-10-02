@@ -161,6 +161,10 @@ fn run_recording(text: &str) -> Session {
         .map(|(at, event)| {
             let msg = match event {
                 Event::Start { .. } => panic!("a second start event at {at} ms"),
+                Event::Suspend => panic!(
+                    "a suspend at {at} ms: the resize and the band's row after the resume \
+                     are not recorded, so this session cannot be replayed"
+                ),
                 Event::Output(bytes) => Msg::Pty(bytes),
                 Event::Resize { cols, rows } => {
                     tape.queue_resize(cols, rows);
@@ -198,6 +202,7 @@ fn run_recording(text: &str) -> Session {
         },
     );
     // What is left on the tape is the teardown, written after the last checkpoint.
+    steps.extend(tape.cut().into_iter().map(Step::Tape));
 
     Session {
         cols,
@@ -222,10 +227,13 @@ fn launch_terminal(session: &Session) -> Terminal {
     term
 }
 
-/// The rules a settled screen has to meet whatever the session was, each broken one
-/// as a line of text.
-fn broken_rules(term: &Terminal, held: &Held, history_rows: u16) -> Vec<String> {
+/// The rules a settled screen has to meet whatever the session was: each broken one
+/// as a line of text, then the rules this screen could not be held to. The two band
+/// rules read the child's grid as gutter holds it, so a fault in that grid passes
+/// them and shows only in the snapshot.
+fn broken_rules(term: &Terminal, held: &Held, history_rows: u16) -> (Vec<String>, Vec<&'static str>) {
     let mut broken = Vec::new();
+    let mut unchecked = Vec::new();
     let band = &held.band;
     let size = term.get_size();
     assert_eq!(
@@ -270,6 +278,8 @@ fn broken_rules(term: &Terminal, held: &Held, history_rows: u16) -> Vec<String> 
                 }
             }
         }
+    } else {
+        unchecked.push("band (resize mode)");
     }
 
     // History lives on the primary screen, which wezterm does not show while the
@@ -287,8 +297,12 @@ fn broken_rules(term: &Terminal, held: &Held, history_rows: u16) -> Vec<String> 
                 ));
             }
         }
+    } else if term.is_alt_screen_active() {
+        unchecked.push("history (alternate screen)");
+    } else {
+        unchecked.push("history (scrollback overflowed)");
     }
-    broken
+    (broken, unchecked)
 }
 
 fn line_text(line: &Line) -> String {
@@ -446,17 +460,20 @@ fn recorded_sessions_replay_to_the_blessed_screens() {
                 Step::Tape(Cut::Resized { cols, rows }) => term.resize(terminal_size(*cols, *rows)),
                 Step::Checkpoint(held) => {
                     let label = format!("{name}-{checkpoint:02}");
-                    for rule in broken_rules(&term, held, session.base_row) {
+                    let (rules, unchecked) = broken_rules(&term, held, session.base_row);
+                    for rule in rules {
                         broken.push(format!("{label} (quiet from {} ms): {rule}", held.at_ms));
                     }
                     let band = &held.band;
                     let shown = format!(
-                        "quiet from {} ms\nband: columns {}-{}, rows from {}{}\n\n{}",
+                        "quiet from {} ms\nband: columns {}-{}, rows from {}{}\n\
+                         rules not checked: {}\n\n{}",
                         held.at_ms,
                         band.left_margin,
                         band.left_margin + band.width - 1,
                         band.offset,
                         if held.resize_mode { ", resize mode" } else { "" },
+                        if unchecked.is_empty() { "none".to_string() } else { unchecked.join(", ") },
                         dump_screen(&term)
                     );
                     insta::assert_snapshot!(label, shown);
@@ -465,6 +482,17 @@ fn recorded_sessions_replay_to_the_blessed_screens() {
             }
         }
         assert!(checkpoint > 0, "{name}: no checkpoint was taken");
+        let stale = format!(
+            "{}/src/oracle/snapshots/gutter__oracle__replay__{name}-{checkpoint:02}.snap",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        assert!(
+            !std::path::Path::new(&stale).exists(),
+            "{name}: took {checkpoint} checkpoints, but a snapshot is blessed for one more"
+        );
+
+        // The terminal as gutter hands it back to the shell.
+        insta::assert_snapshot!(format!("{name}-exit"), dump_screen(&term));
 
         // KNOWN FAILURE, not a blessing. These rules should hold outright and this
         // should be `assert!(broken.is_empty())`. Today's build breaks the first one
