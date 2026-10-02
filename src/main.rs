@@ -116,6 +116,16 @@ fn run() -> i32 {
         }
     };
 
+    // Registered before the size is read, so no resize can fall between the two. A
+    // failure costs resize tracking, not the run.
+    let winch = match sigwinch::register() {
+        Ok(signals) => Some(signals),
+        Err(e) => {
+            eprintln!("gutter: resize tracking disabled: {e}");
+            None
+        }
+    };
+
     // `W` is the one width the child is ever told about; it is sized into the PTY
     // below so the child lays out as if it owned a `W`-wide terminal. The real
     // terminal width only positions the band (the margin).
@@ -227,7 +237,9 @@ fn run() -> i32 {
 
     // Thread 5: SIGWINCH → Msg::Resize. Detached like Thread 3, and the only
     // resize source there is (ADR-020).
-    thread::spawn(move || sigwinch::run(merged_tx));
+    if let Some(signals) = winch {
+        thread::spawn(move || sigwinch::run(signals, merged_tx));
+    }
 
     // Eager outer mouse capture (ADR-005): enable ONCE here, before the alt
     // screen, so the outer terminal is already reporting SGR motion at the first
