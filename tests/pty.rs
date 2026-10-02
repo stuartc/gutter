@@ -339,16 +339,12 @@ fn mode_switch_mid_run_enters_alt_after_primary_lines() {
     assert_eq!(done.code, Some(0), "gutter propagates the zero exit");
 }
 
-/// **Real-PTY smoke (cap).** Feed a few MB of scrolling output through a real
-/// PTY: gutter must stay alive, drain it all, and the settled frame must show the
-/// end of the flood (not a frozen early frame). The exact frame-count proof is the
-/// virtual-clock unit test; this is the real-PTY sanity check that the coalescing
-/// loop neither hangs nor tears.
-///
-/// "Bounded" here means only that the flood ends: the one limit on how long it takes
-/// is the harness's 30 s deadline, so a gutter that got through it slowly passes.
+/// **Real-PTY smoke.** Feed a few MB of scrolling output through a real PTY: gutter
+/// must stay alive, drain it all, and the settled frame must show the end of the
+/// flood (not a frozen early frame) with the band edge intact. How many frames that
+/// takes is the virtual-clock unit test's to prove; nothing here measures speed.
 #[test]
-fn multi_mb_scroll_stays_bounded() {
+fn multi_mb_flood_drains_to_its_last_line() {
     let child = "/bin/sh -c 'i=0; while [ $i -lt 20000 ]; do printf \"line %d of the flood test\\n\" $i; i=$((i+1)); done; printf FLOOD-DONE; read _'";
     let mut gutter = Gutter::spawn(120, 40, &format!("--width 100 --left {child}"));
 
