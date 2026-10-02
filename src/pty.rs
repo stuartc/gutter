@@ -86,6 +86,8 @@ pub fn spawn(
         .map_err(|e| format!("openpty: {e}"))?;
 
     let mut builder = CommandBuilder::new(cmd);
+    // A gutter started inside this one would truncate the same recording.
+    builder.env_remove("GUTTER_RECORD");
     for arg in args {
         builder.arg(arg);
     }

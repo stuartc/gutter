@@ -13,6 +13,7 @@ use tattoy_wezterm_term::{Terminal, TerminalConfiguration, TerminalSize};
 pub mod band;
 pub mod cellview;
 pub mod gate;
+pub mod replay;
 
 use cellview::{CellView, Color, Grid};
 
@@ -28,26 +29,26 @@ impl TerminalConfiguration for OracleConfig {
     }
 }
 
-/// Builds a wezterm-term [`Terminal`] of `width × rows` and replays `bytes`
-/// through it.
+/// A blank wezterm-term [`Terminal`] of `width × rows`.
 #[must_use]
-fn build_terminal(bytes: &[u8], width: u16, rows: u16) -> Terminal {
-    let size = TerminalSize {
+fn new_terminal(width: u16, rows: u16) -> Terminal {
+    Terminal::new(
+        terminal_size(width, rows),
+        Arc::new(OracleConfig),
+        "gutter-oracle",
+        "0",
+        Box::new(std::io::sink()),
+    )
+}
+
+fn terminal_size(width: u16, rows: u16) -> TerminalSize {
+    TerminalSize {
         rows: rows as usize,
         cols: width as usize,
         pixel_width: 0,
         pixel_height: 0,
         dpi: 0,
-    };
-    let mut term = Terminal::new(
-        size,
-        Arc::new(OracleConfig),
-        "gutter-oracle",
-        "0",
-        Box::new(std::io::sink()),
-    );
-    term.advance_bytes(bytes);
-    term
+    }
 }
 
 /// The bare-side grid for the equivalence gate: a wezterm-term screen exposed
@@ -64,12 +65,20 @@ impl WeztermGrid {
     /// settled visible grid.
     #[must_use]
     pub fn replay(bytes: &[u8], width: u16, rows: u16) -> Self {
-        let term = build_terminal(bytes, width, rows);
+        let mut term = new_terminal(width, rows);
+        term.advance_bytes(bytes);
+        Self::of(&term)
+    }
+
+    /// The visible grid of a terminal as it stands.
+    #[must_use]
+    pub fn of(term: &Terminal) -> Self {
+        let size = term.get_size();
         let screen = term.screen();
-        let phys = screen.phys_range(&(0..rows as i64));
+        let phys = screen.phys_range(&(0..size.rows as i64));
         Self {
             lines: screen.lines_in_phys_range(phys),
-            cols: width,
+            cols: size.cols as u16,
         }
     }
 

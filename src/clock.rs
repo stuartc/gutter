@@ -49,16 +49,24 @@ pub trait Clock {
     /// remaining timeout and calls the stable `recv_timeout`; the loop stays in
     /// abstract `Instant`s either way.
     fn recv_until(&mut self, deadline: Self::Instant) -> Recv<Self::Msg>;
+
+    /// Milliseconds since the clock was made — the timestamps of a recording
+    /// (`src/record.rs`). Not a wakeup: it is only read while recording.
+    fn elapsed_ms(&self) -> u64;
 }
 
 /// The production clock: real monotonic time and a real blocking channel.
 pub struct RealClock<M> {
     rx: Receiver<M>,
+    start: Instant,
 }
 
 impl<M> RealClock<M> {
     pub fn new(rx: Receiver<M>) -> Self {
-        Self { rx }
+        Self {
+            rx,
+            start: Instant::now(),
+        }
     }
 }
 
@@ -89,5 +97,9 @@ impl<M> Clock for RealClock<M> {
             Err(RecvTimeoutError::Timeout) => Recv::Timeout,
             Err(RecvTimeoutError::Disconnected) => Recv::Disconnected,
         }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
     }
 }

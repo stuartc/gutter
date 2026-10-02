@@ -205,6 +205,30 @@ stdout and exits before any of this happens):
   child. A pipe or a redirect on stdout is not that case: your terminal is still
   there, so gutter runs and paints on it, and the pipe gets nothing.
 
+## Recording a session
+
+Set `GUTTER_RECORD` to a file name and gutter writes down what it took in while
+it ran: the terminal size it started at, every chunk of output from the child,
+and every resize, each with a timestamp.
+
+```sh
+GUTTER_RECORD=session.rec gutter claude
+```
+
+The file is plain text, one event per line, and is overwritten if it exists.
+gutter's own tests replay these recordings to check what a terminal ends up
+showing, so one is the most useful thing to attach to a rendering bug report.
+
+**A recording holds everything the child put on screen.** That includes what
+you typed wherever the child echoed it, file contents, tokens a tool printed,
+and anything the child copied to the clipboard. Read it before you share it.
+What you typed is not recorded directly, and neither is anything that was never
+drawn.
+
+Two limits: suspending with Ctrl-Z is not recorded, so a session that was
+suspended will not replay as it ran; and the file is written as gutter goes, so
+a path on a slow or stalled filesystem slows the painting down with it.
+
 ## Working on it
 
 ```sh

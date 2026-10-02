@@ -34,6 +34,7 @@ mod modes;
 mod mouse;
 mod msg;
 mod pty;
+mod record;
 mod relay;
 mod render;
 mod rowclip;
@@ -98,6 +99,20 @@ fn run() -> i32 {
             eprintln!("gutter: no controlling terminal: {e}");
             return 1;
         }
+    };
+
+    // Opened before anything is spawned or put into raw mode, so a path that cannot
+    // be written stops the run with a readable message rather than a silent
+    // non-recording.
+    let recorder = match std::env::var_os("GUTTER_RECORD") {
+        Some(path) => match record::Recorder::create(path.as_ref()) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("gutter: cannot record to {}: {e}", path.to_string_lossy());
+                return 1;
+            }
+        },
+        None => None,
     };
 
     // The input side is opened ONCE, here: the CPR probe below and Thread 3 must share
@@ -281,6 +296,9 @@ fn run() -> i32 {
         anchor_row,
     );
     renderer.set_resize_key(config.resize_key);
+    if let Some(recorder) = recorder {
+        renderer.set_recorder(recorder);
+    }
 
     // The job-control seam for the suspend/resume cycle (ADR-0019): continues the
     // child's group by pid on resume, stops gutter's own group on suspend.

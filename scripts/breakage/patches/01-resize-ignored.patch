@@ -1,14 +1,12 @@
 diff --git a/src/render.rs b/src/render.rs
-index 485e60d..bb48695 100644
+index 026051f..ed1f0d2 100644
 --- a/src/render.rs
 +++ b/src/render.rs
-@@ -350,9 +350,6 @@ where
-             // owner. The size is read here rather than carried on the message, so
-             // two coalesced SIGWINCHes can't leave us acting on a stale geometry.
+@@ -388,7 +388,6 @@ where
              // Param-order trap: (cols, rows) here, set_size(rows, cols) inside.
--            if let Ok((cols, rows)) = term.terminal_size() {
+             if let Ok((cols, rows)) = term.terminal_size() {
+                 renderer.record(clock, || Event::Resize { cols, rows });
 -                handle_resize(renderer, resizer, term, cols, rows);
--            }
+             }
              Flow::Continue
          }
-         // Input reaches the child through `apply_message`'s scanner, which is the

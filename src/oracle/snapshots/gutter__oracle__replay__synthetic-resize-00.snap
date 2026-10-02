@@ -1,0 +1,48 @@
+---
+source: src/oracle/replay.rs
+expression: shown
+---
+quiet from 15 ms
+band: columns 12-107, rows from 5
+rules not checked: none
+
+size: 120x30 (primary screen)
+cursor: row 12 col 12 (Visible)
+
+scrollback: 0 lines
+
+screen:
+  0|$ history 00
+  1|$ history 01
+  2|$ history 02
+  3|$ history 03
+  4|$ history 04
+  5|            ┌──────────┬────────────┬────────┐
+  6|            │ Language │ Greeting   │ Script │
+  7|            ├──────────┼────────────┼────────┤
+  8|            │ English  │ Hello      │ Latin  │
+  9|            │ Japanese │ こんにちは │ Kana   │
+ 10|            │ Chinese  │ 你好       │ Hanzi  │
+ 11|            └──────────┴────────────┴────────┘
+ 12|
+ 13|
+ 14|
+ 15|
+ 16|
+ 17|
+ 18|
+ 19|
+ 20|
+ 21|
+ 22|
+ 23|
+ 24|
+ 25|
+ 26|
+ 27|
+ 28|
+ 29|
+
+hyperlinks: none
+
+attributes: none

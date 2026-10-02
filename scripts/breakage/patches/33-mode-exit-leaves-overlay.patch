@@ -1,7 +1,9 @@
+diff --git a/src/render.rs b/src/render.rs
+index 026051f..4181ad3 100644
 --- a/src/render.rs
 +++ b/src/render.rs
-@@ -745,7 +745,6 @@
-     }
+@@ -786,7 +786,6 @@ fn leave_resize_mode<C: Clock, T: OuterTerminal>(
+     renderer.record(clock, || Event::ResizeMode(false));
      resize.disarm();
      renderer.end_resize();
 -    let _ = clear_resize_overlay(renderer, term);
