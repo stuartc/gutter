@@ -1,0 +1,14 @@
+diff --git a/src/anchor.rs b/src/anchor.rs
+index bf4f5a3..c33b95d 100644
+--- a/src/anchor.rs
++++ b/src/anchor.rs
+@@ -47,7 +47,8 @@ pub fn probe_cursor_row(
+         if let Some((start, end, row)) = find_cpr(&buf) {
+             let mut leftover = buf[..start].to_vec();
+             leftover.extend_from_slice(&buf[end..]);
+-            return (Some(row), leftover);
++            let _ = row;
++            return (None, leftover);
+         }
+         let remaining = deadline.saturating_duration_since(Instant::now());
+         if remaining.is_zero() || !wait_readable(tty, remaining) {

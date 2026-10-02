@@ -1,0 +1,13 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..f4bc1f4 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -826,7 +826,7 @@ fn walk_tokens<C, T, P, R>(
+                     continue;
+                 }
+                 match classify_unit(bytes, &renderer.resize_key, resize.active()) {
+-                    KeyAction::PassThrough => forward_to_child(pty_writer, bytes),
++                    KeyAction::PassThrough => {}
+                     action => {
+                         renderer.note_consumed_press(bytes);
+                         apply_key_action(action, clock, renderer, resize, term, resizer);

@@ -1,0 +1,13 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..812d0a5 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -852,7 +852,7 @@ fn walk_tokens<C, T, P, R>(
+                         .and_then(|b| rest.iter().position(|&x| x == b))
+                     {
+                         Some(at) => {
+-                            forward_to_child(pty_writer, &rest[..at]);
++                            forward_to_child(pty_writer, &rest[..=at]);
+                             apply_key_action(
+                                 KeyAction::Enter,
+                                 clock,

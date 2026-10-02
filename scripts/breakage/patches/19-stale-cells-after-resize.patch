@@ -1,0 +1,29 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..3cf2ee0 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -485,7 +485,7 @@ fn handle_resize<R: PtyResizer, T: OuterTerminal>(
+     // Interior clear (see `clear_row_span`) across the band span first: the baseline
+     // reset below makes rows_diff skip cells the new frame leaves blank, so any glyph
+     // the old geometry left there would survive. `repaint_margins` redraws on top.
+-    let _ = term.clear_row_span(renderer.span_offset(), rows);
++    let _ = term.clear_row_span(renderer.span_offset(), rows.min(5));
+     let _ = repaint_margins(renderer, term, /* resize_active: */ false);
+ 
+     // Force a full repaint next frame: reset the diff baseline to a blank grid of the
+diff --git a/src/terminal.rs b/src/terminal.rs
+index ada93bf..c7b372e 100644
+--- a/src/terminal.rs
++++ b/src/terminal.rs
+@@ -494,9 +494,8 @@ impl<W: Write> OuterTerminal for CrosstermTerminal<W> {
+         row_start: u16,
+         row_end: u16,
+     ) -> io::Result<()> {
+-        let mut bytes = Vec::new();
+-        clear_gutter_bytes(&mut bytes, margin, width, real_cols, row_start, row_end);
+-        self.out.write_all(&bytes)
++        let _ = (margin, width, real_cols, row_start, row_end);
++        Ok(())
+     }
+ 
+     fn clear_row_span(&mut self, row_start: u16, row_end: u16) -> io::Result<()> {

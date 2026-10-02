@@ -1,0 +1,13 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..fb10e8c 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -923,7 +923,7 @@ where
+         // thread as the mirror, so this is a plain field read.
+         input
+             .scanner
+-            .set_paste_guards(renderer.mode_mirror.bracketed_paste());
++            .set_paste_guards(renderer.mode_mirror.bracketed_paste() && resize.active());
+         let mut tokens = Vec::new();
+         input.scanner.feed(bytes, &mut tokens);
+         walk_tokens(&tokens, clock, renderer, resize, term, pty_writer, resizer);

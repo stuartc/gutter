@@ -1,0 +1,15 @@
+diff --git a/src/callbacks.rs b/src/callbacks.rs
+index d3b2d8b..9df86a4 100644
+--- a/src/callbacks.rs
++++ b/src/callbacks.rs
+@@ -202,9 +202,7 @@ impl vt100::Callbacks for GutterCallbacks {
+     /// error is swallowed, never propagated: a failed clipboard write must not
+     /// unwind out of `process()` and take down the render loop. See ADR-004.
+     fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
+-        if let Err(e) = forward_osc52(&mut self.clipboard_out, ty, data) {
+-            eprintln!("gutter: clipboard write failed: {e}");
+-        }
++        let _ = (ty, data);
+     }
+ }
+ 

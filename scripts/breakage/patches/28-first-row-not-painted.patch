@@ -1,0 +1,13 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..ea8a74b 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -1005,7 +1005,7 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
+         let mut row_buf = Vec::new();
+         let screen = renderer.parser.screen();
+         let prev_screen = renderer.prev.screen();
+-        for (row, line) in screen.rows_diff(prev_screen, 0, renderer.width).enumerate() {
++        for (row, line) in screen.rows_diff(prev_screen, 0, renderer.width).enumerate().skip(1) {
+             if line.is_empty() {
+                 continue;
+             }

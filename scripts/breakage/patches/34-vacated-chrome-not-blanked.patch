@@ -1,0 +1,11 @@
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -546,7 +546,7 @@
+     prev: Option<BandGeom>,
+ ) -> std::io::Result<()> {
+     if let Some(p) = &prev {
+-        blank_vacated_chrome(term, p)?;
++        let _ = p;
+     }
+     repaint_margins(renderer, term, true)
+ }

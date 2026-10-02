@@ -1,0 +1,13 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..ce7d6be 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -626,7 +626,7 @@ fn apply_resize_step<R: PtyResizer, T: OuterTerminal>(
+     let prev = BandGeom::of(renderer); // capture BEFORE mutating
+ 
+     // Step 0 — unit-preserving step + clamp.
+-    renderer.width_config = geometry::step_width(renderer.width_config, delta, real);
++    renderer.width_config = geometry::step_width(renderer.width_config, delta * 0, real);
+     let w = geometry::resolve_width(renderer.width_config, real);
+ 
+     // At a bound the width is unchanged: skip the PTY/parser churn (and the

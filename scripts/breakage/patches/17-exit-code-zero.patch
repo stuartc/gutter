@@ -1,0 +1,13 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..bb9dcf7 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -361,7 +361,7 @@ where
+         // pre-stop drain (ADR-0019) — where a keystroke is dropped rather than
+         // forwarded unscanned.
+         Msg::Input(_) => Flow::Continue,
+-        Msg::ChildExited(status) => Flow::Exit(status.exit_code() as i32),
++        Msg::ChildExited(status) => Flow::Exit(status.exit_code() as i32 & 0),
+         // The child stopped (ADR-0018): drive the suspend/resume cycle. `sig` is
+         // carried for tests/logging; v1 reacts to every stop signal identically.
+         Msg::ChildStopped { .. } => Flow::Suspend,

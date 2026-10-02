@@ -1,0 +1,12 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..8f8d95d 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -755,7 +755,6 @@ fn forward_to_child<P: Write>(pty_writer: &mut P, bytes: &[u8]) {
+     if bytes.is_empty() {
+         return;
+     }
+-    let _ = pty_writer.write_all(bytes);
+     let _ = pty_writer.flush();
+ }
+ 

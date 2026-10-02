@@ -1,0 +1,12 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..c2bd4f7 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -335,7 +335,6 @@ where
+             // spec-correct reply; drain it to the PTY master.
+             let replies = renderer.parser.callbacks_mut().drain_replies();
+             if !replies.is_empty() {
+-                let _ = pty_writer.write_all(&replies);
+                 let _ = pty_writer.flush();
+             }
+             // Feed the same bytes to the scroll tracker (ADR-013) so vt100's scroll

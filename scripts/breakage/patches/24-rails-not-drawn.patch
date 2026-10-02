@@ -1,0 +1,13 @@
+diff --git a/src/terminal.rs b/src/terminal.rs
+index ada93bf..cbf4bb6 100644
+--- a/src/terminal.rs
++++ b/src/terminal.rs
+@@ -511,7 +511,7 @@ impl<W: Write> OuterTerminal for CrosstermTerminal<W> {
+ 
+     fn draw_rails(&mut self, rails: &Rails) -> io::Result<()> {
+         self.out.write_all(b"\x1b[0m")?; // drop any leftover attribute run
+-        for row in rails.row_start..rails.row_end {
++        for row in rails.row_end..rails.row_end {
+             if let Some(c) = rails.left_col {
+                 queue!(self.out, MoveTo(c, row))?;
+                 self.out.write_all("\x1b[2m\u{258f}\x1b[0m".as_bytes())?; // ▏

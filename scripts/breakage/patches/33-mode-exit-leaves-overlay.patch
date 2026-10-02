@@ -1,0 +1,10 @@
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -745,7 +745,6 @@
+     }
+     resize.disarm();
+     renderer.end_resize();
+-    let _ = clear_resize_overlay(renderer, term);
+     renderer.reset_prev_baseline();
+ }
+ 

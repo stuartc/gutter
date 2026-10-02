@@ -41,6 +41,11 @@ Integration tests drive a **real PTY** via `expectrl` and assert on what the out
 
 **Know what a green suite does not prove.** The render-thread unit tests read gutter's output back through `RecordingGrid` (`src/terminal.rs`), a mock that is itself a `vt100::Parser` — the same emulator gutter reasons with. It checks the band arithmetic and cannot, by construction, catch gutter's model disagreeing with a real terminal: vt100 has no deferred wrap, real terminals do. The equivalence gate does not cover this either — it diffs two grids built from the child's bytes and never sees what gutter writes. Anything about *where* bytes land on the real screen has to be proved against wezterm or a real PTY — in this repo that means the painted-band check in `src/oracle/band.rs`, which replays gutter's own bytes (`paint_frames_to_tape` in `src/render.rs` → a `Tape`) through wezterm-term at the physical screen size. See [ADR-001](docs/adr/0001-two-emulator-equivalence-gate.md).
 
+**Two scripts check the integration tests themselves.** Neither runs in CI; reach for them when changing how the tests wait or what they assert. Each script's header has the full usage, and both write only under `target/`.
+
+- `scripts/stress.sh` runs the integration test binaries over and over, several at once with CPU burners alongside, and counts failures per test — the way to find a flaky test. `scripts/in-docker.sh <cpus> scripts/stress.sh …` runs the same thing in a CPU-limited Linux container, which is the closest local stand-in for the CI runner.
+- `scripts/breakage/breakage.sh <git-ref>` applies each deliberate gutter bug in `scripts/breakage/patches/` to a throwaway worktree of that ref and records which tests fail. `scripts/breakage/compare.sh <before> <after>` then lists any test that stopped catching a bug it used to catch. Run it on both sides of a test rewrite to show the rewrite lost nothing.
+
 ## Architecture
 
 **Five threads, one merged unbounded channel (`std::sync::mpsc`), no async.** Messages are a single enum (`src/msg.rs`): `Pty(Vec<u8>)`, `Input(Vec<u8>)`, `Resize` (payload-free), `ChildExited(ExitStatus)`, `ChildStopped { sig }`, `ChildContinued`, `PtyEof`.
