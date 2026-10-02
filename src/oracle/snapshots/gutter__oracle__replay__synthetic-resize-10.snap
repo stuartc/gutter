@@ -1,0 +1,113 @@
+---
+source: src/oracle/replay.rs
+expression: shown
+---
+quiet from 16243 ms
+band: columns 14-125, rows from 0
+
+size: 140x20 (primary screen)
+cursor: row 19 col 14 (Visible)
+
+scrollback: 76 lines
+   |$ history 00
+   |$ history 01
+   |$ history 02
+   |$ history 03
+   |$ history 04
+   |            ┌──────────┬────────────┬────────┐
+   |            │ Language │ Greeting   │ Script │
+   |            ├──────────┼────────────┼────────┤
+   |            │ English  │ Hello      │ Latin  │
+   |            │ Japanese │ こんにちは │ Kana   │
+   |            │ Chinese  │ 你好       │ Hanzi  │
+   |            └──────────┴────────────┴────────┘
+   |            日本語 中文 한국어 😀 🚀 👍🏽 👨‍👩‍👧 🇿🇦
+   |            ..............................................................................................界
+   |            ...............................................................................................
+   |            界
+   |            bold dim italic underline inverse strike
+   |            red green bg orange 256 truecolour bold italic underline magenta
+   |            first link and https://example.com/a/very/long/path/that/keeps/going/and/going/until/it/has/to/w
+   |            rap/across/the/band/edge
+   |            long: word01 word02 word03 word04 word05 word06 word07 word08 word09 word10 word11 word12 word13
+   |             word14 word15 word16 word17 word18 word19 word20 word21 word22 word23 word24 word25 word26 word
+   |            27 word28 word29 word30
+   |            line 01
+   |            line 02
+   |            line 03
+   |            line 04
+   |            line 05
+   |            line 06
+   |            line 07
+   |            line 08
+   |            line 09
+   |            line 10
+   |            line 11
+   |            line 12
+   |            line 13
+   |            line 14
+   |            line 15
+   |            line 16
+   |            line 17
+   |            line 18
+   |            line 19
+   |            line 20
+   |            line 21
+   |            line 22
+   |            line 23
+   |            line 24
+   |            line 25
+   |            line 26
+   |            line 27
+   |            line 28
+   |            line 29
+   |            line 30
+   |            line 31
+   |            line 32
+   |            line 33
+   |            line 34
+   |            line 35
+   |            line 36
+   |            line 37
+   |            line 38
+   |            line 39
+   |            line 40
+   |            line 41
+   |         line 42
+   |              line 43
+   |              line 44
+   |              line 45
+   |              line 46
+   |              line 47
+   |              line 48
+   |              line 49
+   |              line 50
+   |              line 51
+   |              line 52
+   |              line 53
+
+screen:
+  0|              line 44
+  1|              line 45
+  2|              line 46
+  3|              line 47
+  4|              line 48
+  5|              line 49
+  6|              line 50
+  7|              line 51
+  8|              line 52
+  9|              line 53
+ 10|              line 54
+ 11|              line 55
+ 12|              line 56
+ 13|              line 57
+ 14|              line 58
+ 15|              line 59
+ 16|              line 60
+ 17|              line 61
+ 18|              line 62
+ 19|              line 63
+
+hyperlinks: none
+
+attributes: none

@@ -110,7 +110,7 @@ fn usage() -> String {
 /// ([`Width::Percent`]). `pct` is the documented spelling, `%` an accepted
 /// alias; the bare word `full` is an alias for `100%` (full-width passthrough).
 /// See ADR-011.
-fn parse_width(s: &str) -> Result<Width, String> {
+pub(crate) fn parse_width(s: &str) -> Result<Width, String> {
     if s == "full" {
         return Ok(Width::Percent(100));
     }

@@ -16,6 +16,7 @@
 //!
 //! [`RecordingGrid`]: crate::terminal::mock::RecordingGrid
 
+use std::collections::VecDeque;
 use std::io;
 
 use super::cellview::{CellView, Grid};
@@ -27,6 +28,18 @@ use crate::terminal::{CrosstermTerminal, OuterTerminal};
 /// gutter would have written and can be handed to another emulator verbatim.
 pub struct Tape {
     inner: CrosstermTerminal<Vec<u8>>,
+    size: (u16, u16),
+    /// The sizes the terminal goes on to take, oldest first.
+    resizes: VecDeque<(u16, u16)>,
+    cuts: Vec<Cut>,
+}
+
+/// One stretch of a tape that was resized as it ran: what gutter wrote, or the terminal
+/// taking a new size between two writes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Cut {
+    Bytes(Vec<u8>),
+    Resized { cols: u16, rows: u16 },
 }
 
 impl Tape {
@@ -36,9 +49,35 @@ impl Tape {
     pub fn new(cols: u16, rows: u16) -> Self {
         let mut tape = Self {
             inner: CrosstermTerminal::from_writer(Vec::new(), (cols, rows)),
+            size: (cols, rows),
+            resizes: VecDeque::new(),
+            cuts: Vec::new(),
         };
         tape.set_autowrap(false).expect("a Vec sink cannot fail");
         tape
+    }
+
+    /// Script the terminal's next change of size. It takes effect the next time gutter
+    /// asks for the size, which the render loop does once per `Msg::Resize` and nowhere
+    /// else short of a suspend: by then a real terminal has already changed, so what
+    /// gutter wrote before asking went to the old size and what it writes after goes to
+    /// the new one.
+    pub fn queue_resize(&mut self, cols: u16, rows: u16) {
+        self.resizes.push_back((cols, rows));
+    }
+
+    /// Everything since the last call, in order, leaving the tape empty.
+    pub fn cut(&mut self) -> Vec<Cut> {
+        self.cut_bytes();
+        std::mem::take(&mut self.cuts)
+    }
+
+    fn cut_bytes(&mut self) {
+        self.inner.flush().expect("flush the tape");
+        let bytes = std::mem::take(self.inner.writer().get_mut());
+        if !bytes.is_empty() {
+            self.cuts.push(Cut::Bytes(bytes));
+        }
     }
 
     /// The recorded stream.
@@ -67,7 +106,12 @@ impl OuterTerminal for Tape {
     }
 
     fn terminal_size(&mut self) -> io::Result<(u16, u16)> {
-        self.inner.terminal_size()
+        if let Some((cols, rows)) = self.resizes.pop_front() {
+            self.cut_bytes();
+            self.cuts.push(Cut::Resized { cols, rows });
+            self.size = (cols, rows);
+        }
+        Ok(self.size)
     }
 
     fn move_to(&mut self, col: u16, row: u16) -> io::Result<()> {

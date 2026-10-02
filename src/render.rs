@@ -21,6 +21,7 @@ use crate::modes::ModeMirror;
 use crate::mouse::{MouseDecision, MouseGate};
 use crate::msg::Msg;
 use crate::pty::PtyResizer;
+use crate::record::{Event, Recorder};
 use crate::relay::KeyModeRelay;
 use crate::rowclip::{clip_row_to_width_into, Placement};
 use crate::scan::{Scanner, Token, ESC_HOLD};
@@ -141,6 +142,8 @@ pub struct Renderer {
     /// no key-down, which is the very state it turned event reporting on to track. One
     /// slot: a key's reports arrive together, and any other escape sequence clears it.
     consumed_press: Option<u32>,
+    /// Where the loop's inputs are written when `GUTTER_RECORD` is set.
+    recorder: Option<Recorder>,
 }
 
 impl Renderer {
@@ -198,6 +201,29 @@ impl Renderer {
             resize_key: Chord::default(),
             resize_active: false,
             consumed_press: None,
+            recorder: None,
+        }
+    }
+
+    pub fn set_recorder(&mut self, recorder: Recorder) {
+        self.recorder = Some(recorder);
+    }
+
+    /// Write one event to the recording, if there is one. The event is built and
+    /// the clock read only when recording, so an ordinary run does neither.
+    fn record<C: Clock>(&mut self, clock: &C, event: impl FnOnce() -> Event) {
+        if let Some(recorder) = &mut self.recorder {
+            recorder.record(clock.elapsed_ms(), &event());
+        }
+    }
+
+    fn start_event(&self) -> Event {
+        Event::Start {
+            cols: self.real_cols,
+            rows: self.parser.screen().size().0,
+            base_row: self.base_row,
+            width: self.width_config,
+            layout: self.layout,
         }
     }
 
@@ -260,6 +286,11 @@ impl Renderer {
         }
     }
 
+    #[cfg(all(test, feature = "oracle"))]
+    pub(crate) fn resize_active(&self) -> bool {
+        self.resize_active
+    }
+
     /// Test-only constructor at an explicit `left_margin`, so the cell-walk / CJK
     /// edge-of-band tests can pin a margin directly and inspect physical columns
     /// without routing through a [`Layout`]/`real_cols` pair.
@@ -308,20 +339,25 @@ enum Flow {
 /// recording `Vec<u8>` with no real child. The `PtyResizer` and outer terminal
 /// are injected for the same reason — the resize handler is driven against a
 /// recording mock that captures what `master.resize` was told.
-fn dispatch<P, R, T>(
+fn dispatch<C, P, R, T>(
     msg: Msg,
+    clock: &C,
     renderer: &mut Renderer,
     pty_writer: &mut P,
     resizer: &R,
     term: &mut T,
 ) -> Flow
 where
+    C: Clock,
     P: Write,
     R: PtyResizer,
     T: OuterTerminal,
 {
     match msg {
         Msg::Pty(bytes) => {
+            // Before the parser sees it, so a chunk that brings the parser down is
+            // the last line of the recording.
+            renderer.record(clock, || Event::Output(bytes.clone()));
             renderer.parser.process(&bytes);
             // Carry the child's keyboard-mode requests out to the real terminal
             // (ADR-021), before the inward replies: a relayed `CSI ? u` has a round
@@ -351,6 +387,7 @@ where
             // two coalesced SIGWINCHes can't leave us acting on a stale geometry.
             // Param-order trap: (cols, rows) here, set_size(rows, cols) inside.
             if let Ok((cols, rows)) = term.terminal_size() {
+                renderer.record(clock, || Event::Resize { cols, rows });
                 handle_resize(renderer, resizer, term, cols, rows);
             }
             Flow::Continue
@@ -717,15 +754,17 @@ fn apply_key_action<C, T, R>(
             // expression is an E0502 overlapping borrow.
             let now = clock.now();
             resize.arm(clock.deadline(now, RESIZE_IDLE));
+            renderer.record(clock, || Event::ResizeMode(true));
             let _ = renderer.begin_resize(term);
             let _ = enter_resize_overlay(renderer, term);
         }
         KeyAction::Step(delta) => {
             let now = clock.now();
             resize.arm(clock.deadline(now, RESIZE_IDLE)); // a resize key = activity
+            renderer.record(clock, || Event::Step(delta));
             apply_resize_step(renderer, resizer, term, delta);
         }
-        KeyAction::Exit => leave_resize_mode(resize, renderer, term),
+        KeyAction::Exit => leave_resize_mode(clock, resize, renderer, term),
         // Consumed but NOT counted as activity: a swallowed stray key must not
         // keep the mode alive forever (PRD 0001: idle = "no resize key").
         KeyAction::Swallow => {}
@@ -735,14 +774,16 @@ fn apply_key_action<C, T, R>(
 
 /// Leave resize mode: disarm the idle window, un-suppress the mirrored cursor, erase
 /// the overlay and force a full band repaint. Queued, not flushed — the caller renders.
-fn leave_resize_mode<T: OuterTerminal, I: Copy + Ord>(
-    resize: &mut ResizeCtl<I>,
+fn leave_resize_mode<C: Clock, T: OuterTerminal>(
+    clock: &C,
+    resize: &mut ResizeCtl<C::Instant>,
     renderer: &mut Renderer,
     term: &mut T,
 ) {
     if !resize.active() {
         return;
     }
+    renderer.record(clock, || Event::ResizeMode(false));
     resize.disarm();
     renderer.end_resize();
     let _ = clear_resize_overlay(renderer, term);
@@ -944,7 +985,7 @@ where
     // handle_resize's own (rails-blind) clear left behind.
     let was_resize = matches!(m, Msg::Resize);
     let prev = (was_resize && resize.active()).then(|| BandGeom::of(renderer));
-    let code = dispatch(m, renderer, pty_writer, resizer, term);
+    let code = dispatch(m, clock, renderer, pty_writer, resizer, term);
     if was_resize && resize.active() {
         let _ = refresh_resize_overlay(renderer, term, prev);
     }
@@ -1509,9 +1550,35 @@ where
     R: PtyResizer,
     S: Suspender,
 {
+    run_observed(clock, renderer, term, pty_writer, resizer, suspender, &mut |_, _| {})
+}
+
+/// [`run`], calling `after_frame` once each frame's render has been flushed, with the
+/// renderer as that frame left it and the terminal it painted on. The replay check
+/// (`src/oracle/replay.rs`) reads the child's grid there; nothing else can see the
+/// renderer between frames, since the loop holds it until teardown.
+pub(crate) fn run_observed<C, T, P, R, S>(
+    clock: &mut C,
+    renderer: &mut Renderer,
+    term: &mut T,
+    pty_writer: &mut P,
+    resizer: &R,
+    suspender: &S,
+    after_frame: &mut impl FnMut(&Renderer, &mut T),
+) -> Option<i32>
+where
+    C: Clock<Msg = Msg>,
+    T: OuterTerminal,
+    P: Write,
+    R: PtyResizer,
+    S: Suspender,
+{
     let mut exit_code: Option<i32> = None;
     let mut resize = ResizeCtl::inactive();
     let mut input = InputCtl::new();
+
+    let start = renderer.start_event();
+    renderer.record(clock, || start);
 
     'frames: loop {
         // Top-of-frame hold check: a hold that expired while the loop was busy
@@ -1537,7 +1604,7 @@ where
         if let Some(dl) = resize.idle_deadline
             && clock.now() >= dl
         {
-            leave_resize_mode(&mut resize, renderer, term);
+            leave_resize_mode(clock, &mut resize, renderer, term);
             let _ = render_once(renderer, term); // erase rails this frame
             continue 'frames;
         }
@@ -1559,7 +1626,7 @@ where
                     }
                     if resize.idle_deadline.is_some_and(|d| now >= d) {
                         // ~3 s idle elapsed.
-                        leave_resize_mode(&mut resize, renderer, term);
+                        leave_resize_mode(clock, &mut resize, renderer, term);
                     }
                     // Both paths may have queued an overlay clear; flush it here
                     // rather than waiting for a child that may never write again.
@@ -1647,6 +1714,7 @@ where
 
         // --- Exactly one render per frame ---
         let _ = render_once(renderer, term);
+        after_frame(renderer, term);
 
         if shutdown {
             break 'frames;
@@ -1709,7 +1777,7 @@ where
     // Step 0 — resize-mode teardown (same as run's shutdown tail). `end_resize`
     // clears `resize_active`, or the cursor tail would stay suppressed after resume;
     // park/unpark re-mirror the cursor themselves from there.
-    leave_resize_mode(resize, renderer, term);
+    leave_resize_mode(clock, resize, renderer, term);
 
     // Step 1 — pre-stop drain: bounded quiet-gap drain of the child's terminal-
     // restore bytes. Aborts to a normal shutdown if the child died right after
@@ -1725,7 +1793,7 @@ where
         let deadline = if gap < cap { gap } else { cap };
         match clock.recv_until(deadline) {
             Recv::Msg(m) => {
-                if let Flow::Exit(code) = dispatch(m, renderer, pty_writer, resizer, term) {
+                if let Flow::Exit(code) = dispatch(m, clock, renderer, pty_writer, resizer, term) {
                     return SuspendOutcome::ChildExited(code);
                 }
                 // Any other Flow (including a second Suspend) is ignored here.
@@ -2027,7 +2095,7 @@ fn drain_pty_path<C, T, P, R>(
         }
         match clock.recv_until(grace_deadline) {
             Recv::Msg(m) => {
-                let _ = dispatch(m, renderer, pty_writer, resizer, term);
+                let _ = dispatch(m, clock, renderer, pty_writer, resizer, term);
             }
             Recv::Timeout | Recv::Disconnected => break,
         }
@@ -2141,6 +2209,10 @@ mod tests {
 
         fn deadline(&self, from: u64, dur: Duration) -> u64 {
             from + dur.as_millis() as u64
+        }
+
+        fn elapsed_ms(&self) -> u64 {
+            self.now_ms
         }
 
         fn recv(&mut self) -> Option<Msg> {
@@ -3059,6 +3131,48 @@ mod tests {
             "alt-mode resize must clear from row 0 (gutter owns the whole viewport), \
              calls = {:?}",
             term.calls
+        );
+    }
+
+    #[test]
+    fn recording_holds_output_and_resizes_in_the_order_handled() {
+        let script = vec![
+            (0u64, Msg::Pty(b"\x1b[31mone".to_vec())),
+            (20, Msg::Resize),
+            (20, Msg::Pty(b"two\r\n".to_vec())),
+            (20, Msg::ChildExited(ExitStatus::with_exit_code(0))),
+        ];
+        let mut clock = VirtualClock::new(script);
+        let mut renderer =
+            Renderer::new(20, 24, 80, Layout::Center, Width::Cols(20), Box::new(std::io::sink()), 5);
+        let path = crate::record::temp_path("render-loop");
+        renderer.set_recorder(Recorder::create(&path).unwrap());
+        let mut term = MockTerminal::new();
+        term.set_terminal_size(100, 30);
+        let mut pty: Vec<u8> = Vec::new();
+        run(&mut clock, &mut renderer, &mut term, &mut pty, &NoopResizer, &MockSuspender::disconnected());
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        // The virtual clock counts a message's delay from when the loop asks for
+        // it, which is after the 16 ms frame the previous message opened.
+        assert_eq!(
+            crate::record::parse(&text).unwrap(),
+            vec![
+                (
+                    0,
+                    Event::Start {
+                        cols: 80,
+                        rows: 24,
+                        base_row: 5,
+                        width: Width::Cols(20),
+                        layout: Layout::Center,
+                    }
+                ),
+                (0, Event::Output(b"\x1b[31mone".to_vec())),
+                (36, Event::Resize { cols: 100, rows: 30 }),
+                (72, Event::Output(b"two\r\n".to_vec())),
+            ]
         );
     }
 
@@ -4528,6 +4642,7 @@ line two\r\n\
             let mut pty: Vec<u8> = Vec::new();
             let flow = dispatch(
                 Msg::ChildStopped { sig: 18 },
+                &VirtualClock::new(vec![]),
                 &mut renderer,
                 &mut pty,
                 &NoopResizer,
@@ -4857,6 +4972,7 @@ line two\r\n\
 
             let flow = dispatch(
                 Msg::ChildContinued,
+                &VirtualClock::new(vec![]),
                 &mut renderer,
                 &mut pty,
                 &NoopResizer,

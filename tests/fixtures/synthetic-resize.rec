@@ -1,0 +1,118 @@
+gutter-record 1
+0 start 120 30 5 80% center
+15 out \xe2\x94\x8c\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\xac\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\xac\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x90\r\n\xe2\x94\x82 Language \xe2\x94\x82 Greeting   \xe2\x94\x82 Script \xe2\x94\x82\r\n
+15 out \xe2\x94\x9c\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\xbc\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\xbc\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\xa4\r\n\xe2\x94\x82 English  \xe2\x94\x82 Hello      \xe2\x94\x82 Latin  \xe2\x94\x82\r\n\xe2\x94\x82 Japanese \xe2\x94\x82 \xe3\x81\x93\xe3\x82\x93\xe3\x81\xab\xe3\x81\xa1\xe3\x81\xaf \xe2\x94\x82 Kana   \xe2\x94\x82\r\n
+15 out \xe2\x94\x82 Chinese  \xe2\x94\x82 \xe4\xbd\xa0\xe5\xa5\xbd       \xe2\x94\x82 Hanzi  \xe2\x94\x82\r\n
+15 out \xe2\x94\x94\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\xb4\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\xb4\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x98\r\n
+1322 out \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e \xe4\xb8\xad\xe6\x96\x87 \xed\x95\x9c\xea\xb5\xad\xec\x96\xb4 \xf0\x9f\x98\x80 \xf0\x9f\x9a\x80 \xf0\x9f\x91\x8d\xf0\x9f\x8f\xbd \xf0\x9f\x91\xa8\xe2\x80\x8d\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x91\xa7 \xf0\x9f\x87\xbf\xf0\x9f\x87\xa6\r\n
+1326 out ..............................................................................................
+1326 out \xe7\x95\x8c\r\n
+1329 out ...............................................................................................
+1329 out \xe7\x95\x8c\r\n
+2633 out \x1b[1mbold\x1b[0m \x1b[2mdim\x1b[0m \x1b[3mitalic\x1b[0m \x1b[4munderline\x1b[0m \x1b[7minverse\x1b[0m \x1b[9mstrike\x1b[0m\r\n
+2633 out \x1b[31mred\x1b[0m \x1b[42mgreen bg\x1b[0m \x1b[38;5;208morange 256\x1b[0m \x1b[38;2;100;150;200mtruecolour\x1b[0m \x1b[1;3;4;35mbold italic underline magenta\x1b[0m\r\n
+3941 out \x1b]8;;https://example.com/a\x1b\\first link\x1b]8;;\x1b\\ and \x1b]8;;https://example.com/a/very/long/path/that/keeps/going/and/going/until/it/has/to/wrap/across/the/band/edge\x1b\\https://example.com/a/very/long/path/that/keeps/going/and/going/until/it/has/to/wrap/across/the/band/edge\x1b]8;;\x1b\\\r\n
+5253 out long:
+5259 out  word01
+5259 out  word02 word03
+5259 out  word04
+5259 out  word05
+5259 out  word06
+5259 out  word07
+5259 out  word08 word09
+5259 out  word10
+5259 out  word11
+5259 out  word12
+5259 out  word13
+5259 out  word14
+5259 out  word15
+5259 out  word16
+5259 out  word17
+5259 out  word18
+5259 out  word19
+5259 out  word20
+5259 out  word21
+5259 out  word22
+5259 out  word23
+5259 out  word24
+5259 out  word25
+5259 out  word26
+5259 out  word27 word28 word29
+5259 out  word30
+5259 out \r\n
+6571 out line 01\r\n
+6598 out line 02\r\n
+6631 out line 03\r\n
+6656 out line 04\r\n
+6688 out line 05\r\n
+6718 out line 06\r\n
+6748 out line 07\r\n
+6777 out line 08\r\n
+6801 out line 09\r\n
+6832 out line 10\r\n
+6859 out line 11\r\n
+6883 out line 12\r\n
+6911 out line 13\r\n
+6935 out line 14\r\n
+6967 out line 15\r\n
+6993 out line 16\r\n
+7019 out line 17\r\n
+7052 out line 18\r\n
+7087 out line 19\r\n
+7121 out line 20\r\n
+7153 out line 21\r\n
+7183 out line 22\r\n
+7212 out line 23\r\n
+7245 out line 24\r\n
+7280 out line 25\r\n
+7315 out line 26\r\n
+7348 out line 27\r\n
+7377 out line 28\r\n
+7412 out line 29\r\n
+7448 out line 30\r\n
+7476 out line 31\r\n
+7507 out line 32\r\n
+7544 out line 33\r\n
+7572 out line 34\r\n
+7610 out line 35\r\n
+7648 out line 36\r\n
+7683 out line 37\r\n
+7715 out line 38\r\n
+7749 out line 39\r\n
+7778 out line 40\r\n
+7811 out line 41\r\n
+7849 out line 42\r\n
+7884 out line 43\r\n
+7921 out line 44\r\n
+7959 out line 45\r\n
+7991 out line 46\r\n
+8026 out line 47\r\n
+8053 out line 48\r\n
+8089 out line 49\r\n
+8123 out line 50\r\n
+8153 out line 51\r\n
+8188 out line 52\r\n
+8217 out line 53\r\n
+8244 out line 54\r\n
+8272 out line 55\r\n
+8296 out line 56\r\n
+8323 out line 57\r\n
+8349 out line 58\r\n
+8378 out line 59\r\n
+8404 out line 60\r\n
+8427 out line 61\r\n
+8451 out line 62\r\n
+8483 out line 63\r\n
+8513 out line 64\r\n
+8537 out line 65\r\n
+8563 out line 66\r\n
+8586 out line 67\r\n
+8616 out line 68\r\n
+8642 out line 69\r\n
+8671 out line 70\r\n
+10250 resize 90 30
+11708 out after narrower: 30 72\r\n
+13233 resize 140 30
+14731 out after wider: 30 112\r\n
+16243 resize 140 20
+17743 out after shorter: 20 112\r\n
