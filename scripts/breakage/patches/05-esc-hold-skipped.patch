@@ -1,0 +1,20 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..74ee713 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -930,12 +930,9 @@ where
+         // Re-arm on every feed, not just the not-holding→holding edge: a chunk
+         // that EXTENDS an incomplete sequence is evidence more is coming, so
+         // restarting the clock is the right behaviour.
+-        input.hold_deadline = if input.scanner.holding() {
+-            let now = clock.now();
+-            Some(clock.deadline(now, ESC_HOLD))
+-        } else {
+-            None
+-        };
++        if input.scanner.holding() {
++            flush_hold(input, clock, renderer, resize, term, pty_writer, resizer);
++        }
+         return Flow::Continue;
+     }
+     // A terminal resize (SIGWINCH) while in mode moved the band — repaint the

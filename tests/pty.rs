@@ -9,29 +9,25 @@
 //! Two harness facts shape the tests:
 //!
 //! - **Outer size.** The PTY's default is 80x24. To run gutter inside a wider
-//!   terminal (so a `--width 100` band leaves real gutters) the command is
-//!   `sh -c 'stty cols C rows R; exec gutter ...'`: `stty` resizes gutter's own
-//!   controlling terminal BEFORE it reads its size at startup — deterministic,
-//!   no resize race.
-//! - **Capture the LIVE frame, not the post-exit screen.** gutter mirrors the
-//!   child's screen mode (ADR-012): a TUI's content is painted into the outer
-//!   alternate screen, which is discarded on the alt-leave at teardown. So the
-//!   alt-screen children here stay alive (a long `sleep`) and the harness drains
-//!   a bounded window WHILE the child is still running, parsing the alt-screen
-//!   frame gutter actually painted. Plain (non-alt) children are the opposite:
-//!   their output is painted onto the PRIMARY screen and SURVIVES teardown, so
-//!   the plain-output and exit-status tests read the post-exit stream. The
-//!   child-exit-restore test deliberately reads the teardown sequence.
+//!   terminal (so a `--width 100` band leaves real gutters) the outer PTY is sized
+//!   before the wrapping shell is let through to `exec gutter` (`spawn_sized` in
+//!   `tests/common/mod.rs`), so gutter reads the intended size at startup —
+//!   deterministic, no resize race.
+//! - **The child is held until the test has seen its output.** Each child blocks on
+//!   a `read` after it prints; the test waits for that output on the outer screen
+//!   and only then sends Enter. gutter paints a child's last bytes only if they
+//!   reach it within its teardown grace, so output is never left to race the exit.
+//!   Inline output is on the primary screen and survives teardown, so it is checked
+//!   on the screen gutter leaves. What teardown undoes — the alt screen, a hidden
+//!   cursor, the cursor's position — is checked by the wait itself, or on the alt
+//!   screen as it stood when it was left.
 //!
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
-use std::io::Write;
-use std::time::{Duration, Instant};
-
 mod common;
 use common::{
-    assert_cols_blank, drain_window, first_content_row, first_painted_col, outer_grid, pty_guard,
-    recoverable_from_scrollback, screen_text, spawn_gutter, wait_exit,
+    assert_cols_blank, cell_text, first_painted_col, recoverable_from_scrollback, row_text,
+    screen_text, stty_size_under, Gutter,
 };
 
 /// **Child sees `COLUMNS == W`** — asserted from inside the child (`stty size`
@@ -40,15 +36,11 @@ use common::{
 /// the outer terminal size.
 #[test]
 fn child_sees_band_width() {
-    let _guard = pty_guard();
-    let mut session = spawn_gutter(120, 40, "--width 100 /bin/sh -c 'stty size; sleep 3'");
-    let bytes = drain_window(&mut session, Duration::from_millis(700));
-
-    let parser = outer_grid(&bytes, 120, 40);
-    let row = first_content_row(parser.screen(), 120);
-    assert!(
-        row.contains("100"),
-        "child must see W=100 columns (stty size row was {row:?})"
+    let done = stty_size_under(120, 40, "--width 100");
+    assert_eq!(
+        row_text(&done.screen, 0).trim(),
+        "40 100",
+        "child must see W=100 columns"
     );
 }
 
@@ -57,15 +49,11 @@ fn child_sees_band_width() {
 /// still only sees `W=100` (`stty size` reports it), not the full 120.
 #[test]
 fn default_width_narrows_on_wide_terminal() {
-    let _guard = pty_guard();
-    let mut session = spawn_gutter(120, 40, "/bin/sh -c 'stty size; sleep 3'");
-    let bytes = drain_window(&mut session, Duration::from_millis(700));
-
-    let parser = outer_grid(&bytes, 120, 40);
-    let row = first_content_row(parser.screen(), 120);
-    assert!(
-        row.contains("100"),
-        "default (no --width) must narrow the child to W=100 (stty size row was {row:?})"
+    let done = stty_size_under(120, 40, "");
+    assert_eq!(
+        row_text(&done.screen, 0).trim(),
+        "40 100",
+        "default (no --width) must narrow the child to W=100"
     );
 }
 
@@ -74,18 +62,17 @@ fn default_width_narrows_on_wide_terminal() {
 /// `(120-100)/2 = 10`, with both gutters `[0,10)` and `[110,120)` blank.
 #[test]
 fn default_width_centres_on_wide_terminal() {
-    let _guard = pty_guard();
-    let child = "/bin/sh -c 'printf \"%0.s#\" $(seq 1 200); sleep 3'";
-    let mut session = spawn_gutter(120, 40, child);
-    let bytes = drain_window(&mut session, Duration::from_millis(800));
+    let child = "/bin/sh -c 'printf \"%0.s#\" $(seq 1 200); read _'";
+    let mut gutter = Gutter::spawn(120, 40, child);
+    // 200 `#` fill two band rows exactly; the last lands at the band's right edge.
+    gutter.wait_for("the last # at row 1, column 109", |s| cell_text(s, 1, 109) == "#");
+    gutter.send(b"\n");
+    let done = gutter.finish();
 
-    let parser = outer_grid(&bytes, 120, 40);
-    let screen = parser.screen();
-
-    let first = first_painted_col(screen, 120).expect("row 0 has painted content");
+    let first = first_painted_col(&done.screen, 120).expect("row 0 has painted content");
     assert_eq!(first, 10, "default band must be centred: (120-100)/2 = 10");
-    assert_cols_blank(screen, 0, 10, 40);
-    assert_cols_blank(screen, 110, 120, 40);
+    assert_cols_blank(&done.screen, 0, 10, 40);
+    assert_cols_blank(&done.screen, 110, 120, 40);
 }
 
 /// **Default width clamps on a narrow terminal.** No `--width`, outer terminal
@@ -93,15 +80,11 @@ fn default_width_centres_on_wide_terminal() {
 /// band full-width — no narrowing, no panic — so the child sees `W=80`.
 #[test]
 fn default_width_clamps_on_narrow_terminal() {
-    let _guard = pty_guard();
-    let mut session = spawn_gutter(80, 24, "/bin/sh -c 'stty size; sleep 3'");
-    let bytes = drain_window(&mut session, Duration::from_millis(700));
-
-    let parser = outer_grid(&bytes, 80, 24);
-    let row = first_content_row(parser.screen(), 80);
-    assert!(
-        row.contains("80"),
-        "default width must clamp to the narrow terminal (stty size row was {row:?})"
+    let done = stty_size_under(80, 24, "");
+    assert_eq!(
+        row_text(&done.screen, 0).trim(),
+        "24 80",
+        "default width must clamp to the narrow terminal"
     );
 }
 
@@ -111,27 +94,19 @@ fn default_width_clamps_on_narrow_terminal() {
 /// `--width 100%` is asserted alongside as the equivalent spelling.
 #[test]
 fn full_literal_is_passthrough() {
-    let _guard = pty_guard();
-    let mut session = spawn_gutter(120, 40, "--width full /bin/sh -c 'stty size; sleep 3'");
-    let bytes = drain_window(&mut session, Duration::from_millis(700));
-
-    let parser = outer_grid(&bytes, 120, 40);
-    let screen = parser.screen();
-    let row = first_content_row(screen, 120);
-    assert!(
-        row.contains("120"),
-        "--width full must be full-width passthrough (stty size row was {row:?})"
+    let done = stty_size_under(120, 40, "--width full");
+    // Untrimmed at the front: the size starts at column 0, with no centring offset.
+    assert_eq!(
+        row_text(&done.screen, 0),
+        "40 120",
+        "--width full must be full-width passthrough, flush at margin 0"
     );
-    let first = first_painted_col(screen, 120).expect("row 0 has painted content");
-    assert_eq!(first, 0, "--width full must sit flush at margin 0");
 
-    let mut session = spawn_gutter(120, 40, "--width 100% /bin/sh -c 'stty size; sleep 3'");
-    let bytes = drain_window(&mut session, Duration::from_millis(700));
-    let parser = outer_grid(&bytes, 120, 40);
-    let row = first_content_row(parser.screen(), 120);
-    assert!(
-        row.contains("120"),
-        "--width 100% must behave identically to --width full (stty size row was {row:?})"
+    let done = stty_size_under(120, 40, "--width 100%");
+    assert_eq!(
+        row_text(&done.screen, 0),
+        "40 120",
+        "--width 100% must behave identically to --width full"
     );
 }
 
@@ -140,20 +115,18 @@ fn full_literal_is_passthrough() {
 /// gutter columns to the right (>= 100) hold no stale cells.
 #[test]
 fn content_in_band_gutters_empty() {
-    let _guard = pty_guard();
-    let child = "/bin/sh -c 'printf HELLO_FROM_THE_BAND; sleep 3'";
-    let mut session = spawn_gutter(120, 40, &format!("--width 100 --left {child}"));
-    let bytes = drain_window(&mut session, Duration::from_millis(700));
+    let child = "/bin/sh -c 'printf HELLO_FROM_THE_BAND; read _'";
+    let mut gutter = Gutter::spawn(120, 40, &format!("--width 100 --left {child}"));
+    gutter.wait_for("the child's text", |s| s.contents().contains("HELLO_FROM_THE_BAND"));
+    gutter.send(b"\n");
+    let done = gutter.finish();
 
-    let parser = outer_grid(&bytes, 120, 40);
-    let screen = parser.screen();
-
-    let row0: String = screen.rows(0, 120).next().unwrap_or_default();
+    let row0 = row_text(&done.screen, 0);
     assert!(
         row0.starts_with("HELLO_FROM_THE_BAND"),
         "content must start at the left margin (row 0 = {row0:?})"
     );
-    assert_cols_blank(screen, 100, 120, 40);
+    assert_cols_blank(&done.screen, 100, 120, 40);
 }
 
 /// **Cursor tracking.** After the repaint the real cursor lands inside the band
@@ -161,36 +134,37 @@ fn content_in_band_gutters_empty() {
 /// slice, so physical col == child col).
 #[test]
 fn cursor_tracks_child_inside_band() {
-    let _guard = pty_guard();
-    // Move to row 3, col 10 (1-based CSI), then idle alive.
-    let child = "/bin/sh -c 'printf \"\\033[3;10H\"; sleep 3'";
-    let mut session = spawn_gutter(120, 40, &format!("--width 100 --left {child}"));
-    let bytes = drain_window(&mut session, Duration::from_millis(700));
+    // Print a marker on row 5, then move to row 3, col 10 (1-based CSI) and hold.
+    let child = "/bin/sh -c 'printf \"\\033[5;1HMARK\\033[3;10H\"; read _'";
+    let mut gutter = Gutter::spawn(120, 40, &format!("--width 100 --left {child}"));
 
-    let parser = outer_grid(&bytes, 120, 40);
-    let (crow, ccol) = parser.screen().cursor_position();
-    // CSI 3;10H is row 2, col 9 zero-based; margin 0 so physical == child.
-    assert_eq!(
-        (crow, ccol),
-        (2, 9),
-        "outer cursor must track the child into the band"
-    );
+    // CSI 3;10H is row 2, col 9 zero-based; margin 0 so physical == child. A frame
+    // paints its rows and places the cursor last, and painting the marker takes the
+    // cursor to row 4 — so (2, 9) with the marker up is where gutter put the cursor,
+    // not where a paint happened to leave it. Teardown moves it again, so the wait is
+    // the assertion.
+    gutter.wait_for("the outer cursor at (2, 9), following the child into the band", |s| {
+        row_text(s, 4) == "MARK" && s.cursor_position() == (2, 9)
+    });
+
+    gutter.send(b"\n");
+    assert_eq!(gutter.finish().code, Some(0));
 }
 
 /// **Cursor hide/show (DECTCEM) mirrored.** The child hides its cursor; gutter
 /// must mirror that on the outer terminal (the outer vt100 reports hidden).
 #[test]
 fn cursor_visibility_mirrored_on_outer() {
-    let _guard = pty_guard();
-    let child = "/bin/sh -c 'printf \"\\033[?25lX\"; sleep 3'";
-    let mut session = spawn_gutter(120, 40, &format!("--width 100 --left {child}"));
-    let bytes = drain_window(&mut session, Duration::from_millis(700));
+    let child = "/bin/sh -c 'printf \"\\033[?25lX\"; read _'";
+    let mut gutter = Gutter::spawn(120, 40, &format!("--width 100 --left {child}"));
 
-    let parser = outer_grid(&bytes, 120, 40);
-    assert!(
-        parser.screen().hide_cursor(),
-        "outer terminal must mirror the child hiding its cursor"
-    );
+    // Teardown shows the cursor again, so the wait is the assertion.
+    gutter.wait_for("the outer cursor hidden, mirroring the child", |s| {
+        row_text(s, 0) == "X" && s.hide_cursor()
+    });
+
+    gutter.send(b"\n");
+    assert_eq!(gutter.finish().code, Some(0));
 }
 
 /// **Full-screen TUI usable.** Drive vim inside the band: open it, type text,
@@ -199,46 +173,51 @@ fn cursor_visibility_mirrored_on_outer() {
 /// positioning, SGR) works through gutter, not just `echo`.
 #[test]
 fn vim_renders_inside_band() {
-    let _guard = pty_guard();
     let child = "/usr/bin/vim -u NONE -N -n -i NONE";
-    let mut session = spawn_gutter(120, 40, &format!("--width 100 --left {child}"));
+    let mut gutter = Gutter::spawn(120, 40, &format!("--width 100 --left {child}"));
 
-    // Let vim enter the alt screen and lay out.
-    std::thread::sleep(Duration::from_millis(700));
-    // Insert mode, type a marker at the top-left, then leave insert mode.
-    session.write_all(b"ggIGUTTERVIMOK\x1b").unwrap();
-    session.flush().unwrap();
-    std::thread::sleep(Duration::from_millis(500));
+    // Once the `~` column reaches the last text row vim is in the alt screen, laid
+    // out and reading keys.
+    gutter.wait_for("vim's ~ rows", |s| {
+        s.alternate_screen() && cell_text(s, 1, 0) == "~" && cell_text(s, 38, 0) == "~"
+    });
 
-    let bytes = drain_window(&mut session, Duration::from_millis(600));
-    let parser = outer_grid(&bytes, 120, 40);
-    let screen = parser.screen();
+    // Insert mode, type a marker at the top-left, then leave insert mode — which
+    // steps the cursor back onto the marker's last character.
+    gutter.send(b"ggIGUTTERVIMOK\x1b");
+    gutter.wait_for("the marker on row 0 and vim back in normal mode", |s| {
+        row_text(s, 0).starts_with("GUTTERVIMOK") && s.cursor_position() == (0, 10)
+    });
 
-    let row0: String = screen.rows(0, 120).next().unwrap_or_default();
+    // Quit without saving; the frame vim leaves is the one checked.
+    gutter.send(b":q!\r");
+    let done = gutter.finish();
+    let screen = done.alt_screen.expect("vim leaves the alt screen on exit");
+
+    let row0 = row_text(&screen, 0);
     assert!(
         row0.starts_with("GUTTERVIMOK"),
         "vim edit must render at the band's left margin (row 0 = {row0:?})"
     );
     // Content stays inside the band — gutter columns still empty.
-    assert_cols_blank(screen, 100, 120, 1);
-
-    // Quit vim without saving so the process exits cleanly.
-    session.write_all(b"\x1b:q!\r").unwrap();
-    let _ = session.flush();
+    assert_cols_blank(&screen, 100, 120, 40);
+    assert_eq!(done.code, Some(0), "vim exits cleanly through gutter");
 }
 
 /// **Child-exit restore + exit code (real-PTY smoke).** A child that enters the
-/// alt screen then exits immediately: gutter must leave the alt screen and show
-/// the cursor with NO keypress, and propagate the child's exit code.
+/// alt screen and exits inside it: gutter must leave the alt screen and show the
+/// cursor with no keypress after the exit, and propagate the child's exit code.
 #[test]
 fn child_exit_restores_terminal_and_propagates_code() {
-    let _guard = pty_guard();
-    let child = "/bin/sh -c 'printf \"\\033[?1049h\"; exit 7'";
-    let mut session = spawn_gutter(80, 24, &format!("--width 60 {child}"));
+    let child = "/bin/sh -c 'printf \"\\033[?1049hIN-ALT\"; read _; exit 7'";
+    let mut gutter = Gutter::spawn(80, 24, &format!("--width 60 {child}"));
+    gutter.wait_for("the child in the alt screen", |s| {
+        s.alternate_screen() && s.contents().contains("IN-ALT")
+    });
+    gutter.send(b"\n");
 
-    // Read to EOF this time — we WANT the teardown sequence.
-    let bytes = drain_window(&mut session, Duration::from_secs(3));
-    let s = String::from_utf8_lossy(&bytes);
+    let done = gutter.finish();
+    let s = String::from_utf8_lossy(&done.bytes);
     assert!(
         s.contains("\u{1b}[?1049l") || s.contains("\u{1b}[?47l"),
         "restore must leave the alternate screen, got {s:?}"
@@ -247,12 +226,7 @@ fn child_exit_restores_terminal_and_propagates_code() {
         s.contains("\u{1b}[?25h"),
         "restore must show the cursor, got {s:?}"
     );
-
-    assert_eq!(
-        wait_exit(&session, Duration::from_secs(5)),
-        Some(7),
-        "gutter must propagate the child's exit code"
-    );
+    assert_eq!(done.code, Some(7), "gutter must propagate the child's exit code");
 }
 
 /// **Autowrap is turned off for the run and back on at teardown (ADR-010/ADR-014).**
@@ -267,12 +241,10 @@ fn child_exit_restores_terminal_and_propagates_code() {
 /// leaves no byte to order against.
 #[test]
 fn teardown_restores_autowrap_before_the_restores_flush() {
-    let _guard = pty_guard();
+    // Nothing asserted here is the child's own output, so it needs no holding.
     let child = "/bin/sh -c 'printf hi; exit 0'";
-    let mut session = spawn_gutter(80, 24, &format!("--width 60 {child}"));
-
-    let bytes = drain_window(&mut session, Duration::from_secs(3));
-    let s = String::from_utf8_lossy(&bytes);
+    let done = Gutter::spawn(80, 24, &format!("--width 60 {child}")).finish();
+    let s = String::from_utf8_lossy(&done.bytes);
 
     let off = s.find("\u{1b}[?7l").expect("setup must disable autowrap");
     let on = s.rfind("\u{1b}[?7h").expect("the restore must re-enable autowrap");
@@ -283,26 +255,25 @@ fn teardown_restores_autowrap_before_the_restores_flush() {
         "the `?7h` must be queued before `show_cursor`'s flush, got {s:?}"
     );
 
-    assert_eq!(wait_exit(&session, Duration::from_secs(5)), Some(0));
+    assert_eq!(done.code, Some(0));
 }
 
 /// **Plain output survives to the primary screen (the E2 regression, ADR-012).**
-/// A plain command that only prints to the primary screen (`printf 'line1\nline2
-/// \nline3'; exit 0`, no `?1049h`): gutter must mirror the child's mode, never
-/// force the alt screen, and leave the output visible on the primary screen after
-/// exit. Asserted on the post-exit stream — the inverse of the alt-screen tests:
-/// the three lines are present AND `?1049h`/`?1049l` are NEVER emitted.
+/// A plain command that only prints to the primary screen (three lines, no
+/// `?1049h`): gutter must mirror the child's mode, never force the alt screen, and
+/// leave the output visible on the primary screen after exit. Asserted on the
+/// post-exit stream — the inverse of the alt-screen tests: the three lines are
+/// present AND `?1049h`/`?1049l` are NEVER emitted.
 #[test]
 fn plain_command_output_survives_to_primary_screen() {
-    let _guard = pty_guard();
-    // No trailing newline, no alt-screen negotiation — a pure primary-screen
-    // command. It exits immediately; we read the post-exit stream.
-    let child = "/bin/sh -c \"printf 'line1\\nline2\\nline3'; exit 0\"";
-    let mut session = spawn_gutter(80, 24, &format!("--width 60 --left {child}"));
+    // No trailing newline, no alt-screen negotiation — a pure primary-screen command.
+    let child = "/bin/sh -c \"printf 'line1\\nline2\\nline3'; read _\"";
+    let mut gutter = Gutter::spawn(80, 24, &format!("--width 60 --left {child}"));
+    gutter.wait_for("the child's third line", |s| s.contents().contains("line3"));
+    gutter.send(b"\n");
 
-    // Drain through teardown: the output is on the primary screen, so it survives.
-    let bytes = drain_window(&mut session, Duration::from_secs(3));
-    let s = String::from_utf8_lossy(&bytes);
+    let done = gutter.finish();
+    let s = String::from_utf8_lossy(&done.bytes);
 
     // gutter must NEVER force the alt screen for a plain command — the E2 fix.
     assert!(
@@ -311,18 +282,15 @@ fn plain_command_output_survives_to_primary_screen() {
     );
 
     // All three lines are visible on the primary screen after exit.
-    let parser = outer_grid(&bytes, 80, 24);
-    let screen = parser.screen();
+    let text = screen_text(&done.screen, 80);
     for marker in ["line1", "line2", "line3"] {
-        let present = screen.rows(0, 80).any(|r| r.contains(marker));
-        assert!(present, "plain output {marker:?} must survive on the primary screen");
+        assert!(
+            text.contains(marker),
+            "plain output {marker:?} must survive on the primary screen, got {text:?}"
+        );
     }
 
-    assert_eq!(
-        wait_exit(&session, Duration::from_secs(5)),
-        Some(0),
-        "gutter propagates the zero exit"
-    );
+    assert_eq!(done.code, Some(0), "gutter propagates the zero exit");
 }
 
 /// **Mode-switch mid-run (ADR-012).** A child that prints to the PRIMARY screen
@@ -331,14 +299,23 @@ fn plain_command_output_survives_to_primary_screen() {
 /// lines — not at startup, and restore cleanly (leave the alt screen) on exit.
 #[test]
 fn mode_switch_mid_run_enters_alt_after_primary_lines() {
-    let _guard = pty_guard();
     // Print a primary marker, then enter the alt screen and paint, then exit in
-    // alt. The `?1049h` must appear in the stream AFTER the primary marker.
-    let child = "/bin/sh -c \"printf 'primline'; sleep 0.3; printf '\\033[?1049h\\033[1;1Halt-frame'; sleep 0.3; exit 0\"";
-    let mut session = spawn_gutter(80, 24, &format!("--width 60 --left {child}"));
+    // alt. Each `read` holds the child until the test has seen the step before it
+    // on the outer screen, so gutter paints each in a frame of its own.
+    let child = "/bin/sh -c \"printf 'primline'; read _; printf '\\033[?1049h\\033[1;1Halt-frame'; read _; exit 0\"";
+    let mut gutter = Gutter::spawn(80, 24, &format!("--width 60 --left {child}"));
 
-    let bytes = drain_window(&mut session, Duration::from_secs(3));
-    let s = String::from_utf8_lossy(&bytes);
+    gutter.wait_for("primline on the primary screen", |s| {
+        !s.alternate_screen() && s.contents().contains("primline")
+    });
+    gutter.send(b"\n");
+    gutter.wait_for("alt-frame on the alt screen", |s| {
+        s.alternate_screen() && s.contents().contains("alt-frame")
+    });
+    gutter.send(b"\n");
+
+    let done = gutter.finish();
+    let s = String::from_utf8_lossy(&done.bytes);
 
     // The outer alt screen is entered (the child's `?1049h` edge) and later left.
     let enter = s
@@ -359,72 +336,64 @@ fn mode_switch_mid_run_enters_alt_after_primary_lines() {
         "the primary lines must be painted before the ?1049h edge (not forced at startup)"
     );
 
-    let _ = wait_exit(&session, Duration::from_secs(5));
+    assert_eq!(done.code, Some(0), "gutter propagates the zero exit");
 }
 
-/// **Real-PTY smoke (cap).** Feed a few MB of scrolling output through a real
-/// PTY: gutter must keep up, stay alive, drain in bounded time, and the settled
-/// frame must show late flood output (not a frozen early frame). The exact
-/// frame-count proof is the virtual-clock unit test; this is the real-PTY
-/// sanity check that the coalescing loop neither hangs nor tears.
+/// **Real-PTY smoke.** Feed a few MB of scrolling output through a real PTY: gutter
+/// must stay alive, drain it all, and the settled frame must show the end of the
+/// flood (not a frozen early frame) with the band edge intact. How many frames that
+/// takes is the virtual-clock unit test's to prove; nothing here measures speed.
 #[test]
-fn multi_mb_scroll_stays_bounded() {
-    let _guard = pty_guard();
-    // A burst of scrolling output, then a long idle so the child stays alive
-    // PAST our capture window — we want the live alt-screen frame, not the
-    // post-exit primary screen (leaving the alt screen discards its content).
-    let child = "/bin/sh -c 'i=0; while [ $i -lt 20000 ]; do printf \"line %d of the flood test\\n\" $i; i=$((i+1)); done; sleep 6'";
-    let mut session = spawn_gutter(120, 40, &format!("--width 100 --left {child}"));
+fn multi_mb_flood_drains_to_its_last_line() {
+    let child = "/bin/sh -c 'i=0; while [ $i -lt 20000 ]; do printf \"line %d of the flood test\\n\" $i; i=$((i+1)); done; printf FLOOD-DONE; read _'";
+    let mut gutter = Gutter::spawn(120, 40, &format!("--width 100 --left {child}"));
 
-    let start = Instant::now();
-    let bytes = drain_window(&mut session, Duration::from_secs(3));
-    let elapsed = start.elapsed();
+    // A gutter that hung or fell behind for good never shows the end of the flood,
+    // and the wait's deadline is what bounds it.
+    gutter.wait_for("the end of the flood", |s| {
+        let text = s.contents();
+        text.contains("line 19999 of the flood test") && text.contains("FLOOD-DONE")
+    });
+    gutter.send(b"\n");
 
-    // The capture window is a hard wall-clock cap (non-blocking reads), proving
-    // the coalescing loop kept draining and never hung the reader.
+    let done = gutter.finish();
+    let text = screen_text(&done.screen, 120);
     assert!(
-        elapsed < Duration::from_secs(5),
-        "flood capture window must stay bounded (took {elapsed:?})"
+        text.contains("line 19999 of the flood test"),
+        "the settled frame must show the end of the flood, got {text:?}"
     );
-    assert!(!bytes.is_empty(), "gutter must paint frames of the flood");
-
-    let parser = outer_grid(&bytes, 120, 40);
-    let screen = parser.screen();
-    let shows_flood = screen
-        .rows(0, 120)
-        .any(|row| row.contains("of the flood test"));
-    assert!(shows_flood, "the settled frame must show flood output");
     // Even under a flood the band edge holds — no bleed into the gutter.
-    assert_cols_blank(screen, 100, 120, 40);
-
-    // Drop the session explicitly so the child (and its `sleep`) is reaped now.
-    drop(session);
+    assert_cols_blank(&done.screen, 100, 120, 40);
+    assert_eq!(done.code, Some(0));
 }
 
 /// **Scroll-off survival (ADR-013).** A plain command that
 /// prints MORE than one screenful on the primary screen — 40 distinctly-tagged
 /// lines on a 24-row terminal — must have its early (scrolled-off) lines reach the
-/// **real terminal's own scrollback**, present in the drained bytes even though
-/// they are NOT in the visible last screenful. gutter keeps vt100 at
-/// `scrollback=0` and emits each departed top line into the terminal as it scrolls
-/// off, so the early tags appear in the stream via the scroll emit, not the band
-/// repaint. Not just "the last screenful survives" — every line reaches scrollback.
+/// **real terminal's own scrollback**, even though they are NOT in the visible last
+/// screenful. gutter keeps vt100 at `scrollback=0` and emits each departed top line
+/// into the terminal as it scrolls off, so the early tags reach it via the scroll
+/// emit, not the band repaint. Not just "the last screenful survives" — every line
+/// reaches scrollback.
 ///
-/// The child paces one line per ~25ms so each render frame advances roughly one
-/// line — the count-based emit then captures every departed line deterministically
-/// regardless of coalescing (a single frame never swallows a whole screenful).
+/// The child prints one line and waits for Enter, and the test sends Enter once it
+/// has seen that line painted — so each frame advances exactly one line. The burst
+/// test below is the opposite case.
 #[test]
 fn scroll_off_lines_reach_real_terminal_scrollback() {
-    let _guard = pty_guard();
-    // 40 lines, each `SCROLLTAG-NN`, paced so the band scrolls steadily. No alt
-    // screen — a pure primary-screen command. Exits 0; we read the full stream
-    // (the scrolled-off lines were emitted into scrollback as they departed).
-    let child = "/bin/sh -c 'i=0; while [ $i -lt 40 ]; do printf \"SCROLLTAG-%02d\\n\" $i; i=$((i+1)); sleep 0.025; done; exit 0'";
-    let mut session = spawn_gutter(80, 24, &format!("--width 60 --left {child}"));
+    // 40 lines, each `SCROLLTAG-NN`. No alt screen — a pure primary-screen command.
+    // Echo is off so the Enters that pace it add no lines of their own.
+    let child = "/bin/sh -c 'stty -echo; i=0; while [ $i -lt 40 ]; do printf \"SCROLLTAG-%02d\\n\" $i; i=$((i+1)); read _; done; exit 0'";
+    let mut gutter = Gutter::spawn(80, 24, &format!("--width 60 --left {child}"));
 
-    // Drain through the whole run + teardown.
-    let bytes = drain_window(&mut session, Duration::from_secs(5));
-    let s = String::from_utf8_lossy(&bytes);
+    for i in 0..40 {
+        let tag = format!("SCROLLTAG-{i:02}");
+        gutter.wait_for(&tag, |s| s.contents().contains(&tag));
+        gutter.send(b"\n");
+    }
+
+    let mut done = gutter.finish();
+    let s = String::from_utf8_lossy(&done.bytes);
 
     // gutter must never force the alt screen for this plain command.
     assert!(
@@ -432,17 +401,9 @@ fn scroll_off_lines_reach_real_terminal_scrollback() {
         "a plain scrolling command must never emit ?1049h/?1049l"
     );
 
-    // Parse the outer-terminal bytes through a vt100 WITH scrollback — modelling
-    // the real terminal's own scrollback store. The discriminator: with the scroll
-    // emit, each departed top line was `\r\n`-advanced into scrollback, so the
-    // early lines survive in the scrollback region; an in-place `[0, rows)` repaint
-    // would have overwritten them, leaving them NOT recoverable.
-    let mut parser = vt100::Parser::new(24, 80, 1000);
-    parser.process(&bytes);
-
     // The final visible frame (offset 0) holds the LAST screenful — the early
     // lines must NOT be visible there (they scrolled off).
-    let visible_text = screen_text(parser.screen(), 80);
+    let visible_text = screen_text(&done.screen, 80);
     assert!(
         !visible_text.contains("SCROLLTAG-00"),
         "the earliest line must have scrolled OFF the visible window, but it is \
@@ -453,22 +414,20 @@ fn scroll_off_lines_reach_real_terminal_scrollback() {
         "the final line must be in the visible window, got {visible_text:?}"
     );
 
-    // Scroll the view up through the scrollback and assert the early scrolled-off
-    // lines are recoverable from the terminal's own scrollback.
+    // The harness's screen keeps scrollback, modelling the real terminal's own
+    // store. The discriminator: with the scroll emit, each departed top line was
+    // `\r\n`-advanced into scrollback, so the early lines survive there; an in-place
+    // `[0, rows)` repaint would have overwritten them, leaving them NOT recoverable.
     for tag in ["SCROLLTAG-00", "SCROLLTAG-01", "SCROLLTAG-02", "SCROLLTAG-03"] {
         assert!(
-            recoverable_from_scrollback(&mut parser, 80, tag, 1..=60),
+            recoverable_from_scrollback(&mut done.screen, 80, tag, 1..=60),
             "early scrolled-off line {tag:?} must reach the real terminal's own \
              scrollback (recoverable by scrolling back), got {} bytes of stream",
-            bytes.len()
+            done.bytes.len()
         );
     }
 
-    assert_eq!(
-        wait_exit(&session, Duration::from_secs(5)),
-        Some(0),
-        "gutter propagates the zero exit"
-    );
+    assert_eq!(done.code, Some(0), "gutter propagates the zero exit");
 }
 
 /// **Scroll-off survival under a COALESCED BURST (ADR-007 + ADR-013).** The same
@@ -486,14 +445,16 @@ fn scroll_off_lines_reach_real_terminal_scrollback() {
 /// single-frame advance >= the band height.
 #[test]
 fn scroll_off_burst_reaches_scrollback_without_pacing() {
-    let _guard = pty_guard();
-    // 120 lines, printed as fast as possible (no sleep): a single 16 ms frame
-    // swallows dozens at once on a 24-row terminal. Each line is uniquely tagged.
-    let child = "/bin/sh -c 'i=0; while [ $i -lt 120 ]; do printf \"BURSTTAG-%03d\\n\" $i; i=$((i+1)); done; exit 0'";
-    let mut session = spawn_gutter(80, 24, &format!("--width 60 --left {child}"));
+    // 120 lines, printed as fast as possible: a single 16 ms frame swallows dozens
+    // at once on a 24-row terminal. Each line is uniquely tagged. The child holds
+    // only once the whole burst is out.
+    let child = "/bin/sh -c 'i=0; while [ $i -lt 120 ]; do printf \"BURSTTAG-%03d\\n\" $i; i=$((i+1)); done; read _'";
+    let mut gutter = Gutter::spawn(80, 24, &format!("--width 60 --left {child}"));
+    gutter.wait_for("the last burst line", |s| s.contents().contains("BURSTTAG-119"));
+    gutter.send(b"\n");
 
-    let bytes = drain_window(&mut session, Duration::from_secs(5));
-    let s = String::from_utf8_lossy(&bytes);
+    let mut done = gutter.finish();
+    let s = String::from_utf8_lossy(&done.bytes);
 
     // Still a pure primary-screen command — never the alt screen.
     assert!(
@@ -501,13 +462,9 @@ fn scroll_off_burst_reaches_scrollback_without_pacing() {
         "a plain bursting command must never emit ?1049h/?1049l"
     );
 
-    // Model the real terminal's scrollback store.
-    let mut parser = vt100::Parser::new(24, 80, 4000);
-    parser.process(&bytes);
-
     // The final visible frame holds the LAST screenful; the earliest line scrolled
     // off and the last line is visible.
-    let visible_text = screen_text(parser.screen(), 80);
+    let visible_text = screen_text(&done.screen, 80);
     assert!(
         !visible_text.contains("BURSTTAG-000"),
         "the earliest burst line must have scrolled OFF the visible window: {visible_text:?}"
@@ -529,19 +486,15 @@ fn scroll_off_burst_reaches_scrollback_without_pacing() {
         "BURSTTAG-090",
     ] {
         assert!(
-            recoverable_from_scrollback(&mut parser, 80, tag, 1..=200),
+            recoverable_from_scrollback(&mut done.screen, 80, tag, 1..=200),
             "burst-scrolled-off line {tag:?} must reach scrollback under coalescing \
              (the count-based emit must not drop a whole-frame turnover), got {} \
              bytes of stream",
-            bytes.len()
+            done.bytes.len()
         );
     }
 
-    assert_eq!(
-        wait_exit(&session, Duration::from_secs(5)),
-        Some(0),
-        "gutter propagates the zero exit"
-    );
+    assert_eq!(done.code, Some(0), "gutter propagates the zero exit");
 }
 
 /// **Non-zero exit shows the dim `Exited with: N` status line (the inline hand-back,
@@ -555,13 +508,13 @@ fn scroll_off_burst_reaches_scrollback_without_pacing() {
 /// emits `?1049h`/`?1049l` for this plain command.
 #[test]
 fn non_zero_exit_shows_dim_status_line() {
-    let _guard = pty_guard();
-    let child = "/bin/sh -c 'printf boom; exit 3'";
-    let mut session = spawn_gutter(80, 24, &format!("--width 60 {child}"));
+    let child = "/bin/sh -c 'printf boom; read _; exit 3'";
+    let mut gutter = Gutter::spawn(80, 24, &format!("--width 60 {child}"));
+    gutter.wait_for("the child's output", |s| s.contents().contains("boom"));
+    gutter.send(b"\n");
 
-    // Read to the teardown — we WANT the post-exit restore + status sequence.
-    let bytes = drain_window(&mut session, Duration::from_secs(3));
-    let s = String::from_utf8_lossy(&bytes);
+    let done = gutter.finish();
+    let s = String::from_utf8_lossy(&done.bytes);
 
     assert!(
         s.contains("\u{1b}[2mExited with: 3\u{1b}[0m"),
@@ -573,11 +526,7 @@ fn non_zero_exit_shows_dim_status_line() {
         "a plain command must never enter/leave the alt screen, got {s:?}"
     );
 
-    assert_eq!(
-        wait_exit(&session, Duration::from_secs(5)),
-        Some(3),
-        "gutter must propagate the non-zero exit code"
-    );
+    assert_eq!(done.code, Some(3), "gutter must propagate the non-zero exit code");
 }
 
 /// **A no-output non-zero exit is silent (ADR-013).** The inline
@@ -588,36 +537,34 @@ fn non_zero_exit_shows_dim_status_line() {
 /// and exits non-zero (indistinguishable here by live state) can never be captioned.
 #[test]
 fn no_output_nonzero_exit_is_silent() {
-    let _guard = pty_guard();
+    // The child prints nothing, so there is nothing to see first; the exit code is
+    // the proof it ran.
     let child = "/bin/sh -c 'exit 3'";
-    let mut session = spawn_gutter(80, 24, &format!("--width 60 {child}"));
-
-    let bytes = drain_window(&mut session, Duration::from_secs(3));
-    let s = String::from_utf8_lossy(&bytes);
+    let done = Gutter::spawn(80, 24, &format!("--width 60 {child}")).finish();
+    let s = String::from_utf8_lossy(&done.bytes);
 
     assert!(
         !s.contains("Exited with:"),
         "a no-output non-zero exit must not stamp a status line, got {s:?}"
     );
-    assert_eq!(
-        wait_exit(&session, Duration::from_secs(5)),
-        Some(3),
-        "gutter must still propagate the non-zero exit code"
-    );
+    assert_eq!(done.code, Some(3), "gutter must still propagate the non-zero exit code");
 }
 
-/// **Zero exit is silent.** A plain child that exits cleanly:
-/// gutter must emit NO status line — a clean run leaves a clean screen — and,
-/// mirroring the child's mode (ADR-012), must never enter or leave the alt screen
-/// for a plain command. Asserted on the raw teardown bytes.
+/// **Zero exit is silent.** A plain child that prints inline output and exits
+/// cleanly: gutter must emit NO status line — a clean run leaves a clean screen —
+/// and, mirroring the child's mode (ADR-012), must never enter or leave the alt
+/// screen for a plain command. Asserted on the raw teardown bytes.
 #[test]
 fn zero_exit_shows_no_status_line() {
-    let _guard = pty_guard();
-    let child = "/bin/sh -c 'exit 0'";
-    let mut session = spawn_gutter(80, 24, &format!("--width 60 {child}"));
+    // The child paints the band first: with nothing painted there is no status line
+    // at any exit code, and the zero would not be what kept it away.
+    let child = "/bin/sh -c 'printf fine; read _; exit 0'";
+    let mut gutter = Gutter::spawn(80, 24, &format!("--width 60 {child}"));
+    gutter.wait_for("the child's output", |s| s.contents().contains("fine"));
+    gutter.send(b"\n");
 
-    let bytes = drain_window(&mut session, Duration::from_secs(3));
-    let s = String::from_utf8_lossy(&bytes);
+    let done = gutter.finish();
+    let s = String::from_utf8_lossy(&done.bytes);
 
     // No status line on a clean exit.
     assert!(
@@ -630,9 +577,5 @@ fn zero_exit_shows_no_status_line() {
         "a plain command must never enter/leave the alt screen, got {s:?}"
     );
 
-    assert_eq!(
-        wait_exit(&session, Duration::from_secs(5)),
-        Some(0),
-        "gutter must propagate the zero exit code"
-    );
+    assert_eq!(done.code, Some(0), "gutter must propagate the zero exit code");
 }

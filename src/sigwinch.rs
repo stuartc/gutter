@@ -13,13 +13,16 @@ use signal_hook::iterator::Signals;
 
 use crate::msg::Msg;
 
+/// Installs the handler. `main` calls this before it reads the terminal's size:
+/// until the handler is in place `SIGWINCH` is ignored, and a resize that lands
+/// after the size was read would never be seen.
+pub fn register() -> std::io::Result<Signals> {
+    Signals::new([SIGWINCH])
+}
+
 /// Forwards every `SIGWINCH` as [`Msg::Resize`] until the merged channel closes.
 /// Detached like Thread 3 and reaped by `process::exit` (ADR-010).
-pub fn run(merged: Sender<Msg>) {
-    let Ok(mut signals) = Signals::new([SIGWINCH]) else {
-        eprintln!("gutter: failed to register SIGWINCH; resize is disabled");
-        return;
-    };
+pub fn run(mut signals: Signals, merged: Sender<Msg>) {
     for _ in signals.forever() {
         if merged.send(Msg::Resize).is_err() {
             break;

@@ -1,0 +1,13 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..ca40c2b 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -1857,7 +1857,7 @@ fn ordered_restore<T: OuterTerminal>(
+ 
+     if renderer.outer_alt_active {
+         restore.step(term.leave_alt_screen());
+-    } else if renderer.ever_painted_inline {
++    } else if renderer.ever_painted_inline && renderer.base_row == u16::MAX {
+         restore.step(hand_back_inline(renderer, term, exit_code));
+     }
+     restore.step(term.write_row(SGR_RESET));

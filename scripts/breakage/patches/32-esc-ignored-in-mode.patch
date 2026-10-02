@@ -1,0 +1,11 @@
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -417,7 +417,7 @@
+     // A bare Escape, whether resolved by the hold or arriving as one of the
+     // disambiguated forms a relayed keyboard mode produces.
+     if Chord::ESC.matches(unit) {
+-        return KeyAction::Exit;
++        return KeyAction::Swallow;
+     }
+     let reduced = chord::csi_key(unit)
+         .filter(|k| k.event != KeyEvent::Release)

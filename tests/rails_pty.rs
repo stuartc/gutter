@@ -10,11 +10,20 @@
 //!
 //! CI runs these headlessly: a real PTY, no display, `TERM=xterm-256color`.
 
-use std::io::Write;
-use std::time::Duration;
-
 mod common;
-use common::{assert_cols_blank, drain_window, outer_grid, spawn_gutter};
+use common::{assert_cols_blank, cell_text, leave_resize_mode, rails, Finished, Gutter};
+
+/// The child every test here wraps: it prints nothing and holds on a `read`, so
+/// Enter, once resize mode is left and keys reach the child again, ends the run.
+const SILENT_CHILD: &str = "/bin/sh -c 'read _'";
+
+/// Leave resize mode, end the child — Enter reaches it again once the mode is left —
+/// and return what gutter left.
+fn leave_mode_and_finish(mut gutter: Gutter) -> Finished {
+    leave_resize_mode(&mut gutter);
+    gutter.send(b"\n");
+    gutter.finish()
+}
 
 /// **Entering resize mode paints the rails at the band edges and a width readout in
 /// the right gutter.** A centred 60-column band in a 160-column terminal has margin
@@ -22,116 +31,84 @@ use common::{assert_cols_blank, drain_window, outer_grid, spawn_gutter};
 /// The readout ("60") lands right-aligned in the right gutter's bottom row.
 #[test]
 fn resize_mode_paints_rails_and_readout() {
-    let child = "/bin/sh -c 'while true; do sleep 0.2; done'";
-    let mut session =
-        spawn_gutter(160, 40, &format!("--width 60 --center --resize-key ctrl-o {child}"));
+    let mut gutter = Gutter::spawn(
+        160,
+        40,
+        &format!("--width 60 --center --resize-key ctrl-o {SILENT_CHILD}"),
+    );
 
-    let _ = drain_window(&mut session, Duration::from_millis(400));
+    gutter.send(&[0x0F]); // enter (Ctrl-O)
+    // Leaving the mode erases both, so the wait is the assertion.
+    gutter.wait_for(
+        "the left rail at margin - 1 (column 49), the right rail at band_end (column \
+         110), and the readout \"60\" right-aligned in the bottom row",
+        |s| {
+            rails(s) == (Some(49), Some(110))
+                && cell_text(s, 39, 158) == "6"
+                && cell_text(s, 39, 159) == "0"
+        },
+    );
 
-    session.write_all(&[0x0F]).unwrap(); // enter (Ctrl-O)
-    session.flush().unwrap();
-
-    let bytes = drain_window(&mut session, Duration::from_millis(500));
-    let parser = outer_grid(&bytes, 160, 40);
-    let screen = parser.screen();
-
-    // A mid-band row: rails are drawn across every row of the span, so any row does.
-    let mid = 10u16;
-    let left_rail = screen.cell(mid, 49).map(|c| c.contents()).unwrap_or_default();
-    let right_rail = screen.cell(mid, 110).map(|c| c.contents()).unwrap_or_default();
-    assert_eq!(left_rail, "\u{258f}", "left rail at margin - 1 (column 49)");
-    assert_eq!(right_rail, "\u{2595}", "right rail at band_end (column 110)");
-
-    // The readout digits ("60") right-aligned in the bottom row's right gutter.
-    let bottom = 39u16;
-    let readout: String = (158..160)
-        .map(|c| screen.cell(bottom, c).map(|cell| cell.contents()).unwrap_or_default())
-        .collect();
-    assert_eq!(readout, "60", "the width readout shows the current column count");
-
-    drop(session);
+    let done = leave_mode_and_finish(gutter);
+    assert_eq!(done.code, Some(0));
 }
 
-/// **A manual step slides the rails to the new edges and clears the old ones.** A
-/// centred 60-column band in a 160-column terminal has rails at 49/110; growing by
-/// 20 columns (`llllllllllllllllllll`, PRD's `l` step) moves the band to
-/// `[40, 120)`, so BOTH old rail columns (49, 110) land inside the new band. This
-/// is the end-to-end pin for the grow-strands-old-rails regression: the
-/// `src/render.rs` mock/`RecordingGrid` unit test covers the same shape without a
-/// PTY, but only a real step keypress here proves the live chord-to-repaint path
-/// actually clears them.
+/// **A manual step slides the rails to the new edges.** A centred 60-column band in
+/// a 160-column terminal has rails at 49/110; growing by 20 columns
+/// (`llllllllllllllllllll`, PRD's `l` step) moves the band to `[40, 120)` and the
+/// rails to 39/120, and the columns they passed through, now inside the band, end
+/// up blank.
+///
+/// This does not pin the grow-strands-old-rails regression. A step repaints the
+/// band's whole row span, which wipes a rail the step left behind, so the test
+/// passes with `blank_vacated_chrome` taken out. The `src/render.rs`
+/// mock/`RecordingGrid` unit test is what holds that.
 #[test]
 fn resize_mode_step_slides_rails() {
-    let child = "/bin/sh -c 'while true; do sleep 0.2; done'";
-    let mut session =
-        spawn_gutter(160, 40, &format!("--width 60 --center --resize-key ctrl-o {child}"));
+    let mut gutter = Gutter::spawn(
+        160,
+        40,
+        &format!("--width 60 --center --resize-key ctrl-o {SILENT_CHILD}"),
+    );
 
-    let mut bytes = drain_window(&mut session, Duration::from_millis(400));
+    gutter.send(&[0x0F]); // enter (Ctrl-O)
+    gutter.wait_for("the rails at columns 49 and 110", |s| rails(s) == (Some(49), Some(110)));
 
-    session.write_all(&[0x0F]).unwrap(); // enter (Ctrl-O)
-    session.flush().unwrap();
-    bytes.extend(drain_window(&mut session, Duration::from_millis(300)));
+    gutter.send(b"llllllllllllllllllll"); // grow by 20 (width 60 -> 80)
+    // New rails at the new edges: margin - 1 = 39, band_end = 120. They are only
+    // there once the last of the twenty steps has been taken.
+    gutter.wait_for(
+        "the rails to slide to the new margin - 1 (column 39) and band_end (column 120)",
+        |s| rails(s) == (Some(39), Some(120)),
+    );
 
-    session.write_all(b"llllllllllllllllllll").unwrap(); // grow by 20 (width 60 -> 80)
-    session.flush().unwrap();
-    bytes.extend(drain_window(&mut session, Duration::from_millis(1500)));
-
-    let parser = outer_grid(&bytes, 160, 40);
-    let screen = parser.screen();
-    let mid = 10u16;
-
-    // Old rail columns (margin 50) now sit inside the new band [40, 120) and must
-    // read blank, not the stale glyph.
-    let old_left = screen.cell(mid, 49).map(|c| c.contents()).unwrap_or_default();
-    let old_right = screen.cell(mid, 110).map(|c| c.contents()).unwrap_or_default();
-    assert!(old_left.is_empty() || old_left == " ", "old left rail (col 49) must not strand: {old_left:?}");
-    assert!(old_right.is_empty() || old_right == " ", "old right rail (col 110) must not strand: {old_right:?}");
-
-    // New rails at the new edges: margin - 1 = 39, band_end = 120.
-    let new_left = screen.cell(mid, 39).map(|c| c.contents()).unwrap_or_default();
-    let new_right = screen.cell(mid, 120).map(|c| c.contents()).unwrap_or_default();
-    assert_eq!(new_left, "\u{258f}", "left rail slides to the new margin - 1 (column 39)");
-    assert_eq!(new_right, "\u{2595}", "right rail slides to the new band_end (column 120)");
-
-    drop(session);
+    let done = leave_mode_and_finish(gutter);
+    // The band is now [40, 120), and the child printed nothing into it, so every
+    // column a rail passed through on the way out — 49 and 110 first — reads blank.
+    assert_cols_blank(&done.screen, 40, 120, 40);
 }
 
-/// **Exiting the mode erases the rails and readout.** After `Esc`, the gutter
-/// columns the rails occupied are blank again. The byte stream is accumulated into
-/// ONE parser from before the enter chord through the exit — parsing only the
-/// post-Esc bytes into a fresh (already-blank) grid would pass even if the exit
-/// clear were a no-op, since a fresh vt100 grid starts blank regardless.
+/// **Exiting the mode erases the rails and readout.** Once the mode is left, the
+/// gutter columns the rails occupied are blank again — whether the `Esc` or the idle
+/// exit is what left it, which this test cannot tell apart. The screen is one parser
+/// fed from before the enter chord through gutter's exit — a fresh grid starts
+/// blank, so one fed only the bytes after `Esc` would pass even if the exit clear
+/// were a no-op.
 #[test]
 fn resize_mode_exit_clears_rails() {
-    let child = "/bin/sh -c 'while true; do sleep 0.2; done'";
-    let mut session =
-        spawn_gutter(160, 40, &format!("--width 60 --center --resize-key ctrl-o {child}"));
+    let mut gutter = Gutter::spawn(
+        160,
+        40,
+        &format!("--width 60 --center --resize-key ctrl-o {SILENT_CHILD}"),
+    );
 
-    let mut bytes = drain_window(&mut session, Duration::from_millis(400));
+    gutter.send(&[0x0F]); // enter
+    // The rails are up before the mode is left, so the blank gutters below were
+    // cleared rather than never drawn.
+    gutter.wait_for("the rails at columns 49 and 110", |s| rails(s) == (Some(49), Some(110)));
 
-    session.write_all(&[0x0F]).unwrap(); // enter
-    session.flush().unwrap();
-    bytes.extend(drain_window(&mut session, Duration::from_millis(300)));
-
-    // Confirm the rails are actually up before Esc, so the post-Esc blank assertion
-    // below proves they were cleared rather than never having been drawn.
-    {
-        let parser = outer_grid(&bytes, 160, 40);
-        let screen = parser.screen();
-        let left_rail = screen.cell(10, 49).map(|c| c.contents()).unwrap_or_default();
-        let right_rail = screen.cell(10, 110).map(|c| c.contents()).unwrap_or_default();
-        assert_eq!(left_rail, "\u{258f}", "left rail must be present before Esc");
-        assert_eq!(right_rail, "\u{2595}", "right rail must be present before Esc");
-    }
-
-    session.write_all(&[0x1b]).unwrap(); // Esc: exit
-    session.flush().unwrap();
-    bytes.extend(drain_window(&mut session, Duration::from_millis(500)));
-
-    let parser = outer_grid(&bytes, 160, 40);
+    let done = leave_mode_and_finish(gutter);
     // Rails sat at columns 49 and 110; both gutters must read blank post-exit.
-    assert_cols_blank(parser.screen(), 0, 50, 40);
-    assert_cols_blank(parser.screen(), 110, 160, 40);
-
-    drop(session);
+    assert_cols_blank(&done.screen, 0, 50, 40);
+    assert_cols_blank(&done.screen, 110, 160, 40);
 }

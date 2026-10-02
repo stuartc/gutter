@@ -1,0 +1,13 @@
+diff --git a/src/mouse.rs b/src/mouse.rs
+index e9ff0fa..5f5a561 100644
+--- a/src/mouse.rs
++++ b/src/mouse.rs
+@@ -128,7 +128,7 @@ impl MouseGate {
+ /// that then slips past the `< w` check. `None` rejects it; the proptest guards
+ /// this. The caller's `encode_sgr` adds the SGR 1-based `+1`.
+ fn translate_col(event_col: u16, left_margin: u16, w: u16) -> Option<u16> {
+-    let adjusted = event_col.checked_sub(left_margin)?;
++    let adjusted = event_col.saturating_sub(left_margin);
+     if adjusted < w {
+         Some(adjusted)
+     } else {

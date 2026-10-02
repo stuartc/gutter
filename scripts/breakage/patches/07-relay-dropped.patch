@@ -1,0 +1,14 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..ec6b132 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -328,8 +328,7 @@ where
+             // trip ahead of it and the head start is free. Safe outside a frame —
+             // `render_once` queues and flushes within one call, so no half-built
+             // frame is ever outstanding when a message is dispatched.
+-            let relayed = renderer.parser.callbacks_mut().drain_relay();
+-            let _ = relay_if_any(term, &relayed);
++            let _ = renderer.parser.callbacks_mut().drain_relay();
+             // Answer the child's device queries: parser.process surfaced any
+             // CSI c / CSI 5 n / CSI 6 n through unhandled_csi, which buffered a
+             // spec-correct reply; drain it to the PTY master.

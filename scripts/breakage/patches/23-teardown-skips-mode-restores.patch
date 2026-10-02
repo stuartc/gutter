@@ -1,0 +1,18 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..cd03318 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -1864,13 +1864,10 @@ fn ordered_restore<T: OuterTerminal>(
+     if renderer.parser.callbacks().cursor_shape.is_mirrored() {
+         restore.step(term.set_cursor_shape(DEFAULT_CURSOR_SHAPE));
+     }
+-    restore.step(mode_reset(renderer, term));
+-    restore.step(relay_reset(renderer, term));
+     restore.step(term.disable_mouse()); // conditional on mouse_enabled
+     // Autowrap back on, unconditionally — like the mouse disable (ADR-005), gutter puts
+     // the terminal in the state a shell expects rather than the one it found. Before
+     // `show_cursor`, whose flush is what puts the whole restore on screen (ADR-023).
+-    restore.step(term.set_autowrap(true));
+     restore.step(term.show_cursor());
+     restore.step(term.disable_raw_mode()); // LAST (ADR-010)
+     restore

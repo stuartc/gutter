@@ -1,0 +1,38 @@
+diff --git a/src/modes.rs b/src/modes.rs
+index f7e9bb6..8673b8d 100644
+--- a/src/modes.rs
++++ b/src/modes.rs
+@@ -95,15 +95,9 @@ impl ModeMirror {
+     #[must_use]
+     pub fn reset_bytes(&self) -> Vec<u8> {
+         let mut out = Vec::new();
+-        if self.application_cursor {
+-            out.extend_from_slice(APPLICATION_CURSOR_OFF);
+-        }
+-        if self.application_keypad {
+-            out.extend_from_slice(APPLICATION_KEYPAD_OFF);
+-        }
+-        if self.bracketed_paste {
+-            out.extend_from_slice(BRACKETED_PASTE_OFF);
+-        }
++        out.extend_from_slice(APPLICATION_CURSOR_OFF);
++        out.extend_from_slice(APPLICATION_KEYPAD_OFF);
++        out.extend_from_slice(BRACKETED_PASTE_OFF);
+         out
+     }
+ 
+diff --git a/src/relay.rs b/src/relay.rs
+index 27115ea..02faf05 100644
+--- a/src/relay.rs
++++ b/src/relay.rs
+@@ -159,9 +159,7 @@ impl KeyModeRelay {
+         if matches!(self.kitty.first(), Some(KittyOp::Set(_))) {
+             out.extend_from_slice(KITTY_SET_NONE);
+         }
+-        if self.modify_other_keys.is_some() {
+-            out.extend_from_slice(MODIFY_OTHER_KEYS_OFF);
+-        }
++        out.extend_from_slice(MODIFY_OTHER_KEYS_OFF);
+         out
+     }
+ 

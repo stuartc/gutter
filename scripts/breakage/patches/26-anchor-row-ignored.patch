@@ -1,0 +1,13 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..fb36c0f 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -191,7 +191,7 @@ impl Renderer {
+             // Nothing mirrored yet, so nothing owed back at teardown (ADR-022).
+             mode_mirror: ModeMirror::new(),
+             // The inline anchor (ADR-013), clamped into the grid.
+-            base_row: base_row.min(rows.saturating_sub(1)),
++            base_row: base_row.min(rows.saturating_sub(rows)),
+             ever_painted_inline: false,
+             pty_eof_seen: false,
+             mouse_gate: MouseGate::default(),

@@ -1,0 +1,14 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..b830e93 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -992,7 +992,8 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
+     // follows the child into the alternate screen, where vt100 keeps no scrollback and
+     // nothing ever departs, so an alt frame drains empty on its own — the outer screen
+     // never scrolls under the alt screen.
+-    let departed = renderer.drain_scrolled_off();
++    let mut departed = renderer.drain_scrolled_off();
++    departed.clear();
+ 
+     scroll_to_make_room(renderer, term, departed.is_empty())?;
+ 

@@ -1,0 +1,22 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..e69f6de 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -1857,7 +1857,7 @@ fn ordered_restore<T: OuterTerminal>(
+ 
+     if renderer.outer_alt_active {
+         restore.step(term.leave_alt_screen());
+-    } else if renderer.ever_painted_inline {
++    } else {
+         restore.step(hand_back_inline(renderer, term, exit_code));
+     }
+     restore.step(term.write_row(SGR_RESET));
+@@ -2081,7 +2081,7 @@ fn hand_back_inline<T: OuterTerminal>(
+         .saturating_add(renderer.deepest_live_row())
+         .min(real_rows.saturating_sub(1));
+     term.move_to(0, phys_bottom)?;
+-    if exit_code == 0 {
++    if exit_code < 0 {
+         term.newline()
+     } else {
+         // The leading reset is `newline`'s rule spelled out: this `\r\n` scrolls too

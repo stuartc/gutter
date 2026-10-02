@@ -1,0 +1,13 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..949133e 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -364,7 +364,7 @@ where
+         Msg::ChildExited(status) => Flow::Exit(status.exit_code() as i32),
+         // The child stopped (ADR-0018): drive the suspend/resume cycle. `sig` is
+         // carried for tests/logging; v1 reacts to every stop signal identically.
+-        Msg::ChildStopped { .. } => Flow::Suspend,
++        Msg::ChildStopped { .. } => Flow::Continue,
+         // The child was continued out from under gutter (or by our own SIGCONT):
+         // force a full repaint. A hint only — never triggers suspend.
+         Msg::ChildContinued => {

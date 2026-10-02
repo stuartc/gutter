@@ -1,0 +1,13 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..ef95cf1 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -985,7 +985,7 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
+     // margin-offset rectangle (ADR-014), and mode bytes between a `move_to` and its row
+     // would break that for nothing.
+     let mode_bytes = renderer.mode_mirror.take_pending(renderer.parser.screen());
+-    relay_if_any(term, &mode_bytes)?;
++    let _ = mode_bytes;
+ 
+     // Scroll emit (ADR-013): on the primary screen, advance each line that left the
+     // top of the W-window this frame into the terminal's own scrollback. The tracker

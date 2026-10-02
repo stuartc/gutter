@@ -1,0 +1,13 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..080f436 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -801,7 +801,7 @@ fn walk_tokens<C, T, P, R>(
+                     renderer.left_margin,
+                     renderer.width,
+                 ) {
+-                    MouseDecision::Forward(bytes) => forward_to_child(pty_writer, &bytes),
++                    MouseDecision::Forward(_) => {}
+                     MouseDecision::Swallow => {}
+                     // A reporting mode with a non-SGR encoding is out of v1 scope, so
+                     // the report is dropped rather than sent in a form that would

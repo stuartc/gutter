@@ -12,10 +12,8 @@
 //!
 //! Headless: a real PTY, no display, `TERM=xterm-256color`.
 
-use std::time::Duration;
-
 mod common;
-use common::{read_until, spawn_gutter_argv as spawn_gutter};
+use common::Gutter;
 
 /// **Cursor-position round-trip in W-grid coordinates (the gate).** gutter runs a
 /// centred 40-column band in an 80-column terminal, so the band's left margin is
@@ -29,52 +27,46 @@ fn cursor_position_reply_is_in_w_grid_coords() {
     // bash: move to (3,7), query, read the CPR reply up to its `R` delimiter,
     // strip the `ESC [` prefix and print the bare `row;col` between markers.
     let script = r#"printf '\033[3;7H\033[6n'
-IFS= read -rs -d R -t 5 cpr
+IFS= read -rs -d R cpr
 cpr=${cpr#$'\033'}
 cpr=${cpr#'['}
 printf 'CPR<%s>' "$cpr"
-sleep 1"#;
-    let mut session = spawn_gutter(&["--width", "40", "--center", "bash", "-c", script]);
+read _"#;
+    let mut gutter = Gutter::spawn_argv(&["--width", "40", "--center", "bash", "-c", script]);
 
-    let (_elapsed, out) = read_until(&mut session, "CPR<", Duration::from_secs(6));
+    // The whole report, closing `>` included, whatever coordinates it carries.
+    gutter.wait_for("the child's CPR report", |s| {
+        s.contents().split_once("CPR<").is_some_and(|(_, rest)| rest.contains('>'))
+    });
+    gutter.send(b"\n");
+    let out = gutter.finish().screen.contents();
 
     assert!(
         out.contains("CPR<3;7>"),
         "cursor-position reply must be the child's W-grid position (3;7), not a \
-         margin-shifted column.\nouter bytes (lossy): {out:?}"
+         margin-shifted column.\nouter screen: {out:?}"
     );
     assert!(
         !out.contains("CPR<3;27>"),
         "the band's left-margin offset (20) must not leak into the reply"
     );
-
-    drop(session);
 }
 
 /// **Prompt exit — no DA1 stall.** The child
-/// emits a Primary Device Attributes query (`CSI c`) and blocks reading the reply
-/// with a generous 6s timeout, then prints `DONE` and exits. With gutter
-/// answering DA1 the read returns at once; without it the child waits out its full
-/// timeout. Assert `DONE` appears well under the timeout — the ~2s exit stall is
-/// gone.
+/// emits a Primary Device Attributes query (`CSI c`) and blocks reading the reply,
+/// with no timeout of its own, then prints `DONE`. Only gutter's answer can unblock
+/// it: unanswered, the child never reaches `DONE` and the wait below fails.
 #[test]
 fn da1_query_is_answered_without_stalling_exit() {
     let script = r#"printf '\033[c'
-IFS= read -rs -d c -t 6 _
-printf 'DONE'"#;
-    let mut session = spawn_gutter(&["bash", "-c", script]);
+IFS= read -rs -d c _
+printf 'DONE'
+read _"#;
+    let mut gutter = Gutter::spawn_argv(&["bash", "-c", script]);
 
-    let (elapsed, out) = read_until(&mut session, "DONE", Duration::from_secs(6));
-
-    assert!(
-        out.contains("DONE"),
-        "the child must unblock and finish; got: {out:?}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(3),
-        "DA1 must be answered promptly — the child reached DONE in {elapsed:?}, \
-         which means it blocked on its query (the ~2s stall)"
-    );
-
-    drop(session);
+    gutter.wait_for("the child's DONE, which only a DA1 reply lets it print", |s| {
+        s.contents().contains("DONE")
+    });
+    gutter.send(b"\n");
+    gutter.finish();
 }

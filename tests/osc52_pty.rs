@@ -20,10 +20,20 @@
 //!
 //! Headless: a real PTY, no display, `TERM=xterm-256color`.
 
-use std::time::Duration;
-
 mod common;
-use common::{drain_window, spawn_gutter_argv as spawn_gutter};
+use common::{find, Gutter};
+
+/// Run `sh -c script` under gutter and return every byte the outer terminal saw,
+/// once `expected` has turned up among them. `script` must end on a `read`, which
+/// holds the child until then.
+fn outer_bytes_once_seen(script: &str, expected: &str) -> String {
+    let mut gutter = Gutter::spawn_argv(&["sh", "-c", script]);
+    gutter.wait_for("the forwarded OSC 52", |s| {
+        find(s.bytes, expected.as_bytes()).is_some()
+    });
+    gutter.send(b"\n");
+    String::from_utf8_lossy(&gutter.finish().bytes).into_owned()
+}
 
 /// A known base64 payload the child copies. Carries `+`, `/` and `=` padding so
 /// the "verbatim, no decode/re-encode" guarantee is exercised on the full base64
@@ -38,18 +48,13 @@ const KNOWN_B64: &str = "aGVs+bG8/8w==";
 /// is present and that `data` is byte-for-byte the base64 the child emitted.
 #[test]
 fn child_osc52_write_reaches_the_real_terminal() {
-    // The child prints the OSC-52 write, then sleeps so it stays alive while
-    // gutter's render thread processes the bytes and forwards the clipboard.
     // \033 = ESC, \007 = BEL — built explicitly so no shell quoting mangles it.
     let payload = format!("\\033]52;c;{KNOWN_B64}\\007");
-    let child_script = format!("printf '{payload}'; sleep 2");
-    let mut session = spawn_gutter(&["sh", "-c", &child_script]);
-
-    let bytes = drain_window(&mut session, Duration::from_millis(1200));
+    let child_script = format!("printf '{payload}'; read _");
 
     // The reconstructed OSC-52 (BEL-terminated) gutter forwarded to /dev/tty.
     let expected = format!("\x1b]52;c;{KNOWN_B64}\x07");
-    let haystack = String::from_utf8_lossy(&bytes);
+    let haystack = outer_bytes_once_seen(&child_script, &expected);
     assert!(
         haystack.contains(&expected),
         "gutter must forward the reconstructed OSC-52 to the real terminal.\n\
@@ -64,8 +69,6 @@ fn child_osc52_write_reaches_the_real_terminal() {
         haystack.contains(&marker),
         "the base64 payload must be forwarded verbatim (no round-trip mangling)"
     );
-
-    drop(session);
 }
 
 /// A non-52 OSC the child emits (a window-title set, OSC 0) must NOT produce a
@@ -79,15 +82,14 @@ fn non_osc52_does_not_produce_a_clipboard_write() {
     // sequence must appear exactly once (the real copy), never spuriously from
     // the title.
     let payload = format!("\\033]0;my-title\\007\\033]52;c;{KNOWN_B64}\\007");
-    let child_script = format!("printf '{payload}'; sleep 2");
-    let mut session = spawn_gutter(&["sh", "-c", &child_script]);
-
-    let bytes = drain_window(&mut session, Duration::from_millis(1200));
-    let haystack = String::from_utf8_lossy(&bytes);
+    let child_script = format!("printf '{payload}'; read _");
 
     // Exactly one forwarded clipboard sequence (the real OSC-52), and it carries
-    // the known payload — the title's "my-title" never appears as a 52 write.
+    // the known payload — the title's "my-title" never appears as a 52 write. The
+    // title comes first in the child's output, so once the real copy is through,
+    // anything the title was going to cause has been written too.
     let clip = format!("]52;c;{KNOWN_B64}\x07");
+    let haystack = outer_bytes_once_seen(&child_script, &clip);
     assert!(
         haystack.contains(&clip),
         "the real OSC-52 copy must be forwarded"
@@ -96,6 +98,4 @@ fn non_osc52_does_not_produce_a_clipboard_write() {
         !haystack.contains("]52;c;my-title"),
         "a window-title OSC must not be forwarded as a clipboard write"
     );
-
-    drop(session);
 }

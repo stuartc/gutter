@@ -1,0 +1,13 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..375d364 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -1093,7 +1093,7 @@ fn mirror_cursor<T: OuterTerminal>(
+     term: &mut T,
+     offset: u16,
+ ) -> std::io::Result<()> {
+-    if renderer.resize_active {
++    if !renderer.resize_active {
+         return Ok(());
+     }
+     let screen = renderer.parser.screen();

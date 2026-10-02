@@ -1,0 +1,20 @@
+diff --git a/src/terminal.rs b/src/terminal.rs
+index ada93bf..3b449f6 100644
+--- a/src/terminal.rs
++++ b/src/terminal.rs
+@@ -458,7 +458,6 @@ impl<W: Write> OuterTerminal for CrosstermTerminal<W> {
+     }
+ 
+     fn enter_alt_screen(&mut self) -> io::Result<()> {
+-        queue!(self.out, EnterAlternateScreen)?;
+         self.out.flush()
+     }
+ 
+@@ -556,7 +555,6 @@ impl<W: Write> OuterTerminal for CrosstermTerminal<W> {
+     }
+ 
+     fn leave_alt_screen(&mut self) -> io::Result<()> {
+-        queue!(self.out, LeaveAlternateScreen)?;
+         self.out.flush()
+     }
+ 

@@ -1,0 +1,22 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..c6641ef 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -1011,7 +1011,7 @@ fn render_once<T: OuterTerminal>(renderer: &mut Renderer, term: &mut T) -> std::
+             }
+             let row = row as u16;
+             let at = Placement {
+-                left_margin: renderer.left_margin,
++                left_margin: renderer.left_margin + 1,
+                 phys_row: offset.saturating_add(row),
+                 grid_row: row,
+             };
+@@ -1184,7 +1184,7 @@ fn emit_scroll_stream<T: OuterTerminal>(
+             bottom
+         };
+         let at = Placement {
+-            left_margin: renderer.left_margin,
++            left_margin: renderer.left_margin + 1,
+             phys_row,
+             grid_row,
+         };

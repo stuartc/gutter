@@ -1,0 +1,13 @@
+diff --git a/src/render.rs b/src/render.rs
+index 485e60d..e9d3fef 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -39,7 +39,7 @@ pub const RESIZE_IDLE: Duration = Duration::from_secs(3);
+ /// once and the drain returns immediately; the cap is only hit when a grandchild
+ /// keeps the PTY slave open and the master never EOFs, so teardown would otherwise
+ /// hang waiting for a sentinel that never comes.
+-pub const TEARDOWN_DRAIN_GRACE: Duration = Duration::from_millis(100);
++pub const TEARDOWN_DRAIN_GRACE: Duration = Duration::from_millis(0);
+ 
+ /// The scroll-tracker's bounded scrollback (ADR-013). The tracker keeps its screen for
+ /// the whole session and counts departures as the growth of that scrollback, so the cap

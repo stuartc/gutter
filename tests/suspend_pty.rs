@@ -32,18 +32,21 @@
 //!
 //! Headless: a real PTY, no display, `TERM=xterm-256color`.
 
-use std::io::Write;
-use std::time::Duration;
-
 mod common;
-use common::{drain_window, find, pty_guard, spawn_gutter, wait_exit};
+use common::{find, Gutter};
 
 // The head of gutter's mouse disable and the cursor-show — both part of the park
 // restore (and again at final teardown). Finding them BEFORE the resume marker is
 // what distinguishes a real park from ordinary teardown.
 const MOUSE_OFF: &[u8] = b"\x1b[?1000l";
 const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
+// Written once at startup and once more at each unpark, never at teardown.
 const MOUSE_ON: &[u8] = b"\x1b[?1000h";
+
+/// Whether gutter has unparked: its second mouse enable, the first being startup's.
+fn resumed(bytes: &[u8]) -> bool {
+    bytes.windows(MOUSE_ON.len()).filter(|w| *w == MOUSE_ON).count() >= 2
+}
 
 /// **Self-stop → park → resume.** A child prints `START`, stops itself
 /// (`SIGSTOP`; see the module note on why not `SIGTSTP`), then prints `RESUMED`.
@@ -55,25 +58,24 @@ const MOUSE_ON: &[u8] = b"\x1b[?1000h";
 /// means the cycle self-completes under this orphaned-group harness.
 #[test]
 fn self_stop_parks_then_resumes() {
-    let _g = pty_guard();
-    let mut s =
-        spawn_gutter(
-            80,
-            24,
-            "--width 40 sh -c 'printf START; kill -STOP $$; printf RESUMED; sleep 0.2'",
-        );
+    let child = "sh -c 'printf START; read _; kill -STOP $$; printf RESUMED; read _'";
+    let mut gutter = Gutter::spawn(80, 24, &format!("--width 40 {child}"));
+    gutter.wait_for("the child's pre-stop output", |s| s.contents().contains("START"));
+    gutter.send(b"\n");
+    // Proof continue_child resumed the stopped child.
+    gutter.wait_for("RESUMED", |s| s.contents().contains("RESUMED"));
+    gutter.send(b"\n");
+    let done = gutter.finish();
+    let out = &done.bytes;
 
-    let out = drain_window(&mut s, Duration::from_secs(5));
-
-    let start = find(&out, b"START").expect("child's pre-stop output must appear");
-    let resumed = find(&out, b"RESUMED")
-        .expect("RESUMED must reappear — proof continue_child resumed the stopped child");
+    let start = find(out, b"START").expect("child's pre-stop output must appear");
+    let resumed = find(out, b"RESUMED").expect("RESUMED must reappear");
     assert!(start < resumed, "START must precede RESUMED");
 
     // The park restore lands BEFORE the child is resumed: mouse disabled and
     // cursor shown so the (would-be) shell inherits a sane terminal.
-    let park_mouse_off = find(&out, MOUSE_OFF).expect("park must disable mouse");
-    let park_cursor_show = find(&out, CURSOR_SHOW).expect("park must show the cursor");
+    let park_mouse_off = find(out, MOUSE_OFF).expect("park must disable mouse");
+    let park_cursor_show = find(out, CURSOR_SHOW).expect("park must show the cursor");
     assert!(
         park_mouse_off < resumed,
         "mouse-disable must be part of the park (before RESUMED), not just teardown"
@@ -83,23 +85,28 @@ fn self_stop_parks_then_resumes() {
         "cursor-show must be part of the park (before RESUMED), not just teardown"
     );
 
-    assert_eq!(wait_exit(&s, Duration::from_secs(5)), Some(0), "clean exit after resume");
+    assert_eq!(done.code, Some(0), "clean exit after resume");
 }
 
 /// **Alt-screen child: park leaves the alt screen, resume re-enters it.** The
-/// child enters the alt screen and pauses (so gutter renders & mirrors the alt
-/// edge to the outer terminal) before stopping. Park must leave the alt screen
+/// child enters the alt screen and is held there until gutter has mirrored the alt
+/// edge to the outer terminal, then stops. Park must leave the alt screen
 /// (`?1049l`) so the shell inherits the primary screen; resume — with the child
 /// still in alt — must re-enter it (`?1049h`). We assert a park `?1049l` followed
 /// by a later resume `?1049h`.
 #[test]
 fn alt_screen_left_at_park_reentered_at_resume() {
-    let _g = pty_guard();
-    let mut s = spawn_gutter(80, 24, 
-        "--width 40 sh -c 'tput smcup; printf READY; sleep 0.3; kill -STOP $$; sleep 0.3; tput rmcup'",
-    );
-
-    let out = drain_window(&mut s, Duration::from_secs(5));
+    let child = "sh -c 'tput smcup; printf READY; read _; kill -STOP $$; printf BACK; read _'";
+    let mut gutter = Gutter::spawn(80, 24, &format!("--width 40 {child}"));
+    gutter.wait_for("the child in the alt screen", |s| {
+        s.alternate_screen() && s.contents().contains("READY")
+    });
+    gutter.send(b"\n");
+    gutter.wait_for("the resumed child back in the alt screen", |s| {
+        s.alternate_screen() && s.contents().contains("BACK")
+    });
+    gutter.send(b"\n");
+    let out = gutter.finish().bytes;
 
     // The startup mirror enters alt; then park leaves it, then resume re-enters.
     // Locate the park leave-alt, then require a re-enter strictly after it.
@@ -109,8 +116,6 @@ fn alt_screen_left_at_park_reentered_at_resume() {
         find(after, b"\x1b[?1049h").is_some(),
         "resume must re-enter the alt screen (a ?1049h after the park's ?1049l)"
     );
-
-    let _ = wait_exit(&s, Duration::from_secs(5));
 }
 
 /// **Child dies by SIGKILL across the suspend cycle → gutter exits 137.** The
@@ -122,28 +127,26 @@ fn alt_screen_left_at_park_reentered_at_resume() {
 /// child *while stopped*": under the orphaned-group harness we cannot land an
 /// external kill precisely inside the (~sub-100ms) window before `continue_child`
 /// fires without a race, so the child self-kills the instant it is resumed. The
-/// stop is a genuine `SIGSTOP` park cycle (park bytes below prove it ran), and the
-/// assertion of record — signal-death mapped to 137 through the suspend path — is
-/// exercised exactly.
+/// stop is a genuine `SIGSTOP` park cycle (the unpark's mouse enable below proves
+/// it ran), and the assertion of record — signal-death mapped to 137 through the
+/// suspend path — is exercised exactly.
 #[test]
 fn child_sigkilled_across_suspend_exits_137() {
-    let _g = pty_guard();
-    let mut s = spawn_gutter(
-        80,
-        24,
-        "--width 40 sh -c 'printf START; kill -STOP $$; kill -KILL $$'",
-    );
+    let child = "sh -c 'printf START; read _; kill -STOP $$; kill -KILL $$'";
+    let mut gutter = Gutter::spawn(80, 24, &format!("--width 40 {child}"));
+    gutter.wait_for("the child's pre-stop output", |s| s.contents().contains("START"));
+    gutter.send(b"\n");
+    let done = gutter.finish();
 
-    let out = drain_window(&mut s, Duration::from_secs(2));
-    assert!(find(&out, b"START").is_some(), "child ran before stopping");
+    // The unpark is written before the child is continued, so before it can die.
     assert!(
-        find(&out, MOUSE_OFF).is_some(),
-        "a real SIGSTOP park cycle ran (mouse-disable emitted)"
+        resumed(&done.bytes),
+        "a real SIGSTOP park cycle ran (mouse capture re-enabled at unpark)"
     );
 
     // 137 = 128 + SIGKILL(9). gutter reaps the child and exits with that code.
     assert_eq!(
-        wait_exit(&s, Duration::from_secs(5)),
+        done.code,
         Some(137),
         "gutter must propagate the child's SIGKILL death as 137"
     );
@@ -156,12 +159,14 @@ fn child_sigkilled_across_suspend_exits_137() {
 /// before a Ctrl-Z and not after.
 #[test]
 fn relayed_modes_are_reset_at_park_and_replayed_at_resume() {
-    let _g = pty_guard();
-    let mut s = spawn_gutter(80, 24, 
-        "--width 40 sh -c 'printf \"\\033[>1u\"; printf START; sleep 0.3; kill -STOP $$; printf RESUMED; sleep 0.2'",
-    );
-
-    let out = drain_window(&mut s, Duration::from_secs(5));
+    let child = "sh -c 'printf \"\\033[>1uSTART\"; read _; kill -STOP $$; printf RESUMED; read _'";
+    let mut gutter = Gutter::spawn(80, 24, &format!("--width 40 {child}"));
+    // START follows the push, so the push is relayed by the time it is on screen.
+    gutter.wait_for("the child's pre-stop output", |s| s.contents().contains("START"));
+    gutter.send(b"\n");
+    gutter.wait_for("RESUMED", |s| s.contents().contains("RESUMED"));
+    gutter.send(b"\n");
+    let out = gutter.finish().bytes;
 
     let push = find(&out, b"\x1b[>1u").expect("the child's push must be relayed");
     let after_push = &out[push + 5..];
@@ -171,8 +176,6 @@ fn relayed_modes_are_reset_at_park_and_replayed_at_resume() {
         find(after_reset, b"\x1b[>1u").is_some(),
         "resume must replay the level the child asked for"
     );
-
-    let _ = wait_exit(&s, Duration::from_secs(5));
 }
 
 /// **Input liveness after resume.** After the park/resume cycle, a keystroke
@@ -182,33 +185,18 @@ fn relayed_modes_are_reset_at_park_and_replayed_at_resume() {
 /// it back through gutter.
 #[test]
 fn input_reaches_child_after_resume() {
-    let _g = pty_guard();
-    let mut s = spawn_gutter(80, 24, 
-        "--width 40 sh -c 'printf START; kill -STOP $$; read x; printf \"GOT-$x\"; sleep 0.1'",
-    );
+    let child =
+        "sh -c 'printf START; read _; kill -STOP $$; read x; printf \"GOT-$x\"; read _'";
+    let mut gutter = Gutter::spawn(80, 24, &format!("--width 40 {child}"));
+    gutter.wait_for("the child's pre-stop output", |s| s.contents().contains("START"));
+    gutter.send(b"\n");
 
-    // Drain until the resume has happened: mouse is re-enabled at unpark, so a
-    // SECOND ?1000h (the first is startup capture) marks the child as resumed and
-    // its `read` now waiting.
-    let resumed = |b: &[u8]| b.windows(MOUSE_ON.len()).filter(|w| *w == MOUSE_ON).count() >= 2;
-    let (_, seen) = common::poll_until(
-        &mut s,
-        Duration::from_secs(3),
-        Duration::from_millis(3),
-        resumed,
-    );
-    assert!(
-        resumed(&seen),
-        "resume must have re-enabled mouse capture before we type"
-    );
+    gutter.wait_for("gutter to unpark", |s| resumed(s.bytes));
+    gutter.send(b"hello\r");
+    gutter.wait_for("the child's echo of the keystroke typed after resume", |s| {
+        s.contents().contains("GOT-hello")
+    });
 
-    s.write_all(b"hello\r").expect("send a keystroke to the resumed child");
-
-    let out = drain_window(&mut s, Duration::from_secs(3));
-    assert!(
-        find(&out, b"GOT-hello").is_some(),
-        "the keystroke typed after resume must reach the child's `read`"
-    );
-
-    let _ = wait_exit(&s, Duration::from_secs(5));
+    gutter.send(b"\n");
+    gutter.finish();
 }

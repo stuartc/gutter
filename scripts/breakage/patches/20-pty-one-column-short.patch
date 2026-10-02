@@ -1,0 +1,13 @@
+diff --git a/src/pty.rs b/src/pty.rs
+index 39d1381..b818ffb 100644
+--- a/src/pty.rs
++++ b/src/pty.rs
+@@ -79,7 +79,7 @@ pub fn spawn(
+     let pair = pty_system
+         .openpty(PtySize {
+             rows,
+-            cols,
++            cols: cols.saturating_sub(1),
+             pixel_width: 0,
+             pixel_height: 0,
+         })

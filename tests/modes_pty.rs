@@ -16,13 +16,12 @@
 //! Headless: a real PTY, no display, `TERM=xterm-256color`.
 
 mod common;
-use common::{find, outer_bytes_for, pty_guard};
+use common::{find, outer_bytes_for};
 
 /// **The three mirrored modes reach the real terminal.** All gutter is responsible
 /// for; what the terminal does with them is the terminal's business.
 #[test]
 fn each_mirrored_mode_reaches_the_outer_terminal() {
-    let _g = pty_guard();
     for (emit, want) in [
         ("\\033[?1h", b"\x1b[?1h".as_slice()),
         ("\\033=", b"\x1b="),
@@ -41,7 +40,6 @@ fn each_mirrored_mode_reaches_the_outer_terminal() {
 /// program that never asked.
 #[test]
 fn teardown_turns_off_what_was_mirrored_on() {
-    let _g = pty_guard();
     let out = outer_bytes_for("\\033[?2004h");
 
     let on = find(&out, b"\x1b[?2004h").expect("the mode must be mirrored on");
@@ -57,7 +55,6 @@ fn teardown_turns_off_what_was_mirrored_on() {
 /// must not appear for a child that set neither.
 #[test]
 fn a_child_that_sets_no_mode_leaves_the_terminal_alone() {
-    let _g = pty_guard();
     let out = outer_bytes_for("hello");
 
     assert!(find(&out, b"hello").is_some(), "the child ran");
@@ -74,7 +71,6 @@ fn a_child_that_sets_no_mode_leaves_the_terminal_alone() {
 /// emits it — so there is no startup noise to filter out the way `?1000h` would have.
 #[test]
 fn a_mouse_mode_never_reaches_the_outer_terminal() {
-    let _g = pty_guard();
     let out = outer_bytes_for("\\033[?9h");
     assert!(
         find(&out, b"\x1b[?9h").is_none(),
@@ -88,7 +84,6 @@ fn a_mouse_mode_never_reaches_the_outer_terminal() {
 /// that owns it (ADR-012).
 #[test]
 fn an_unimplemented_decset_is_not_relayed() {
-    let _g = pty_guard();
     let out = outer_bytes_for("\\033[?1047h");
     assert!(
         find(&out, b"\x1b[?1047h").is_none(),
